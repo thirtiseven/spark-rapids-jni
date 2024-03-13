@@ -16,9 +16,11 @@
 #pragma once
 
 #include <cudf/strings/detail/utf8.hpp>
+#include <cudf/strings/string_view.hpp>
 #include <cudf/types.hpp>
 
 #include <thrust/pair.h>
+#include <thrust/tuple.h>
 
 namespace spark_rapids_jni {
 
@@ -26,10 +28,10 @@ namespace spark_rapids_jni {
  * write style when writing out JSON string
  */
 enum class write_style {
-  // e.g.: '\\r' is a string with 2 chars '\' '\r', writes 1 char '\r'
+  // e.g.: '\\r' is a string with 2 chars '\' 'r', writes 1 char '\r'
   unescaped,
 
-  // e.g.: '"' is a string with 1 char '"', writes out 4 chars '"' '\' '\"' '\''
+  // * e.g.: '"' is a string with 1 char '"', writes out 4 chars '"' '\' '\"' '"'
   escaped
 };
 
@@ -765,7 +767,9 @@ class json_parser {
     return std::make_pair(false, nullptr);
   }
 
-  bool try_match_char(char const*& char_pos, char const* const char_end_pos, char c)
+  CUDF_HOST_DEVICE inline bool try_match_char(char const*& char_pos,
+                                              char const* const char_end_pos,
+                                              char c)
   {
     if (nullptr != char_pos) {
       if (char_pos < char_end_pos && *char_pos == c) {
@@ -1461,9 +1465,11 @@ class json_parser {
     }
   }
 
+  CUDF_HOST_DEVICE cudf::size_type compute_unescaped_len() { return write_unescaped_text(nullptr); }
+
   /**
    * unescape current token text, then write to destination
-   * e.g.: '\\r' is a string with 2 chars '\' '\r', writes 1 char '\r'
+   * e.g.: '\\r' is a string with 2 chars '\' 'r', writes 1 char '\r'
    * e.g.: "\u4e2d\u56FD" are code points for Chinese chars "中国",
    *   writes 6 utf8 bytes: -28  -72 -83 -27 -101 -67
    * For number, write verbatim without normalization
@@ -1523,7 +1529,7 @@ class json_parser {
 
   /**
    * escape current token text, then write to destination
-   * e.g.: '"' is a string with 1 char '"', writes out 4 chars '"' '\' '\"' '\''
+   * e.g.: '"' is a string with 1 char '"', writes out 4 chars '"' '\' '\"' '"'
    * e.g.: "\u4e2d\u56FD" are code points for Chinese chars "中国",
    *   writes 8 utf8 bytes: '"' -28  -72 -83 -27 -101 -67 '"'
    * For number, write verbatim without normalization
@@ -1616,6 +1622,14 @@ class json_parser {
                               float_fraction_len,
                               float_exp_pos,
                               float_exp_len);
+  }
+
+  /**
+   * match current field name
+   */
+  CUDF_HOST_DEVICE bool match_current_field_name(cudf::string_view name)
+  {
+    return match_current_field_name(name.data(), name.size_bytes());
   }
 
   /**

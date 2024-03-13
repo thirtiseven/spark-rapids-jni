@@ -104,25 +104,29 @@ class json_generator {
     }
   }
 
-  CUDF_HOST_DEVICE json_generator finish_child_generator(json_generator const& child_generator)
+  CUDF_HOST_DEVICE void write_start_array() {}
+
+  CUDF_HOST_DEVICE void write_end_array() {}
+
+  CUDF_HOST_DEVICE void copy_current_unescaped_text(json_parser<max_json_nesting_depth>& parser)
   {
-    // logically delete child generator
-    output_len += child_generator.get_output_len();
+    if (nullptr != output) {
+      int len = parser.write_unescaped_text(output + output_len);
+      output_len += len;
+    } else {
+      int len = parser.compute_unescaped_text(output + output_len);
+      output_len += len;
+    }
   }
 
-  CUDF_HOST_DEVICE void write_start_array()
+  /**
+   * return false if copy failed, e.g.: JSON validation failed
+   * return true if copy successfully
+   */
+  CUDF_HOST_DEVICE bool copy_current_structure(json_parser<max_json_nesting_depth>& parser)
   {
     // TODO
-  }
-
-  CUDF_HOST_DEVICE void write_end_array()
-  {
-    // TODO
-  }
-
-  CUDF_HOST_DEVICE void copy_current_structure(json_parser<max_json_nesting_depth>& parser)
-  {
-    // TODO
+    return false;  // never reach to here
   }
 
   /**
@@ -134,16 +138,31 @@ class json_generator {
    */
   CUDF_HOST_DEVICE void write_raw(json_parser<max_json_nesting_depth>& parser)
   {
-    if (output) {
+    if (nullptr != output) {
       auto copied = parser.write_unescaped_text(output + output_len);
       output_len += copied;
+    } else {
+      auto len = parser.compute_unescaped_len();
+      output_len += len;
+    }
+  }
+
+  CUDF_HOST_DEVICE void write_raw_value(char const* p, size_t len)
+  {
+    if (nullptr != output) {
+      memcpy(output + output_len, p, len);
+      output_len += len;
+    } else {
+      output_len += len;
     }
   }
 
   CUDF_HOST_DEVICE inline size_t get_output_len() const { return output_len; }
+  CUDF_HOST_DEVICE inline char* get_output_start_position() const { return output; }
+  CUDF_HOST_DEVICE inline char* get_current_output_position() const { return output + output_len; }
 
  private:
-  char const* const output;
+  char* output;
   size_t output_len;
 };
 
@@ -156,30 +175,354 @@ class json_generator {
  * would want to continue doing this until you either encounter an error
  * (parse_result::ERROR) or you get nothing back (parse_result::EMPTY)
  */
-enum class parse_result {
-  ERROR,          // failure
-  SUCCESS,        // success
-  MISSING_FIELD,  // success, but the field is missing
-  EMPTY,          // success, but no data
-};
+enum class parse_result { ERROR, SUCCESS };
+
+CUDF_HOST_DEVICE inline bool path_is_empty(size_t path_size) { return path_size == 0; }
+
+CUDF_HOST_DEVICE inline bool path_match_element(path_instruction const* path_ptr,
+                                                size_t path_size,
+                                                path_instruction_type path_type0)
+{
+  if (path_size < 1) { return false; }
+  return path_ptr[0].type == path_type0;
+}
+
+CUDF_HOST_DEVICE inline bool path_match_elements(path_instruction const* path_ptr,
+                                                 size_t path_size,
+                                                 path_instruction_type path_type0,
+                                                 path_instruction_type path_type1)
+{
+  if (path_size < 2) { return false; }
+  return path_ptr[0].type == path_type0 && path_ptr[1].type == path_type1;
+}
+
+CUDF_HOST_DEVICE inline bool path_match_elements(path_instruction const* path_ptr,
+                                                 size_t path_size,
+                                                 path_instruction_type path_type0,
+                                                 path_instruction_type path_type1,
+                                                 path_instruction_type path_type2,
+                                                 path_instruction_type path_type3)
+{
+  if (path_size < 4) { return false; }
+  return path_ptr[0].type == path_type0 && path_ptr[1].type == path_type1 &&
+         path_ptr[2].type == path_type2 && path_ptr[3].type == path_type3;
+}
+
+CUDF_HOST_DEVICE inline thrust::tuple<bool, int> path_match_subscript_index(
+  path_instruction const* path_ptr, size_t path_size)
+{
+  auto match = path_match_elements(
+    path_ptr, path_size, path_instruction_type::subscript, path_instruction_type::index);
+  if (match) {
+    return thrust::make_tuple(true, path_ptr[1].index);
+  } else {
+    return thrust::make_tuple(false, 0);
+  }
+}
+
+CUDF_HOST_DEVICE inline thrust::tuple<bool, cudf::string_view> path_match_named(
+  path_instruction const* path_ptr, size_t path_size)
+{
+  auto match = path_match_element(path_ptr, path_size, path_instruction_type::named);
+  if (match) {
+    return thrust::make_tuple(true, path_ptr[0].name);
+  } else {
+    return thrust::make_tuple(false, cudf::string_view());
+  }
+}
+
+CUDF_HOST_DEVICE inline thrust::tuple<bool, int> path_match_subscript_index_subscript_wildcard(
+  path_instruction const* path_ptr, size_t path_size)
+{
+  auto match = path_match_elements(path_ptr,
+                                   path_size,
+                                   path_instruction_type::subscript,
+                                   path_instruction_type::index,
+                                   path_instruction_type::subscript,
+                                   path_instruction_type::wildcard);
+  if (match) {
+    return thrust::make_tuple(true, path_ptr[1].index);
+  } else {
+    return thrust::make_tuple(false, 0);
+  }
+}
+
+template <int max_json_nesting_depth = curr_max_json_nesting_depth>
+__device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
+                              thrust::optional<char> first_char_in_g,
+                              json_generator<max_json_nesting_depth>& g,
+                              write_style style,
+                              path_instruction const* path_ptr,
+                              int path_size)
+{
+  auto token = p.get_current_token();
+
+  // case (VALUE_STRING, Nil) if style == RawStyle
+  if (json_token::VALUE_STRING == token && path_is_empty(path_size) &&
+      style == write_style::raw_style) {
+    // there is no array wildcard or slice parent, emit this string without quotes
+    // write current string in parser to generator
+    g.write_raw(p);
+    return true;
+  }
+  // case (START_ARRAY, Nil) if style == FlattenStyle
+  else if (json_token::START_ARRAY == token && path_is_empty(path_size) &&
+           style == write_style::flatten_style) {
+    // flatten this array into the parent
+    bool dirty = false;
+    while (json_token::END_ARRAY != p.next_token()) {
+      // JSON validation check
+      if (json_token::ERROR == p.get_current_token()) { return false; }
+
+      dirty |= evaluate_path(p, thrust::nullopt, g, style, nullptr, 0);
+    }
+    return dirty;
+  }
+  // case (_, Nil)
+  else if (path_is_empty(path_size)) {
+    // general case: just copy the child tree verbatim
+    return g.copy_current_structure(p);
+  }
+  // case (START_OBJECT, Key :: xs)
+  else if (json_token::START_OBJECT == token &&
+           path_match_element(path_ptr, path_size, path_instruction_type::key)) {
+    bool dirty = false;
+    while (json_token::END_OBJECT != p.next_token()) {
+      // JSON validation check
+      if (json_token::ERROR == p.get_current_token()) { return false; }
+
+      if (dirty) {
+        // once a match has been found we can skip other fields
+        if (!p.try_skip_children()) {
+          // JSON validation check
+          return false;
+        }
+      } else {
+        dirty = evaluate_path(p, thrust::nullopt, g, style, path_ptr + 1, path_size - 1);
+      }
+    }
+    return dirty;
+  }
+  // case (START_ARRAY, Subscript :: Wildcard :: Subscript :: Wildcard :: xs)
+  else if (json_token::START_ARRAY == token &&
+           path_match_elements(path_ptr,
+                               path_size,
+                               path_instruction_type::subscript,
+                               path_instruction_type::wildcard,
+                               path_instruction_type::subscript,
+                               path_instruction_type::wildcard)) {
+    // special handling for the non-structure preserving double wildcard behavior in Hive
+    bool dirty = false;
+    g.write_start_array();
+    while (p.next_token() != json_token::END_ARRAY) {
+      // JSON validation check
+      if (json_token::ERROR == p.get_current_token()) { return false; }
+
+      dirty |= evaluate_path(
+        p, thrust::nullopt, g, write_style::flatten_style, path_ptr + 4, path_size - 4);
+    }
+    g.write_end_array();
+    return dirty;
+  }
+  // case (START_ARRAY, Subscript :: Wildcard :: xs) if style != QuotedStyle
+  else if (json_token::START_ARRAY == token &&
+           path_match_elements(path_ptr,
+                               path_size,
+                               path_instruction_type::subscript,
+                               path_instruction_type::wildcard) &&
+           style != write_style::quoted_style) {
+    // retain Flatten, otherwise use Quoted... cannot use Raw within an array
+    write_style next_style;
+    switch (style) {
+      case write_style::raw_style: next_style = write_style::quoted_style; break;
+      case write_style::flatten_style: next_style = write_style::flatten_style; break;
+      case write_style::quoted_style: assert(false);
+    }
+
+    // temporarily buffer child matches, the emitted json will need to be
+    // modified slightly if there is only a single element written
+
+    int dirty    = 0;
+    auto child_g = g.new_child_generator();
+
+    // store the first char for child generator
+    char first_char_in_sub_generator = '[';
+    while (p.next_token() != json_token::END_ARRAY) {
+      // JSON validation check
+      if (json_token::ERROR == p.get_current_token()) { return false; }
+
+      // track the number of array elements and only emit an outer array if
+      // we've written more than one element, this matches Hive's behavior
+      dirty += (evaluate_path(
+                  p, first_char_in_sub_generator, child_g, next_style, path_ptr + 2, path_size - 2)
+                  ? 1
+                  : 0);
+    }
+    child_g.write_end_array();
+
+    if (dirty > 1) {
+      // First move chars [2, end) a byte forward
+      char* child_g_pos = child_g.get_current_output_position();
+      while (child_g_pos > child_g.get_output_start_position()) {
+        *child_g_pos = *(child_g_pos - 1);
+        child_g_pos--;
+      }
+
+      // TODO check write raw value
+      *child_g_pos = first_char_in_sub_generator;
+    } else if (dirty == 1) {
+      // remove outer array tokens
+      // do not need to do anything, because child generator did not write first char '['
+    }  // else do not write anything
+
+    return dirty > 0;
+  }
+  // case (START_ARRAY, Subscript :: Wildcard :: xs)
+  else if (json_token::START_ARRAY == token &&
+           path_match_elements(path_ptr,
+                               path_size,
+                               path_instruction_type::subscript,
+                               path_instruction_type::wildcard)) {
+    bool dirty = false;
+    g.write_start_array();
+    while (p.next_token() != json_token::END_ARRAY) {
+      // JSON validation check
+      if (json_token::ERROR == p.get_current_token()) { return false; }
+
+      // wildcards can have multiple matches, continually update the dirty count
+      dirty |= evaluate_path(
+        p, thrust::nullopt, g, write_style::quoted_style, path_ptr + 2, path_size - 2);
+    }
+    g.write_end_array();
+
+    return dirty;
+  }
+  // case (START_ARRAY, Subscript :: Index(idx) :: (xs@Subscript :: Wildcard :: _))
+  else if (json_token::START_ARRAY == token &&
+           thrust::get<0>(path_match_subscript_index_subscript_wildcard(path_ptr, path_size))) {
+    int idx = thrust::get<1>(path_match_subscript_index_subscript_wildcard(path_ptr, path_size));
+    p.next_token();
+    // JSON validation check
+    if (json_token::ERROR == p.get_current_token()) { return false; }
+
+    int i = idx;
+    while (i >= 0) {
+      if (p.get_current_token() == json_token::END_ARRAY) {
+        // terminate, nothing has been written
+        return false;
+      }
+      if (0 == i) {
+        bool dirty = evaluate_path(
+          p, thrust::nullopt, g, write_style::quoted_style, path_ptr + 2, path_size - 2);
+        while (p.next_token() != json_token::END_ARRAY) {
+          // JSON validation check
+          if (json_token::ERROR == p.get_current_token()) { return false; }
+
+          // advance the token stream to the end of the array
+          if (!p.try_skip_children()) { return false; }
+        }
+        return dirty;
+      } else {
+        // i > 0
+        if (!p.try_skip_children()) { return false; }
+
+        p.next_token();
+        // JSON validation check
+        if (json_token::ERROR == p.get_current_token()) { return false; }
+      }
+      --i;
+    }
+    // path parser guarantees idx >= 0
+    // will never reach to here
+    return false;
+  }
+  // case (START_ARRAY, Subscript :: Index(idx) :: xs)
+  else if (json_token::START_ARRAY == token &&
+           thrust::get<0>(path_match_subscript_index(path_ptr, path_size))) {
+    int idx = thrust::get<1>(path_match_subscript_index(path_ptr, path_size));
+    p.next_token();
+    // JSON validation check
+    if (json_token::ERROR == p.get_current_token()) { return false; }
+
+    int i = idx;
+    while (i >= 0) {
+      if (p.get_current_token() == json_token::END_ARRAY) {
+        // terminate, nothing has been written
+        return false;
+      }
+      if (0 == i) {
+        bool dirty = evaluate_path(p, thrust::nullopt, g, style, path_ptr + 2, path_size - 2);
+        while (p.next_token() != json_token::END_ARRAY) {
+          // JSON validation check
+          if (json_token::ERROR == p.get_current_token()) { return false; }
+
+          // advance the token stream to the end of the array
+          if (!p.try_skip_children()) { return false; }
+        }
+        return dirty;
+      } else {
+        // i > 0
+        if (!p.try_skip_children()) { return false; }
+
+        p.next_token();
+        // JSON validation check
+        if (json_token::ERROR == p.get_current_token()) { return false; }
+      }
+      --i;
+    }
+    // path parser guarantees idx >= 0
+    // will never reach to here
+    return false;
+  }
+  // case (FIELD_NAME, Named(name) :: xs) if p.getCurrentName == name
+  else if (json_token::FIELD_NAME == token &&
+           thrust::get<0>(path_match_named(path_ptr, path_size)) &&
+           p.match_current_field_name(thrust::get<1>(path_match_named(path_ptr, path_size)))) {
+    if (p.next_token() != json_token::VALUE_NULL) {
+      // JSON validation check
+      if (json_token::ERROR == p.get_current_token()) { return false; }
+
+      return evaluate_path(p, thrust::nullopt, g, style, path_ptr + 1, path_size - 1);
+    } else {
+      return false;
+    }
+  }
+  // case (FIELD_NAME, Wildcard :: xs)
+  else if (json_token::FIELD_NAME == token &&
+           path_match_element(path_ptr, path_size, path_instruction_type::wildcard)) {
+    p.next_token();
+    // JSON validation check
+    if (json_token::ERROR == p.get_current_token()) { return false; }
+
+    return evaluate_path(p, thrust::nullopt, g, style, path_ptr + 1, path_size - 1);
+  } else {
+    p.try_skip_children();
+    return false;
+  }
+}
 
 /**
  * @brief Parse a single json string using the provided command buffer
  *
- * @param j_state The incoming json string and associated parser
- * @param commands The command buffer to be applied to the string. Always ends
- * with a path_operator_type::END
- * @param output Buffer user to store the results of the query
+ * @param j_parser The incoming json string and associated parser
+ * @param path_ptr The command buffer to be applied to the string.
+ * @param path_size Command buffer size
+ * @param output Buffer used to store the results of the query
  * @returns A result code indicating success/fail/empty.
  */
 template <int max_json_nesting_depth = curr_max_json_nesting_depth>
 __device__ parse_result parse_json_path(json_parser<max_json_nesting_depth>& j_parser,
-                                        path_instruction const* path_commands_ptr,
-                                        int path_commands_size,
+                                        path_instruction const* path_ptr,
+                                        size_t path_size,
                                         json_generator<max_json_nesting_depth>& output)
 {
-  // TODO
-  return parse_result::SUCCESS;
+  j_parser.next_token();
+  // JSON validation check
+  if (json_token::ERROR == j_parser.get_current_token()) { return parse_result::ERROR; }
+
+  auto matched =
+    evaluate_path(j_parser, thrust::nullopt, output, write_style::raw_style, path_ptr, path_size);
+  return matched ? parse_result::SUCCESS : parse_result::ERROR;
 }
 
 /**
@@ -199,13 +542,15 @@ __device__ parse_result parse_json_path(json_parser<max_json_nesting_depth>& j_p
  */
 template <int max_json_nesting_depth = curr_max_json_nesting_depth>
 __device__ thrust::pair<parse_result, json_generator<max_json_nesting_depth>>
-get_json_object_single(char const* input,
-                       cudf::size_type input_len,
-                       path_instruction const* path_commands_ptr,
-                       int path_commands_size,
-                       char* out_buf,
-                       size_t out_buf_size,
-                       json_parser_options options)
+get_json_object_single(
+  char const* input,
+  cudf::size_type input_len,
+  path_instruction const* path_commands_ptr,
+  int path_commands_size,
+  char* out_buf,
+  size_t out_buf_size,
+  json_parser_options options)  // TODO make this a reference? use a global singleton options?
+                                // reduce the copy contructor overhead
 {
   json_parser j_parser(options, input, input_len);
   json_generator generator(out_buf, out_buf_size);
@@ -296,7 +641,6 @@ __launch_bounds__(block_size) CUDF_KERNEL
 
 std::unique_ptr<cudf::column> get_json_object(cudf::strings_column_view const& col,
                                               cudf::string_scalar const& json_path,
-                                              spark_rapids_jni::json_parser_options options,
                                               rmm::cuda_stream_view stream,
                                               rmm::mr::device_memory_resource* mr)
 {
@@ -310,9 +654,11 @@ std::unique_ptr<cudf::column> get_json_object(cudf::strings_column_view const& c
     return std::make_unique<cudf::column>(
       cudf::data_type{cudf::type_id::STRING},
       col.size(),
-      rmm::device_buffer{0, stream, mr},  // no data
+      // no data
+      rmm::device_buffer{0, stream, mr},
       cudf::detail::create_null_mask(col.size(), cudf::mask_state::ALL_NULL, stream, mr),
-      col.size());  // null count
+      // null count
+      col.size());
   }
 
   // compute output sizes
@@ -323,6 +669,15 @@ std::unique_ptr<cudf::column> get_json_object(cudf::strings_column_view const& c
   constexpr int block_size = 512;
   cudf::detail::grid_1d const grid{col.size(), block_size};
   auto cdv = cudf::column_device_view::create(col.parent(), stream);
+
+  // create json parser options
+  spark_rapids_jni::json_parser_options options;
+  options.set_allow_single_quotes(true);
+  options.set_allow_unescaped_control_chars(true);
+  options.set_max_string_len(true);
+  options.set_max_num_len(true);
+  options.set_allow_tailing_sub_string(true);
+
   // preprocess sizes (returned in the offsets buffer)
   get_json_object_kernel<block_size>
     <<<grid.num_blocks, grid.num_threads_per_block, 0, stream.value()>>>(
@@ -382,13 +737,11 @@ std::unique_ptr<cudf::column> get_json_object(cudf::strings_column_view const& c
 
 std::unique_ptr<cudf::column> get_json_object(cudf::strings_column_view const& col,
                                               cudf::string_scalar const& json_path,
-                                              spark_rapids_jni::json_parser_options options,
                                               rmm::cuda_stream_view stream,
                                               rmm::mr::device_memory_resource* mr)
 {
-  // TODO: main logic
-  // return cudf::make_empty_column(cudf::type_to_id<cudf::size_type>());
-  return detail::get_json_object(col, json_path, options, stream, mr);
+  // TODO: here do not know if json path is invalid, should handle it in Plugin
+  return detail::get_json_object(col, json_path, stream, mr);
 }
 
 }  // namespace spark_rapids_jni
