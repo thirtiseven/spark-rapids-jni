@@ -686,9 +686,9 @@ class json_parser {
     bytes_diff_for_escape_writing = 0;
 
     // write the first " if write style is escaped
-    if (nullptr != copy_destination && write_style::escaped == w_style) {
-      *copy_destination++ = '"';
+    if (write_style::escaped == w_style) {
       bytes_diff_for_escape_writing++;
+      if (nullptr != copy_destination) { *copy_destination++ = '"'; }
     }
 
     // skip left quote char
@@ -712,9 +712,9 @@ class json_parser {
         }
 
         // write the end " if write style is escaped
-        if (nullptr != copy_destination && write_style::escaped == w_style) {
-          *copy_destination++ = '"';
+        if (write_style::escaped == w_style) {
           bytes_diff_for_escape_writing++;
+          if (nullptr != copy_destination) { *copy_destination++ = '"'; }
         }
 
         return std::make_pair(true, str_pos);
@@ -1284,8 +1284,11 @@ class json_parser {
   /**
    * continute parsing the next token and update current token
    * Note: only parse one token at a time
+   * @param[out] has_comma_before_token has comma before next token
+   * @param[out] has_colon_before_token has colon before next token
    */
-  CUDF_HOST_DEVICE inline json_token parse_next_token()
+  CUDF_HOST_DEVICE inline json_token parse_next_token(bool& has_comma_before_token,
+                                                      bool& has_colon_before_token)
   {
     // SUCCESS or ERROR means parsing is completed,
     // should not call this function again.
@@ -1332,6 +1335,7 @@ class json_parser {
             }
           } else if (curr_token == json_token::FIELD_NAME) {
             if (c == ':') {
+              has_colon_before_token = true;
               // skip ':' and parse value in key:value pair
               curr_pos++;
               skip_whitespaces(curr_pos);
@@ -1349,6 +1353,7 @@ class json_parser {
               curr_token = json_token::END_OBJECT;
               pop_curr_context();
             } else if (c == ',') {
+              has_comma_before_token = true;
               // parse next key:value pair
               curr_pos++;
               skip_whitespaces(curr_pos);
@@ -1375,6 +1380,7 @@ class json_parser {
             }
           } else {
             if (c == ',') {
+              has_comma_before_token = true;
               // skip ',' and parse the next value
               curr_pos++;
               skip_whitespaces(curr_pos);
@@ -1417,7 +1423,9 @@ class json_parser {
     // save current token
     previous_token = curr_token;
     // parse next token
-    return parse_next_token();
+    bool has_comma_before_token;  // no-initialization because of do not care here
+    bool has_colon_before_token;  // no-initialization because of do not care here
+    return parse_next_token(has_comma_before_token, has_colon_before_token);
   }
 
   /**
@@ -1484,30 +1492,45 @@ class json_parser {
           current_token_start_pos, nullptr, nullptr, destination, write_style::unescaped);
         return string_token_utf8_bytes;
       case json_token::VALUE_NUMBER_INT:
+        // int can be copied from JSON string directly
+        if (nullptr != destination) {
+          for (cudf::size_type i = 0; i < number_token_len; ++i) {
+            *destination++ = *(current_token_start_pos + i);
+          }
+        }
+        return number_token_len;
       case json_token::VALUE_NUMBER_FLOAT:
-        // number can be copied from JSON string directly
-        for (cudf::size_type i = 0; i < number_token_len; ++i) {
-          *destination++ = *(current_token_start_pos + i);
+        // TODO normalization: 0.03E-2 => 0.3E-5
+        if (nullptr != destination) {
+          for (cudf::size_type i = 0; i < number_token_len; ++i) {
+            *destination++ = *(current_token_start_pos + i);
+          }
         }
         return number_token_len;
       case json_token::VALUE_TRUE:
-        *destination++ = 't';
-        *destination++ = 'r';
-        *destination++ = 'u';
-        *destination++ = 'e';
+        if (nullptr != destination) {
+          *destination++ = 't';
+          *destination++ = 'r';
+          *destination++ = 'u';
+          *destination++ = 'e';
+        }
         return 4;
       case json_token::VALUE_FALSE:
-        *destination++ = 'f';
-        *destination++ = 'a';
-        *destination++ = 'l';
-        *destination++ = 's';
-        *destination++ = 'e';
+        if (nullptr != destination) {
+          *destination++ = 'f';
+          *destination++ = 'a';
+          *destination++ = 'l';
+          *destination++ = 's';
+          *destination++ = 'e';
+        }
         return 5;
       case json_token::VALUE_NULL:
-        *destination++ = 'n';
-        *destination++ = 'u';
-        *destination++ = 'l';
-        *destination++ = 'l';
+        if (nullptr != destination) {
+          *destination++ = 'n';
+          *destination++ = 'u';
+          *destination++ = 'l';
+          *destination++ = 'l';
+        }
         return 4;
       case json_token::FIELD_NAME:
         // can not copy from JSON directly due to escaped chars
@@ -1515,10 +1538,18 @@ class json_parser {
         try_parse_string(
           current_token_start_pos, nullptr, nullptr, destination, write_style::unescaped);
         return string_token_utf8_bytes;
-      case json_token::START_ARRAY: *destination++ = '['; return 1;
-      case json_token::END_ARRAY: *destination++ = ']'; return 1;
-      case json_token::START_OBJECT: *destination++ = '{'; return 1;
-      case json_token::END_OBJECT: *destination++ = '}'; return 1;
+      case json_token::START_ARRAY:
+        if (nullptr != destination) { *destination++ = '['; }
+        return 1;
+      case json_token::END_ARRAY:
+        if (nullptr != destination) { *destination++ = ']'; }
+        return 1;
+      case json_token::START_OBJECT:
+        if (nullptr != destination) { *destination++ = '{'; }
+        return 1;
+      case json_token::END_OBJECT:
+        if (nullptr != destination) { *destination++ = '}'; }
+        return 1;
       // for the following tokens, return false
       case json_token::SUCCESS:
       case json_token::ERROR:
@@ -1527,6 +1558,7 @@ class json_parser {
     return 0;
   }
 
+  CUDF_HOST_DEVICE cudf::size_type compute_escaped_len() { return write_escaped_text(nullptr); }
   /**
    * escape current token text, then write to destination
    * e.g.: '"' is a string with 1 char '"', writes out 4 chars '"' '\' '\"' '"'
@@ -1542,32 +1574,40 @@ class json_parser {
         // rewind the pos; parse again with copy
         try_parse_string(
           current_token_start_pos, nullptr, nullptr, destination, write_style::escaped);
-        return string_token_utf8_bytes + bytes_diff_for_escape_writing++;
+        return string_token_utf8_bytes + bytes_diff_for_escape_writing;
       case json_token::VALUE_NUMBER_INT:
       case json_token::VALUE_NUMBER_FLOAT:
         // number can be copied from JSON string directly
-        for (cudf::size_type i = 0; i < number_token_len; ++i) {
-          *destination++ = *(current_token_start_pos + i);
+        if (nullptr != destination) {
+          for (cudf::size_type i = 0; i < number_token_len; ++i) {
+            *destination++ = *(current_token_start_pos + i);
+          }
         }
         return number_token_len;
       case json_token::VALUE_TRUE:
-        *destination++ = 't';
-        *destination++ = 'r';
-        *destination++ = 'u';
-        *destination++ = 'e';
+        if (nullptr != destination) {
+          *destination++ = 't';
+          *destination++ = 'r';
+          *destination++ = 'u';
+          *destination++ = 'e';
+        }
         return 4;
       case json_token::VALUE_FALSE:
-        *destination++ = 'f';
-        *destination++ = 'a';
-        *destination++ = 'l';
-        *destination++ = 's';
-        *destination++ = 'e';
+        if (nullptr != destination) {
+          *destination++ = 'f';
+          *destination++ = 'a';
+          *destination++ = 'l';
+          *destination++ = 's';
+          *destination++ = 'e';
+        }
         return 5;
       case json_token::VALUE_NULL:
-        *destination++ = 'n';
-        *destination++ = 'u';
-        *destination++ = 'l';
-        *destination++ = 'l';
+        if (nullptr != destination) {
+          *destination++ = 'n';
+          *destination++ = 'u';
+          *destination++ = 'l';
+          *destination++ = 'l';
+        }
         return 4;
       case json_token::FIELD_NAME:
         // can not copy from JSON directly due to escaped chars
@@ -1575,10 +1615,18 @@ class json_parser {
         try_parse_string(
           current_token_start_pos, nullptr, nullptr, destination, write_style::escaped);
         return string_token_utf8_bytes + bytes_diff_for_escape_writing;
-      case json_token::START_ARRAY: *destination++ = '['; return 1;
-      case json_token::END_ARRAY: *destination++ = ']'; return 1;
-      case json_token::START_OBJECT: *destination++ = '{'; return 1;
-      case json_token::END_OBJECT: *destination++ = '}'; return 1;
+      case json_token::START_ARRAY:
+        if (nullptr != destination) { *destination++ = '['; }
+        return 1;
+      case json_token::END_ARRAY:
+        if (nullptr != destination) { *destination++ = ']'; }
+        return 1;
+      case json_token::START_OBJECT:
+        if (nullptr != destination) { *destination++ = '{'; }
+        return 1;
+      case json_token::END_OBJECT:
+        if (nullptr != destination) { *destination++ = '}'; }
+        return 1;
       // for the following tokens, return false
       case json_token::SUCCESS:
       case json_token::ERROR:
@@ -1594,6 +1642,7 @@ class json_parser {
   {
     curr_pos               = json_start_pos;
     curr_token             = json_token::INIT;
+    previous_token         = json_token::INIT;
     stack_size             = 0;
     curr_field_name_offset = -1;
   }
@@ -1672,6 +1721,92 @@ class json_parser {
     }
   }
 
+  /**
+   * copy current structure to destination.
+   * return false if meets JSON format error,
+   * reurn true otherwise.
+   * @param[out] copy_to
+   */
+  CUDF_HOST_DEVICE thrust::pair<bool, size_t> copy_current_structure(char* copy_to)
+  {
+    switch (curr_token) {
+      case json_token::INIT:
+      case json_token::ERROR:
+      case json_token::SUCCESS:
+      case json_token::FIELD_NAME:
+      case json_token::END_ARRAY:
+      case json_token::END_OBJECT: return thrust::make_pair(false, 0);
+      case json_token::VALUE_NUMBER_INT:
+      case json_token::VALUE_NUMBER_FLOAT:
+      case json_token::VALUE_STRING:
+      case json_token::VALUE_TRUE:
+      case json_token::VALUE_FALSE:
+      case json_token::VALUE_NULL:
+        // copy terminal token
+        if (nullptr != copy_to) {
+          size_t copy_len = write_escaped_text(copy_to);
+          return thrust::make_pair(true, copy_len);
+        } else {
+          size_t copy_len = compute_escaped_len();
+          return thrust::make_pair(true, copy_len);
+        }
+      case json_token::START_ARRAY:
+      case json_token::START_OBJECT:
+        // stack size increased by 1 when meet start object/array
+        // copy until meet matched end object/array
+        size_t sum_copy_len   = 0;
+        int backup_stack_size = stack_size;
+
+        // copy start object/array
+        if (nullptr != copy_to) {
+          int len = write_escaped_text(copy_to);
+          sum_copy_len += len;
+          copy_to += len;
+        } else {
+          sum_copy_len += compute_unescaped_len();
+        }
+
+        while (true) {
+          bool has_comma_before_token = false;
+          bool has_colon_before_token = false;
+
+          // parse and get has_comma_before_token, has_colon_before_token
+          parse_next_token(has_comma_before_token, has_colon_before_token);
+
+          // check the JSON format
+          if (curr_token == json_token::ERROR) { return thrust::make_pair(false, 0); }
+
+          // write out the token
+          if (nullptr != copy_to) {
+            if (has_comma_before_token) {
+              sum_copy_len++;
+              *copy_to++ = ',';
+            }
+            if (has_colon_before_token) {
+              sum_copy_len++;
+              *copy_to++ = ':';
+            }
+            int len = write_escaped_text(copy_to);
+            sum_copy_len += len;
+            copy_to += len;
+          } else {
+            if (has_comma_before_token) { sum_copy_len++; }
+            if (has_colon_before_token) { sum_copy_len++; }
+            sum_copy_len += compute_escaped_len();
+          }
+
+          if (backup_stack_size - 1 == stack_size) {
+            // indicate meet the matched end object/array
+            return thrust::make_pair(true, sum_copy_len);
+          }
+        }
+        return thrust::make_pair(false, 0);
+    }
+
+    // never happen
+    return thrust::make_pair(false, 0);
+  }
+
  private:
   json_parser_options const& options;
   char const* const json_start_pos;
@@ -1688,9 +1823,9 @@ class json_parser {
   // saves field names for start object/array token, end object token and end array token
   // has the same field names with corresponding start object token and  start array token
   cudf::size_type field_name_offset_stack[max_json_nesting_depth];
-  // current field name: last reached field name or poped field name when encounter ]/}
+  // current field name: last reached field name or poped field name when meet ]/}
   // using offset in JSON str instead of `char *` to save memory,
-  // here assume `char *` using 8 bytes
+  // here assume `char *` using 8 bytes, size_type using 4 bytes.
   cudf::size_type curr_field_name_offset = -1;
   int stack_size                         = 0;
 

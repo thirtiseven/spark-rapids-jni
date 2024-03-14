@@ -81,8 +81,9 @@ thrust::optional<rmm::device_uvector<path_instruction>> parse_path(
 }
 
 /**
- * TODO: JSON generator
- *
+ * JSON generator is used to write out JSON string.
+ * It's not a full featured JSON generator, because get json object
+ * outputs an array or single item. JSON object is wroten as a whole item.
  */
 template <int max_json_nesting_depth = curr_max_json_nesting_depth>
 class json_generator {
@@ -104,29 +105,75 @@ class json_generator {
     }
   }
 
-  CUDF_HOST_DEVICE void write_start_array() {}
-
-  CUDF_HOST_DEVICE void write_end_array() {}
-
-  CUDF_HOST_DEVICE void copy_current_unescaped_text(json_parser<max_json_nesting_depth>& parser)
+  CUDF_HOST_DEVICE void write_start_array()
   {
-    if (nullptr != output) {
-      int len = parser.write_unescaped_text(output + output_len);
-      output_len += len;
-    } else {
-      int len = parser.compute_unescaped_text(output + output_len);
-      output_len += len;
+    if (output) { *(output + output_len) = '['; }
+    output_len++;
+    is_first_item[array_depth] = true;
+    array_depth++;
+  }
+
+  /**
+   * only update the internal state, not actually write to underlying buffer
+   */
+  CUDF_HOST_DEVICE void write_start_array_fake()
+  {
+    output_len++;
+    is_first_item[array_depth] = true;
+    array_depth++;
+  }
+
+  CUDF_HOST_DEVICE void write_end_array()
+  {
+    if (output) { *(output + output_len) = ']'; }
+    output_len++;
+    array_depth--;
+  }
+
+  CUDF_HOST_DEVICE void write_end_array_fake()
+  {
+    output_len++;
+    array_depth--;
+  }
+
+  CUDF_HOST_DEVICE bool need_comma() { return (array_depth > 0 && is_first_item[array_depth - 1]); }
+
+  /**
+   * write comma accroding to current generator state
+   */
+  CUDF_HOST_DEVICE void try_write_comma()
+  {
+    if (need_comma()) {
+      // in array context and writes first item
+      *(output + output_len) = ',';
+      output_len++;
     }
   }
 
   /**
-   * return false if copy failed, e.g.: JSON validation failed
-   * return true if copy successfully
+   * copy current structure when parsing. If current token is start object/array, then copy to
+   * corresponding matched end object/array.
+   * return false if JSON format is invalid
+   * return true if JSON format is valid
    */
   CUDF_HOST_DEVICE bool copy_current_structure(json_parser<max_json_nesting_depth>& parser)
   {
-    // TODO
-    return false;  // never reach to here
+    // first try add comma
+    try_write_comma();
+
+    is_first_item[array_depth - 1] = false;
+
+    if (nullptr != output) {
+      auto copy_to       = output + output_len;
+      auto [b, copy_len] = parser.copy_current_structure(copy_to);
+      output_len += copy_len;
+      return b;
+    } else {
+      char* copy_to      = nullptr;
+      auto [b, copy_len] = parser.copy_current_structure(copy_to);
+      output_len += copy_len;
+      return b;
+    }
   }
 
   /**
@@ -138,6 +185,8 @@ class json_generator {
    */
   CUDF_HOST_DEVICE void write_raw(json_parser<max_json_nesting_depth>& parser)
   {
+    is_first_item[array_depth - 1] = false;
+
     if (nullptr != output) {
       auto copied = parser.write_unescaped_text(output + output_len);
       output_len += copied;
@@ -147,13 +196,78 @@ class json_generator {
     }
   }
 
-  CUDF_HOST_DEVICE void write_raw_value(char const* p, size_t len)
+  /**
+   * write child raw value
+   * e.g.:
+   *
+   * write_array_tokens = false
+   * need_comma = true
+   * [1,2,3]1,2,3
+   *        ^
+   *        |
+   *    child pointer
+   * ==>>
+   * [1,2,3],1,2,3
+   *
+   *
+   * write_array_tokens = true
+   * need_comma = true
+   *   [12,3,4
+   *     ^
+   *     |
+   * child pointer
+   * ==>>
+   *   [1,[2,3,4]
+   *
+   * @param child_block_begin
+   * @param child_block_len
+   */
+  CUDF_HOST_DEVICE void write_raw_value(char* child_block_begin,
+                                        size_t child_block_len,
+                                        bool write_outer_array_tokens)
   {
+    bool insert_comma = need_comma();
+
+    is_first_item[array_depth - 1] = false;
+
     if (nullptr != output) {
-      memcpy(output + output_len, p, len);
-      output_len += len;
-    } else {
-      output_len += len;
+      if (write_outer_array_tokens) {
+        if (insert_comma) {
+          *(child_block_begin + child_block_len + 2) = ']';
+          move_forward(child_block_begin, child_block_len, 2);
+          *(child_block_begin + 1) = '[';
+          *(child_block_begin)     = ',';
+        } else {
+          *(child_block_begin + child_block_len + 1) = ']';
+          move_forward(child_block_begin, child_block_len, 1);
+          *(child_block_begin) = '[';
+        }
+      } else {
+        if (insert_comma) {
+          move_forward(child_block_begin, child_block_len, 1);
+          *(child_block_begin) = ',';
+        } else {
+          // do not need comma && do not need write outer array tokens
+          // do nothing
+        }
+      }
+    }
+
+    // update length
+    if (insert_comma) { output_len++; }
+    if (write_outer_array_tokens) { output_len += 2; }
+    output_len += child_block_len;
+  }
+
+  CUDF_HOST_DEVICE void move_forward(char* begin, size_t len, int forward)
+  {
+    char* pos = begin + len + forward - 1;
+    char* e   = begin + forward - 1;
+    // should add outer array tokens
+    // First move chars [2, end) a byte forward
+    while (pos > e) {
+      *pos = *(pos - 1);
+      pos--;
     }
   }
 
@@ -164,6 +278,9 @@ class json_generator {
  private:
   char* output;
   size_t output_len;
+
+  bool is_first_item[max_json_nesting_depth];
+  int array_depth = 0;
 };
 
 /**
@@ -249,8 +366,8 @@ CUDF_HOST_DEVICE inline thrust::tuple<bool, int> path_match_subscript_index_subs
 
 template <int max_json_nesting_depth = curr_max_json_nesting_depth>
 __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
-                              thrust::optional<char> first_char_in_g,
                               json_generator<max_json_nesting_depth>& g,
+                              bool g_contains_outer_array_pairs,
                               write_style style,
                               path_instruction const* path_ptr,
                               int path_size)
@@ -274,7 +391,7 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
       // JSON validation check
       if (json_token::ERROR == p.get_current_token()) { return false; }
 
-      dirty |= evaluate_path(p, thrust::nullopt, g, style, nullptr, 0);
+      dirty |= evaluate_path(p, g, true, style, nullptr, 0);
     }
     return dirty;
   }
@@ -298,7 +415,7 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
           return false;
         }
       } else {
-        dirty = evaluate_path(p, thrust::nullopt, g, style, path_ptr + 1, path_size - 1);
+        dirty = evaluate_path(p, g, true, style, path_ptr + 1, path_size - 1);
       }
     }
     return dirty;
@@ -318,8 +435,7 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
       // JSON validation check
       if (json_token::ERROR == p.get_current_token()) { return false; }
 
-      dirty |= evaluate_path(
-        p, thrust::nullopt, g, write_style::flatten_style, path_ptr + 4, path_size - 4);
+      dirty |= evaluate_path(p, g, true, write_style::flatten_style, path_ptr + 4, path_size - 4);
     }
     g.write_end_array();
     return dirty;
@@ -345,34 +461,30 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
     int dirty    = 0;
     auto child_g = g.new_child_generator();
 
-    // store the first char for child generator
-    char first_char_in_sub_generator = '[';
+    // child generator write a fake start array
+    child_g.write_start_array_fake();
+
     while (p.next_token() != json_token::END_ARRAY) {
       // JSON validation check
       if (json_token::ERROR == p.get_current_token()) { return false; }
 
       // track the number of array elements and only emit an outer array if
       // we've written more than one element, this matches Hive's behavior
-      dirty += (evaluate_path(
-                  p, first_char_in_sub_generator, child_g, next_style, path_ptr + 2, path_size - 2)
-                  ? 1
-                  : 0);
+      dirty += (evaluate_path(p, child_g, false, next_style, path_ptr + 2, path_size - 2) ? 1 : 0);
     }
-    child_g.write_end_array();
+
+    // child generator write a fake end array
+    child_g.write_end_array_fake();
+
+    char* child_g_start = child_g.get_output_start_position();
+    size_t child_g_len  = child_g.get_output_len() - 2;  // exclude [ ]
 
     if (dirty > 1) {
-      // First move chars [2, end) a byte forward
-      char* child_g_pos = child_g.get_current_output_position();
-      while (child_g_pos > child_g.get_output_start_position()) {
-        *child_g_pos = *(child_g_pos - 1);
-        child_g_pos--;
-      }
-
-      // TODO check write raw value
-      *child_g_pos = first_char_in_sub_generator;
+      // add outer array tokens
+      g.write_raw_value(child_g_start, child_g_len, true);
     } else if (dirty == 1) {
       // remove outer array tokens
-      // do not need to do anything, because child generator did not write first char '['
+      g.write_raw_value(child_g_start, child_g_len, false);
     }  // else do not write anything
 
     return dirty > 0;
@@ -390,8 +502,7 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
       if (json_token::ERROR == p.get_current_token()) { return false; }
 
       // wildcards can have multiple matches, continually update the dirty count
-      dirty |= evaluate_path(
-        p, thrust::nullopt, g, write_style::quoted_style, path_ptr + 2, path_size - 2);
+      dirty |= evaluate_path(p, g, true, write_style::quoted_style, path_ptr + 2, path_size - 2);
     }
     g.write_end_array();
 
@@ -412,8 +523,8 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
         return false;
       }
       if (0 == i) {
-        bool dirty = evaluate_path(
-          p, thrust::nullopt, g, write_style::quoted_style, path_ptr + 2, path_size - 2);
+        bool dirty =
+          evaluate_path(p, g, true, write_style::quoted_style, path_ptr + 2, path_size - 2);
         while (p.next_token() != json_token::END_ARRAY) {
           // JSON validation check
           if (json_token::ERROR == p.get_current_token()) { return false; }
@@ -451,7 +562,7 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
         return false;
       }
       if (0 == i) {
-        bool dirty = evaluate_path(p, thrust::nullopt, g, style, path_ptr + 2, path_size - 2);
+        bool dirty = evaluate_path(p, g, true, style, path_ptr + 2, path_size - 2);
         while (p.next_token() != json_token::END_ARRAY) {
           // JSON validation check
           if (json_token::ERROR == p.get_current_token()) { return false; }
@@ -482,7 +593,7 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
       // JSON validation check
       if (json_token::ERROR == p.get_current_token()) { return false; }
 
-      return evaluate_path(p, thrust::nullopt, g, style, path_ptr + 1, path_size - 1);
+      return evaluate_path(p, g, true, style, path_ptr + 1, path_size - 1);
     } else {
       return false;
     }
@@ -494,9 +605,10 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
     // JSON validation check
     if (json_token::ERROR == p.get_current_token()) { return false; }
 
-    return evaluate_path(p, thrust::nullopt, g, style, path_ptr + 1, path_size - 1);
+    return evaluate_path(p, g, true, style, path_ptr + 1, path_size - 1);
+    // case _ =>
   } else {
-    p.try_skip_children();
+    if (!p.try_skip_children()) { return false; }
     return false;
   }
 }
@@ -520,8 +632,7 @@ __device__ parse_result parse_json_path(json_parser<max_json_nesting_depth>& j_p
   // JSON validation check
   if (json_token::ERROR == j_parser.get_current_token()) { return parse_result::ERROR; }
 
-  auto matched =
-    evaluate_path(j_parser, thrust::nullopt, output, write_style::raw_style, path_ptr, path_size);
+  auto matched = evaluate_path(j_parser, output, true, write_style::raw_style, path_ptr, path_size);
   return matched ? parse_result::SUCCESS : parse_result::ERROR;
 }
 

@@ -1124,3 +1124,167 @@ TEST_F(JsonParserTests, WriteEscapedContralChars)
     assert_start_with(buf, buf_size, cases[i].second);
   }
 }
+
+void testCopyCurrentStructureValid(bool copy_to_nullptr)
+{
+  constexpr std::size_t buf_size = 256;
+  char buf[buf_size];
+  std::string json = R"(
+    {
+      "k1": 1,
+      'k2': {
+        "k3": {}
+      }
+    }
+  )";
+  json_parser_options options;
+  auto parser = get_parser(options, json, /*single_quote*/ true, /*control_char*/ true);
+  parser.next_token();
+  clear_buff(buf, buf_size);
+  char* copy_to = copy_to_nullptr ? nullptr : buf;
+  thrust::pair<bool, size_t> ret;
+  ret = parser.copy_current_structure(copy_to);
+  ASSERT_TRUE(thrust::get<0>(ret));  // copy from the first {
+  std::string expect = R"({"k1":1,"k2":{"k3":{}}})";
+  ASSERT_EQ(thrust::get<1>(ret), expect.size());
+  if (!copy_to_nullptr) { assert_start_with(buf, buf_size, expect); }
+  ASSERT_EQ(parser.get_current_token(), json_token::END_OBJECT);
+
+  parser.reset();
+  clear_buff(buf, buf_size);
+  parser.next_token();
+  parser.next_token();
+  parser.next_token();
+  parser.next_token();
+  parser.next_token();
+  copy_to = copy_to_nullptr ? nullptr : buf;
+  ret     = parser.copy_current_structure(copy_to);
+  ASSERT_TRUE(thrust::get<0>(ret));  // copy from the the 2nd {
+  expect = R"({"k3":{}})";
+  ASSERT_EQ(thrust::get<1>(ret), expect.size());
+  if (!copy_to_nullptr) { assert_start_with(buf, buf_size, expect); }
+  ASSERT_EQ(parser.get_current_token(), json_token::END_OBJECT);
+
+  std::string json2 = R"(
+    [[1,{'k':2},3]]
+  )";
+  auto parser2      = get_parser(options, json2, /*single_quote*/ true, /*control_char*/ true);
+  parser2.next_token();
+  clear_buff(buf, buf_size);
+  copy_to = copy_to_nullptr ? nullptr : buf;
+  ret     = parser2.copy_current_structure(copy_to);  // copy from the first [
+  ASSERT_TRUE(thrust::get<0>(ret));
+  expect = R"([[1,{"k":2},3]])";
+  ASSERT_EQ(thrust::get<1>(ret), expect.size());
+  if (!copy_to_nullptr) { assert_start_with(buf, buf_size, expect); }
+  ASSERT_EQ(parser2.get_current_token(), json_token::END_ARRAY);
+
+  parser2.reset();
+  clear_buff(buf, buf_size);
+  parser2.next_token();
+  parser2.next_token();
+  copy_to = copy_to_nullptr ? nullptr : buf;
+  ret     = parser2.copy_current_structure(copy_to);
+  ASSERT_TRUE(thrust::get<0>(ret));  // copy from the 2nd [
+  expect = R"([1,{"k":2},3])";
+  ASSERT_EQ(thrust::get<1>(ret), expect.size());
+  if (!copy_to_nullptr) { assert_start_with(buf, buf_size, expect); }
+  ASSERT_EQ(parser2.get_current_token(), json_token::END_ARRAY);
+
+  parser2.reset();
+  clear_buff(buf, buf_size);
+  parser2.next_token();
+  parser2.next_token();
+  parser2.next_token();  // current token is 1
+  copy_to = copy_to_nullptr ? nullptr : buf;
+  ret     = parser2.copy_current_structure(copy_to);
+  ASSERT_TRUE(thrust::get<0>(ret));
+  expect = "1";
+  ASSERT_EQ(thrust::get<1>(ret), expect.size());
+  if (!copy_to_nullptr) { assert_start_with(buf, buf_size, expect); }
+  ASSERT_EQ(parser2.get_current_token(), json_token::VALUE_NUMBER_INT);
+}
+
+TEST_F(JsonParserTests, CopyCurrentStructureValid)
+{
+  // testCopyCurrentStructureValid(/* copy_to_nullptr */ false);
+  testCopyCurrentStructureValid(/* copy_to_nullptr */ true);
+}
+
+TEST_F(JsonParserTests, CopyCurrentStructureInValid1)
+{
+  constexpr std::size_t buf_size = 256;
+  char buf[buf_size];
+  std::string json = R"(
+    [{}]
+  )";
+  json_parser_options options;
+  auto parser   = get_parser(options, json, /*single_quote*/ true, /*control_char*/ true);
+  char* copy_to = buf;
+  thrust::pair<bool, size_t> ret;
+  ret = parser.copy_current_structure(copy_to);
+  ASSERT_FALSE(thrust::get<0>(ret));  // INIT token
+  parser.next_token();
+  parser.next_token();
+  parser.next_token();
+  copy_to = buf;
+  ret     = parser.copy_current_structure(copy_to);
+  ASSERT_FALSE(thrust::get<0>(ret));  // for } token
+  parser.next_token();
+  copy_to = buf;
+  ret     = parser.copy_current_structure(copy_to);
+  ASSERT_FALSE(thrust::get<0>(ret));  // for ] token
+  parser.next_token();
+  copy_to = buf;
+  ret     = parser.copy_current_structure(copy_to);
+  ASSERT_FALSE(thrust::get<0>(ret));  // for SUCCESS token
+}
+
+TEST_F(JsonParserTests, CopyCurrentStructureInValid2)
+{
+  constexpr std::size_t buf_size = 256;
+  char buf[buf_size];
+  std::string json = R"(
+    {'k' : 1}
+  )";
+  json_parser_options options;
+  auto parser = get_parser(options, json, /*single_quote*/ true, /*control_char*/ true);
+  parser.next_token();
+  parser.next_token();
+  char* copy_to = buf;
+  thrust::pair<bool, size_t> ret;
+  ret = parser.copy_current_structure(copy_to);
+  ASSERT_FALSE(thrust::get<0>(ret));  // for field name 'k', return false
+}
+
+TEST_F(JsonParserTests, CopyCurrentStructureInValid3)
+{
+  constexpr std::size_t buf_size = 256;
+  char buf[buf_size];
+  std::string json = R"(
+    {'k' : 1
+  )";
+  json_parser_options options;
+  auto parser = get_parser(options, json, /*single_quote*/ true, /*control_char*/ true);
+  parser.next_token();
+  char* copy_to = buf;
+  thrust::pair<bool, size_t> ret;
+  ret = parser.copy_current_structure(copy_to);
+  ASSERT_FALSE(thrust::get<0>(ret));  // for { token, fails because of invalid JSON format
+}
+
+TEST_F(JsonParserTests, CopyCurrentStructureInValid4)
+{
+  constexpr std::size_t buf_size = 256;
+  char buf[buf_size];
+  std::string json = R"(
+    invalid
+  )";
+  json_parser_options options;
+  auto parser = get_parser(options, json, /*single_quote*/ true, /*control_char*/ true);
+  parser.next_token();
+  char* copy_to = buf;
+  thrust::pair<bool, size_t> ret;
+  ret = parser.copy_current_structure(copy_to);
+  ASSERT_FALSE(thrust::get<0>(ret));  // for ERROR token
+}
