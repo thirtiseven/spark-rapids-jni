@@ -781,24 +781,6 @@ void assert_ptr_len(char const* actaul_ptr,
   ASSERT_EQ(expected_len, actual_len);
 }
 
-TEST_F(JsonParserTests, GetNumberText)
-{
-  std::string json = "[-12.45e056,123456789]  ";
-  json_parser_options options;
-  auto parser = get_parser(options, json, /*single_quote*/ true, /*control_char*/ true);
-
-  ASSERT_EQ(json_token::INIT, parser.get_current_token());
-  ASSERT_EQ(json_token::START_ARRAY, parser.next_token());
-
-  ASSERT_EQ(json_token::VALUE_NUMBER_FLOAT, parser.next_token());
-  auto [ptr1, len1] = parser.get_current_number_text();
-  assert_ptr_len(ptr1, len1, json.data() + 1, 10);
-
-  ASSERT_EQ(json_token::VALUE_NUMBER_INT, parser.next_token());
-  auto [ptr2, len2] = parser.get_current_number_text();
-  assert_ptr_len(ptr2, len2, json.data() + 12, 9);
-}
-
 void assert_float_parts(bool float_sign,
                         char const* float_integer_pos,
                         int float_integer_len,
@@ -900,7 +882,9 @@ TEST_F(JsonParserTests, MatchFieldNameTest)
     std::vector<std::optional<std::string>>{
       std::nullopt, "k", "k", std::nullopt, std::nullopt, std::nullopt, "k", std::nullopt});
 
-  json = "            [     1 ,    {      'k' :  'v'   }    ,  {      }      ]    ";
+  json =
+    "            [     1 ,    {      'k' :  'v'   }    ,  {      }      ] "
+    "   ";
   // field names:     NULL   NULL   NULL   k     k    NULL     NULL   NULL  NULL
   assert_field_names(json,
                      std::vector<std::optional<std::string>>{std::nullopt,
@@ -913,8 +897,11 @@ TEST_F(JsonParserTests, MatchFieldNameTest)
                                                              std::nullopt,
                                                              std::nullopt});
 
-  json = "             {     'k' : [    1  ,  [   1,    2,    3     ] ,     3      ]      }     ";
-  // field names:      NULL   k    k    NULL  NULL NULL NULL  NULL  NULL   NULL    k      NULL
+  json =
+    "             {     'k' : [    1  ,  [   1,    2,    3     ] ,     3  "
+    "    ]      }     ";
+  // field names:      NULL   k    k    NULL  NULL NULL NULL  NULL  NULL   NULL
+  // k      NULL
   assert_field_names(json,
                      std::vector<std::optional<std::string>>{std::nullopt,
                                                              "k",
@@ -929,8 +916,11 @@ TEST_F(JsonParserTests, MatchFieldNameTest)
                                                              "k",
                                                              std::nullopt});
 
-  json = "             {    'k1' : {  'k2' : {   'k3': {   'k4':  4    }    }    }     }       ";
-  // field names:      NULL  k1    k1  k2    k2   k3   k3   k4    k4   k3   k2   k1   NULL
+  json =
+    "             {    'k1' : {  'k2' : {   'k3': {   'k4':  4    }    }  "
+    "  }     }       ";
+  // field names:      NULL  k1    k1  k2    k2   k3   k3   k4    k4   k3   k2
+  // k1   NULL
   assert_field_names(json,
                      std::vector<std::optional<std::string>>{std::nullopt,
                                                              "k1",
@@ -945,6 +935,22 @@ TEST_F(JsonParserTests, MatchFieldNameTest)
                                                              "k2",
                                                              "k1",
                                                              std::nullopt});
+
+  json = "             {    'k1-\\\"\\'\\\\\\/\\b\\f\\n\\r\\t' :  'v1'}       ";
+  // field names:      NULL  k1    k1  k2    k2   k3   k3   k4    k4   k3   k2
+  // k1   NULL
+  assert_field_names(json,
+                     std::vector<std::optional<std::string>>{
+                       std::nullopt, "k1-\"'\\/\b\f\n\r\t", "k1-\"'\\/\b\f\n\r\t", std::nullopt});
+  // \\u4e2d\\u56FD is code points for 中国
+  json =
+    "             {    '中国\\u4e2d\\u56FD中国\\u4e2d\\u56FD' :  'v1'}    "
+    "   ";
+  // field names:      NULL  k1    k1  k2    k2   k3   k3   k4    k4   k3   k2
+  // k1   NULL
+  assert_field_names(json,
+                     std::vector<std::optional<std::string>>{
+                       std::nullopt, "中国中国中国中国", "中国中国中国中国", std::nullopt});
 }
 
 TEST_F(JsonParserTests, WriteEscapedStringText)

@@ -151,10 +151,9 @@ class json_generator {
   }
 
   /**
-   * copy current structure when parsing. If current token is start object/array, then copy to
-   * corresponding matched end object/array.
-   * return false if JSON format is invalid
-   * return true if JSON format is valid
+   * copy current structure when parsing. If current token is start
+   * object/array, then copy to corresponding matched end object/array. return
+   * false if JSON format is invalid return true if JSON format is valid
    */
   CUDF_HOST_DEVICE bool copy_current_structure(json_parser<max_json_nesting_depth>& parser)
   {
@@ -222,9 +221,9 @@ class json_generator {
    * @param child_block_begin
    * @param child_block_len
    */
-  CUDF_HOST_DEVICE void write_raw_value(char* child_block_begin,
-                                        size_t child_block_len,
-                                        bool write_outer_array_tokens)
+  CUDF_HOST_DEVICE void write_child_raw_value(char* child_block_begin,
+                                              size_t child_block_len,
+                                              bool write_outer_array_tokens)
   {
     bool insert_comma = need_comma();
 
@@ -248,7 +247,7 @@ class json_generator {
           *(child_block_begin) = ',';
         } else {
           // do not need comma && do not need write outer array tokens
-          // do nothing
+          // do nothing, because child generator buff is directly after the parent generator
         }
       }
     }
@@ -365,20 +364,20 @@ CUDF_HOST_DEVICE inline thrust::tuple<bool, int> path_match_subscript_index_subs
 }
 
 template <int max_json_nesting_depth = curr_max_json_nesting_depth>
-__device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
-                              json_generator<max_json_nesting_depth>& g,
-                              bool g_contains_outer_array_pairs,
-                              write_style style,
-                              path_instruction const* path_ptr,
-                              int path_size)
+CUDF_HOST_DEVICE bool evaluate_path(json_parser<max_json_nesting_depth>& p,
+                                    json_generator<max_json_nesting_depth>& g,
+                                    bool g_contains_outer_array_pairs,
+                                    write_style style,
+                                    path_instruction const* path_ptr,
+                                    int path_size)
 {
   auto token = p.get_current_token();
 
   // case (VALUE_STRING, Nil) if style == RawStyle
   if (json_token::VALUE_STRING == token && path_is_empty(path_size) &&
       style == write_style::raw_style) {
-    // there is no array wildcard or slice parent, emit this string without quotes
-    // write current string in parser to generator
+    // there is no array wildcard or slice parent, emit this string without
+    // quotes write current string in parser to generator
     g.write_raw(p);
     return true;
   }
@@ -428,7 +427,8 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
                                path_instruction_type::wildcard,
                                path_instruction_type::subscript,
                                path_instruction_type::wildcard)) {
-    // special handling for the non-structure preserving double wildcard behavior in Hive
+    // special handling for the non-structure preserving double wildcard
+    // behavior in Hive
     bool dirty = false;
     g.write_start_array();
     while (p.next_token() != json_token::END_ARRAY) {
@@ -451,8 +451,7 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
     write_style next_style;
     switch (style) {
       case write_style::raw_style: next_style = write_style::quoted_style; break;
-      case write_style::flatten_style: next_style = write_style::flatten_style; break;
-      case write_style::quoted_style: assert(false);
+      case write_style::flatten_style: next_style = write_style::flatten_style;
     }
 
     // temporarily buffer child matches, the emitted json will need to be
@@ -481,10 +480,10 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
 
     if (dirty > 1) {
       // add outer array tokens
-      g.write_raw_value(child_g_start, child_g_len, true);
+      g.write_child_raw_value(child_g_start, child_g_len, true);
     } else if (dirty == 1) {
       // remove outer array tokens
-      g.write_raw_value(child_g_start, child_g_len, false);
+      g.write_child_raw_value(child_g_start, child_g_len, false);
     }  // else do not write anything
 
     return dirty > 0;
@@ -508,7 +507,8 @@ __device__ bool evaluate_path(json_parser<max_json_nesting_depth>& p,
 
     return dirty;
   }
-  // case (START_ARRAY, Subscript :: Index(idx) :: (xs@Subscript :: Wildcard :: _))
+  // case (START_ARRAY, Subscript :: Index(idx) :: (xs@Subscript :: Wildcard ::
+  // _))
   else if (json_token::START_ARRAY == token &&
            thrust::get<0>(path_match_subscript_index_subscript_wildcard(path_ptr, path_size))) {
     int idx = thrust::get<1>(path_match_subscript_index_subscript_wildcard(path_ptr, path_size));

@@ -35,7 +35,7 @@ enum class write_style {
   escaped
 };
 
-// deep depth will consume more memory, we can tuning this in future.
+// deep JSON nesting depth will consume more memory, we can tuning this in future.
 // we ever run into a limit of 254, here use a little value 200.
 constexpr int curr_max_json_nesting_depth = 200;
 
@@ -44,9 +44,11 @@ constexpr int curr_max_json_nesting_depth = 200;
  */
 class json_parser_options {
   // allow single quotes to represent strings in JSON
+  // e.g.: {'k': 'v'} is valid when it's true
   bool allow_single_quotes = false;
 
   // Whether allow unescaped control characters in JSON Strings.
+  // e.g.: ["\n"] is valid, here \n is one char
   bool allow_unescaped_control_chars = false;
 
   // Define the maximum JSON String length, counts utf8 bytes.
@@ -55,7 +57,8 @@ class json_parser_options {
   // Define the maximum JSON number length.
   int max_num_len = -1;
 
-  // Whether allow tailing useless sub-string
+  // Whether allow tailing useless sub-string.
+  // e.g.: [1,2,3]xxxx is valid when it's true
   bool allow_tailing_sub_string = false;
 
  public:
@@ -80,7 +83,7 @@ class json_parser_options {
    * representing strings are allowed.
    *
    * Unescaped control characters are ASCII characters with value less than 32,
-   * including tab and line feed characters.
+   * including tab and line feed characters. ASCII values range is [0, 32)
    *
    * If true, JSON is not conventional format.
    * e.g., how to represent carriage return and newline characters:
@@ -576,12 +579,11 @@ class json_parser {
    * escape control char ( ASCII code value [0, 32) )
    * e.g.: \0  (ASCII code 0) will be escaped to 6 chars: \u0000
    * e.g.: \10 (ASCII code 0) will be escaped to 2 chars: \n
-   * @param char to be escaped
+   * @param char to be escaped, c should in range [0, 31)
    * @param[out] escape output
    */
   CUDF_HOST_DEVICE inline int escape_char(unsigned char c, char* output)
   {
-    assert(c < 32);
     switch (c) {
       case 8:
         output[0] = '\\';
@@ -682,6 +684,7 @@ class json_parser {
     char* copy_destination,
     write_style w_style)
   {
+    // update state
     string_token_utf8_bytes       = 0;
     bytes_diff_for_escape_writing = 0;
 
@@ -721,12 +724,12 @@ class json_parser {
       } else if (v >= 0 && v < 32 && options.get_allow_unescaped_control_chars()) {
         // path 2: unescaped control char
 
-        // copy if enabled
+        // copy if enabled, unescape mode, write 1 char
         if (copy_destination != nullptr && write_style::unescaped == w_style) {
           *copy_destination++ = *str_pos;
         }
 
-        // copy if enabled
+        // copy if enabled, escape mode, write more chars
         if (copy_destination != nullptr && write_style::escaped == w_style) {
           int escape_chars = escape_char(*str_pos, copy_destination);
           copy_destination += escape_chars;
@@ -750,17 +753,13 @@ class json_parser {
         }
       } else {
         // path 4: safe code point
-        if (!try_skip_safe_code_point(str_pos, c)) {
+        if (!try_skip_safe_code_point(str_pos, c)) { return std::make_pair(false, nullptr); }
+        if (copy_destination != nullptr) { *copy_destination++ = c; }
+        // check match if enabled
+        if (!try_match_char(to_match_str_pos, to_match_str_end, c)) {
           return std::make_pair(false, nullptr);
-        } else {
-          if (copy_destination != nullptr) { *copy_destination++ = c; }
-          // check match if enabled
-          if (!try_match_char(to_match_str_pos, to_match_str_end, c)) {
-            return std::make_pair(false, nullptr);
-          }
-
-          string_token_utf8_bytes++;
         }
+        string_token_utf8_bytes++;
       }
     }
 
@@ -789,7 +788,7 @@ class json_parser {
    * @return positive escaped ASCII value if success, -1 otherwise
    */
   CUDF_HOST_DEVICE inline bool try_skip_escape_part(char const*& str_pos,
-                                                    char const* to_match_str_pos,
+                                                    char const*& to_match_str_pos,
                                                     char const* const to_match_str_end,
                                                     char*& copy_dest,
                                                     write_style w_style)
@@ -849,7 +848,7 @@ class json_parser {
             *copy_dest++ = 'b';
             bytes_diff_for_escape_writing++;
           }
-          if (!try_match_char(to_match_str_pos, to_match_str_end, c)) { return false; }
+          if (!try_match_char(to_match_str_pos, to_match_str_end, '\b')) { return false; }
           string_token_utf8_bytes++;
           str_pos++;
           return true;
@@ -860,7 +859,7 @@ class json_parser {
             *copy_dest++ = 'f';
             bytes_diff_for_escape_writing++;
           }
-          if (!try_match_char(to_match_str_pos, to_match_str_end, c)) { return false; }
+          if (!try_match_char(to_match_str_pos, to_match_str_end, '\f')) { return false; }
           string_token_utf8_bytes++;
           str_pos++;
           return true;
@@ -871,7 +870,7 @@ class json_parser {
             *copy_dest++ = 'n';
             bytes_diff_for_escape_writing++;
           }
-          if (!try_match_char(to_match_str_pos, to_match_str_end, c)) { return false; }
+          if (!try_match_char(to_match_str_pos, to_match_str_end, '\n')) { return false; }
           string_token_utf8_bytes++;
           str_pos++;
           return true;
@@ -882,7 +881,7 @@ class json_parser {
             *copy_dest++ = 'r';
             bytes_diff_for_escape_writing++;
           }
-          if (!try_match_char(to_match_str_pos, to_match_str_end, c)) { return false; }
+          if (!try_match_char(to_match_str_pos, to_match_str_end, '\r')) { return false; }
           string_token_utf8_bytes++;
           str_pos++;
           return true;
@@ -893,11 +892,11 @@ class json_parser {
             *copy_dest++ = 't';
             bytes_diff_for_escape_writing++;
           }
-          if (!try_match_char(to_match_str_pos, to_match_str_end, c)) { return false; }
+          if (!try_match_char(to_match_str_pos, to_match_str_end, '\t')) { return false; }
           string_token_utf8_bytes++;
           str_pos++;
           return true;
-        // path 1: \", \', \\, \/, \b, \f, \n, \r, \t
+        // path 1 done: \", \', \\, \/, \b, \f, \n, \r, \t
         case 'u':
           // path 2: \u HEX HEX HEX HEX
           str_pos++;
@@ -969,7 +968,7 @@ class json_parser {
    * in pattern: '\\' 'u' HEX HEX HEX HEX
    */
   CUDF_HOST_DEVICE inline bool try_skip_unicode(char const*& str_pos,
-                                                char const* to_match_str_pos,
+                                                char const*& to_match_str_pos,
                                                 char const* const to_match_str_end,
                                                 char*& copy_dest)
   {
@@ -995,11 +994,11 @@ class json_parser {
 
       if (nullptr != to_match_str_pos) {
         for (cudf::size_type i = 0; i < bytes; i++) {
-          if (!(to_match_str_pos + i < to_match_str_end && to_match_str_pos[i] == buff[i])) {
+          if (!(to_match_str_pos < to_match_str_end && *to_match_str_pos == buff[i])) {
             return false;
           }
+          to_match_str_pos++;
         }
-        to_match_str_pos += bytes;
       }
 
       return true;
@@ -1290,10 +1289,6 @@ class json_parser {
   CUDF_HOST_DEVICE inline json_token parse_next_token(bool& has_comma_before_token,
                                                       bool& has_colon_before_token)
   {
-    // SUCCESS or ERROR means parsing is completed,
-    // should not call this function again.
-    assert(curr_token != json_token::SUCCESS && curr_token != json_token::ERROR);
-
     skip_whitespaces(curr_pos);
     if (!eof(curr_pos)) {
       char c = *curr_pos;
@@ -1648,22 +1643,11 @@ class json_parser {
   }
 
   /**
-   * get current text for VALUE_NUMBER_INT token or VALUE_NUMBER_FLOAT token
-   */
-  CUDF_HOST_DEVICE thrust::pair<char const*, cudf::size_type> get_current_number_text()
-  {
-    assert(json_token::VALUE_NUMBER_FLOAT == curr_token ||
-           json_token::VALUE_NUMBER_INT == curr_token);
-    return thrust::make_pair(current_token_start_pos, number_token_len);
-  }
-
-  /**
-   * get float parts
+   * get float parts, current token should be VALUE_NUMBER_FLOAT.
    */
   CUDF_HOST_DEVICE thrust::tuple<bool, char const*, int, char const*, int, char const*, int>
   get_current_float_parts()
   {
-    assert(json_token::VALUE_NUMBER_FLOAT == curr_token);
     return thrust::make_tuple(float_sign,
                               float_integer_pos,
                               float_integer_len,
