@@ -431,7 +431,7 @@ struct path_evaluator {
                                  path_instruction_type::wildcard) &&
              style != write_style::quoted_style) {
       // retain Flatten, otherwise use Quoted... cannot use Raw within an array
-      write_style next_style;
+      write_style next_style = write_style::raw_style;
       switch (style) {
         case write_style::raw_style: next_style = write_style::quoted_style; break;
         case write_style::flatten_style: next_style = write_style::flatten_style; break;
