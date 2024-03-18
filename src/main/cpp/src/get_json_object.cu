@@ -41,11 +41,6 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <thrust/optional.h>
-#include <thrust/pair.h>
-#include <thrust/scan.h>
-#include <thrust/tuple.h>
-
 namespace spark_rapids_jni {
 
 namespace detail {
@@ -194,20 +189,34 @@ class json_generator {
  * would want to continue doing this until you either encounter an error
  * (parse_result::ERROR) or you get nothing back (parse_result::EMPTY)
  */
-enum class parse_result {
-  ERROR,          // failure
-  SUCCESS,        // success
-  MISSING_FIELD,  // success, but the field is missing
-  EMPTY,          // success, but no data
-};
+enum class parse_result { ERROR, SUCCESS };
+
+// TODO parse JSON path
+thrust::optional<rmm::device_uvector<path_instruction>> parse_path(
+  cudf::string_scalar const& json_path)
+{
+  return thrust::nullopt;
+}
+
+template <int max_json_nesting_depth>
+CUDF_HOST_DEVICE bool evaluate_path(json_parser<max_json_nesting_depth>& p,
+                                    json_generator<max_json_nesting_depth>& g,
+                                    bool g_contains_outer_array_pairs,
+                                    write_style style,
+                                    path_instruction const* path_ptr,
+                                    int path_size)
+{
+  return path_evaluator::evaluate_path<max_json_nesting_depth>(
+    p, g, g_contains_outer_array_pairs, style, path_ptr, path_size);
+}
 
 /**
  * @brief Parse a single json string using the provided command buffer
  *
- * @param j_state The incoming json string and associated parser
- * @param commands The command buffer to be applied to the string. Always ends
- * with a path_operator_type::END
- * @param output Buffer user to store the results of the query
+ * @param j_parser The incoming json string and associated parser
+ * @param path_ptr The command buffer to be applied to the string.
+ * @param path_size Command buffer size
+ * @param output Buffer used to store the results of the query
  * @returns A result code indicating success/fail/empty.
  */
 template <int max_json_nesting_depth = curr_max_json_nesting_depth>
@@ -215,8 +224,13 @@ __device__ parse_result parse_json_path(json_parser<max_json_nesting_depth>& j_p
                                         cudf::device_span<path_instruction const> path_commands,
                                         json_generator<max_json_nesting_depth>& output)
 {
-  // TODO
-  return parse_result::SUCCESS;
+  j_parser.next_token();
+  // JSON validation check
+  if (json_token::ERROR == j_parser.get_current_token()) { return parse_result::ERROR; }
+
+  auto matched = evaluate_path<max_json_nesting_depth>(
+    j_parser, output, true, write_style::raw_style, path_ptr, path_size);
+  return matched ? parse_result::SUCCESS : parse_result::ERROR;
 }
 
 /**
@@ -244,8 +258,8 @@ get_json_object_single(char const* input,
                        json_parser_options options)
 {
   json_parser j_parser(options, input, input_len);
-  json_generator generator(out_buf, out_buf_size);
-  auto const result = parse_json_path(j_parser, path_commands, generator);
+  json_generator generator(out_buf);
+  auto const result = parse_json_path(j_parser, path_commands_ptr, path_commands_size, generator);
   return {result, generator};
 }
 
@@ -345,6 +359,15 @@ std::unique_ptr<cudf::column> get_json_object(
   constexpr int block_size = 512;
   cudf::detail::grid_1d const grid{col.size(), block_size};
   auto cdv = cudf::column_device_view::create(col.parent(), stream);
+
+  // create json parser options
+  spark_rapids_jni::json_parser_options options;
+  options.set_allow_single_quotes(true);
+  options.set_allow_unescaped_control_chars(true);
+  options.set_max_string_len(true);
+  options.set_max_num_len(true);
+  options.set_allow_tailing_sub_string(true);
+
   // preprocess sizes (returned in the offsets buffer)
   get_json_object_kernel<block_size>
     <<<grid.num_blocks, grid.num_threads_per_block, 0, stream.value()>>>(
@@ -396,8 +419,6 @@ std::unique_ptr<cudf::column> get_json_object(
   return result;
 }
 
-// }  // namespace
-
 }  // namespace detail
 
 std::unique_ptr<cudf::column> get_json_object(
@@ -406,8 +427,8 @@ std::unique_ptr<cudf::column> get_json_object(
   rmm::cuda_stream_view stream,
   rmm::mr::device_memory_resource* mr)
 {
-  // TODO: main logic
-  return detail::get_json_object(col, instructions, stream, mr);
+  // TODO: here do not know if json path is invalid, should handle it in Plugin
+  return detail::get_json_object(col, json_path, stream, mr);
 }
 
 }  // namespace spark_rapids_jni
