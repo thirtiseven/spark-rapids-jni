@@ -63,52 +63,65 @@ struct path_instruction {
 template <int max_json_nesting_depth = curr_max_json_nesting_depth>
 class json_generator {
  public:
-  CUDF_HOST_DEVICE json_generator(char* _output) : output(_output), output_len(0) {}
-  CUDF_HOST_DEVICE json_generator() : output(nullptr), output_len(0) {}
+  CUDF_HOST_DEVICE json_generator(char* _output)
+    : output(_output), output_len(0), hide_outer_array_tokens(false)
+  {
+  }
+  CUDF_HOST_DEVICE json_generator() : output(nullptr), output_len(0), hide_outer_array_tokens(false)
+  {
+  }
+  CUDF_HOST_DEVICE json_generator(char* _output, bool _hide_outer_array_tokens)
+    : output(_output), output_len(0), hide_outer_array_tokens(_hide_outer_array_tokens)
+  {
+  }
+  CUDF_HOST_DEVICE json_generator(bool _hide_outer_array_tokens)
+    : output(nullptr), output_len(0), hide_outer_array_tokens(_hide_outer_array_tokens)
+  {
+  }
 
   // create a nested child generator based on this parent generator
   // child generator is a view
-  CUDF_HOST_DEVICE json_generator new_child_generator()
+  CUDF_HOST_DEVICE json_generator new_child_generator(bool hide_outer_array_tokens)
   {
     if (nullptr == output) {
-      return json_generator();
+      return json_generator(hide_outer_array_tokens);
     } else {
-      return json_generator(output + output_len);
+      return json_generator(output + output_len, hide_outer_array_tokens);
     }
   }
 
   CUDF_HOST_DEVICE void write_start_array()
   {
-    if (output) { *(output + output_len) = '['; }
-    output_len++;
-    is_first_item[array_depth] = true;
-    array_depth++;
-  }
-
-  /**
-   * only update the internal state, not actually write to underlying buffer
-   */
-  CUDF_HOST_DEVICE void write_start_array_fake()
-  {
-    output_len++;
-    is_first_item[array_depth] = true;
-    array_depth++;
+    if (!hide_outer_array_tokens) {
+      if (output) { *(output + output_len) = '['; }
+      output_len++;
+      is_first_item[array_depth] = true;
+      array_depth++;
+    } else {
+      // hide the outer start array token
+      // Note: do not inc output_len
+      is_first_item[array_depth] = true;
+      array_depth++;
+    }
   }
 
   CUDF_HOST_DEVICE void write_end_array()
   {
-    if (output) { *(output + output_len) = ']'; }
-    output_len++;
-    array_depth--;
+    if (!hide_outer_array_tokens) {
+      if (output) { *(output + output_len) = ']'; }
+      output_len++;
+      array_depth--;
+    } else {
+      // hide the outer end array token
+      array_depth--;
+    }
   }
 
-  CUDF_HOST_DEVICE void write_end_array_fake()
+  // return true if it's in a array context and it's not writing the first item.
+  CUDF_HOST_DEVICE bool need_comma()
   {
-    output_len++;
-    array_depth--;
+    return (array_depth > 0 && !is_first_item[array_depth - 1]);
   }
-
-  CUDF_HOST_DEVICE bool need_comma() { return (array_depth > 0 && is_first_item[array_depth - 1]); }
 
   /**
    * write comma accroding to current generator state
@@ -219,7 +232,8 @@ class json_generator {
           *(child_block_begin) = ',';
         } else {
           // do not need comma && do not need write outer array tokens
-          // do nothing, because child generator buff is directly after the parent generator
+          // do nothing, because child generator buff is directly after the
+          // parent generator
         }
       }
     }
@@ -242,6 +256,8 @@ class json_generator {
     }
   }
 
+  CUDF_HOST_DEVICE void reset() { output_len = 0; }
+
   CUDF_HOST_DEVICE inline size_t get_output_len() const { return output_len; }
   CUDF_HOST_DEVICE inline char* get_output_start_position() const { return output; }
   CUDF_HOST_DEVICE inline char* get_current_output_position() const { return output + output_len; }
@@ -249,6 +265,7 @@ class json_generator {
  private:
   char* output;
   size_t output_len;
+  bool hide_outer_array_tokens;
 
   bool is_first_item[max_json_nesting_depth];
   int array_depth = 0;
@@ -424,11 +441,13 @@ struct path_evaluator {
       // temporarily buffer child matches, the emitted json will need to be
       // modified slightly if there is only a single element written
 
-      int dirty    = 0;
-      auto child_g = g.new_child_generator();
+      int dirty = 0;
+      // create a child generator with hide outer array tokens mode.
+      auto child_g = g.new_child_generator(/*hide_outer_array_tokens*/ true);
 
-      // child generator write a fake start array
-      child_g.write_start_array_fake();
+      // Note: child generator does not actually write the outer start array
+      // token into buffer it only updates internal nested state
+      child_g.write_start_array();
 
       while (p.next_token() != json_token::END_ARRAY) {
         // JSON validation check
@@ -442,11 +461,12 @@ struct path_evaluator {
              : 0);
       }
 
-      // child generator write a fake end array
-      child_g.write_end_array_fake();
+      // Note: child generator does not actually write the outer end array token
+      // into buffer it only updates internal nested state
+      child_g.write_end_array();
 
       char* child_g_start = child_g.get_output_start_position();
-      size_t child_g_len  = child_g.get_output_len() - 2;  // exclude [ ]
+      size_t child_g_len  = child_g.get_output_len();  // len already excluded outer [ ]
 
       if (dirty > 1) {
         // add outer array tokens
@@ -470,7 +490,8 @@ struct path_evaluator {
         // JSON validation check
         if (json_token::ERROR == p.get_current_token()) { return false; }
 
-        // wildcards can have multiple matches, continually update the dirty count
+        // wildcards can have multiple matches, continually update the dirty
+        // count
         dirty |= path_evaluator::evaluate_path(
           p, g, true, write_style::quoted_style, path_ptr + 2, path_size - 2);
       }
@@ -478,7 +499,8 @@ struct path_evaluator {
 
       return dirty;
     }
-    // case (START_ARRAY, Subscript :: Index(idx) :: (xs@Subscript :: Wildcard ::
+    // case (START_ARRAY, Subscript :: Index(idx) :: (xs@Subscript :: Wildcard
+    // ::
     // _))
     else if (json_token::START_ARRAY == token &&
              thrust::get<0>(path_match_subscript_index_subscript_wildcard(path_ptr, path_size))) {

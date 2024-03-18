@@ -31,12 +31,13 @@ enum class write_style {
   // e.g.: '\\r' is a string with 2 chars '\' 'r', writes 1 char '\r'
   unescaped,
 
-  // * e.g.: '"' is a string with 1 char '"', writes out 4 chars '"' '\' '\"' '"'
+  // * e.g.: '"' is a string with 1 char '"', writes out 4 chars '"' '\' '\"'
+  // '"'
   escaped
 };
 
-// deep JSON nesting depth will consume more memory, we can tuning this in future.
-// we ever run into a limit of 254, here use a little value 200.
+// deep JSON nesting depth will consume more memory, we can tuning this in
+// future. we ever run into a limit of 254, here use a little value 200.
 constexpr int curr_max_json_nesting_depth = 200;
 
 /**
@@ -485,10 +486,13 @@ class json_parser {
    * try parse ' or " quoted string
    *
    * when allow single quote, first try single quote
-   * @param str_pos str start position for parsing, should be a position in JSON string
-   * @param to_match_str_pos expected match str position, nullptr means do not match
+   * @param str_pos str start position for parsing, should be a position in JSON
+   * string
+   * @param to_match_str_pos expected match str position, nullptr means do not
+   * match
    * @param to_match_str_end expected match str end
-   * @param copy_destination copy unescaped str to destination, nullptr means do not copy
+   * @param copy_destination copy unescaped str to destination, nullptr means do
+   * not copy
    * @return whether passed successfully and the end position of parsed str
    *
    */
@@ -516,10 +520,13 @@ class json_parser {
    * try parse ' quoted string
    *
    * when allow single quote, first try single quote
-   * @param str_pos str start position for parsing, should be a position in JSON string
-   * @param to_match_str_pos expected match str position, nullptr means do not match
+   * @param str_pos str start position for parsing, should be a position in JSON
+   * string
+   * @param to_match_str_pos expected match str position, nullptr means do not
+   * match
    * @param to_match_str_end expected match str end
-   * @param copy_destination copy unescaped str to destination, nullptr means do not copy
+   * @param copy_destination copy unescaped str to destination, nullptr means do
+   * not copy
    *
    */
   CUDF_HOST_DEVICE inline std::pair<bool, char const*> try_parse_single_quoted_string(
@@ -529,23 +536,26 @@ class json_parser {
     char* copy_destination,
     write_style w_style)
   {
-    return try_parse_quoted_string(
-      str_pos,
-      '\'',
-      to_match_str_pos,  // match str pos, nullptr means do not match
-      to_match_str_end,  // match str end
-      copy_destination,  // copy destination while parsing, nullptr means do not copy
-      w_style);
+    return try_parse_quoted_string(str_pos,
+                                   '\'',
+                                   to_match_str_pos,  // match str pos, nullptr means do not match
+                                   to_match_str_end,  // match str end
+                                   copy_destination,  // copy destination while parsing, nullptr
+                                                      // means do not copy
+                                   w_style);
   }
 
   /**
    * try parse " quoted string.
    *
    * when allow single quote, first try single quote
-   * @param str_pos str start position for parsing, should be a position in JSON string
-   * @param to_match_str_pos expected match str position, nullptr means do not match
+   * @param str_pos str start position for parsing, should be a position in JSON
+   * string
+   * @param to_match_str_pos expected match str position, nullptr means do not
+   * match
    * @param to_match_str_end expected match str end
-   * @param copy_destination copy unescaped str to destination, nullptr means do not copy
+   * @param copy_destination copy unescaped str to destination, nullptr means do
+   * not copy
    *
    */
   CUDF_HOST_DEVICE inline std::pair<bool, char const*> try_parse_double_quoted_string(
@@ -555,13 +565,13 @@ class json_parser {
     char* copy_destination,
     write_style w_style)
   {
-    return try_parse_quoted_string(
-      str_pos,
-      '\"',
-      to_match_str_pos,  // match str pos, nullptr means do not match
-      to_match_str_end,  // match str end
-      copy_destination,  // copy destination while parsing, nullptr means do not copy
-      w_style);
+    return try_parse_quoted_string(str_pos,
+                                   '\"',
+                                   to_match_str_pos,  // match str pos, nullptr means do not match
+                                   to_match_str_end,  // match str end
+                                   copy_destination,  // copy destination while parsing, nullptr
+                                                      // means do not copy
+                                   w_style);
   }
 
   /**
@@ -626,20 +636,17 @@ class json_parser {
   }
 
   /**
-   * utility for parsing string, this function does not update the parser internal
-   * try parse quoted string using passed `quote_char`
-   * `quote_char` can be ' or "
-   * For UTF-8 encoding:
-   *   Single byte char: The most significant bit of the byte is always 0
-   *   Two-byte characters: The leading bits of the first byte are 110,
-   *     and the leading bits of the second byte are 10.
-   *   Three-byte characters: The leading bits of the first byte are 1110,
-   *     and the leading bits of the second and third bytes are 10.
-   *   Four-byte characters: The leading bits of the first byte are 11110,
-   *     and the leading bits of the second, third, and fourth bytes are 10.
-   * Because JSON structural chars([ ] { } , :), string quote char(" ') and
-   * Escape char \ are all Ascii(The leading bit is 0), so it's safe that do
-   * not convert byte array to UTF-8 char.
+   * utility for parsing string, this function does not update the parser
+   * internal try parse quoted string using passed `quote_char` `quote_char` can
+   * be ' or " For UTF-8 encoding: Single byte char: The most significant bit of
+   * the byte is always 0 Two-byte characters: The leading bits of the first
+   * byte are 110, and the leading bits of the second byte are 10. Three-byte
+   * characters: The leading bits of the first byte are 1110, and the leading
+   * bits of the second and third bytes are 10. Four-byte characters: The
+   * leading bits of the first byte are 11110, and the leading bits of the
+   * second, third, and fourth bytes are 10. Because JSON structural chars([ ] {
+   * } , :), string quote char(" ') and Escape char \ are all Ascii(The leading
+   * bit is 0), so it's safe that do not convert byte array to UTF-8 char.
    *
    * When quote is " and allow_unescaped_control_chars is false, grammar is:
    *
@@ -670,11 +677,14 @@ class json_parser {
    *   Allow [0-32) control Ascii chars directly without escape
    * When allow_single_quotes is true:
    *   These strings are allowed: '\'' , '\"' , '"' , "\"" , "\'" , "'"
-   * @param str_pos str start position for parsing, should be a position in JSON string
+   * @param str_pos str start position for parsing, should be a position in JSON
+   * string
    * @param quote_char expected quote char
-   * @param to_match_str_pos expected match str position, nullptr means do not match
+   * @param to_match_str_pos expected match str position, nullptr means do not
+   * match
    * @param to_match_str_end expected match str end
-   * @param copy_destination copy unescaped str to destination, nullptr means do not copy
+   * @param copy_destination copy unescaped str to destination, nullptr means do
+   * not copy
    */
   CUDF_HOST_DEVICE inline std::pair<bool, char const*> try_parse_quoted_string(
     char const* str_pos,
@@ -901,8 +911,8 @@ class json_parser {
           // path 2: \u HEX HEX HEX HEX
           str_pos++;
 
-          // for both unescaped/escaped writes corresponding utf8 bytes, no need to pass in write
-          // style
+          // for both unescaped/escaped writes corresponding utf8 bytes, no need
+          // to pass in write style
           return try_skip_unicode(str_pos, to_match_str_pos, to_match_str_end, copy_dest);
         default:
           // path 3: invalid
@@ -1804,25 +1814,27 @@ class json_parser {
   // When encounter EOF and this stack is non-empty, means non-closed JSON
   // object/array, then parsing will fail.
   bool context_stack[max_json_nesting_depth];
-  // saves field names for start object/array token, end object token and end array token
-  // has the same field names with corresponding start object token and  start array token
+  // saves field names for start object/array token, end object token and end
+  // array token has the same field names with corresponding start object token
+  // and  start array token
   cudf::size_type field_name_offset_stack[max_json_nesting_depth];
-  // current field name: last reached field name or poped field name when meet ]/}
-  // using offset in JSON str instead of `char *` to save memory,
-  // here assume `char *` using 8 bytes, size_type using 4 bytes.
+  // current field name: last reached field name or poped field name when meet
+  // ]/} using offset in JSON str instead of `char *` to save memory, here
+  // assume `char *` using 8 bytes, size_type using 4 bytes.
   cudf::size_type curr_field_name_offset = -1;
   int stack_size                         = 0;
 
   // save current token start pos, used by coping current row text
   char const* current_token_start_pos;
-  // used to copy int/float string verbatim, note: int/float have no escape chars
+  // used to copy int/float string verbatim, note: int/float have no escape
+  // chars
   cudf::size_type number_token_len;
 
   // The following variables record number token informations.
   // if current token is int/float, use the following variables to save
   // float parts e.g.: -123.000456E-000789, sign is false; integer part is 123;
-  // fraction part is 000456; exp part is -000789. The following parts is used by
-  // normalization, e.g.: 0.001 => 1E-3
+  // fraction part is 000456; exp part is -000789. The following parts is used
+  // by normalization, e.g.: 0.001 => 1E-3
   bool float_sign;
   char const* float_integer_pos;
   int float_integer_len;
