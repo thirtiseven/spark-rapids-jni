@@ -46,38 +46,13 @@ namespace spark_rapids_jni {
 namespace detail {
 // namespace {
 
-/**
- * write JSON style
- */
-enum class write_style { raw_style, quoted_style, flatten_style };
-
-/**
- * path instruction
- */
-struct path_instruction {
-  CUDF_HOST_DEVICE inline path_instruction(path_instruction_type _type) : type(_type) {}
-
-  path_instruction_type type;
-
-  // used when type is named type
-  cudf::string_view name;
-
-  // used when type is index
-  int64_t index{-1};
-};
-
 rmm::device_uvector<path_instruction> construct_path_commands(
   std::vector<std::tuple<path_instruction_type, std::string, int64_t>> const& instructions,
+  cudf::string_scalar const& all_names_scalar,
   rmm::cuda_stream_view stream,
   rmm::mr::device_memory_resource* mr)
 {
-  // get a string buffer to store all the names and convert to device
-  std::string all_names;
-  for (auto const& inst : instructions) {
-    all_names += std::get<1>(inst);
-  }
-  cudf::string_scalar all_names_scalar(all_names);
-  int name_pos = 0;
+  cudf::size_type name_pos = 0;
 
   // construct the path commands
   std::vector<path_instruction> path_commands;
@@ -92,9 +67,6 @@ rmm::device_uvector<path_instruction> construct_path_commands(
         break;
       case path_instruction_type::key:
         path_commands.emplace_back(path_instruction{path_instruction_type::key});
-        path_commands.back().name =
-          cudf::string_view(all_names_scalar.data() + name_pos, name.size());
-        name_pos += name.size();
         break;
       case path_instruction_type::index:
         path_commands.emplace_back(path_instruction{path_instruction_type::index});
@@ -104,81 +76,23 @@ rmm::device_uvector<path_instruction> construct_path_commands(
         path_commands.emplace_back(path_instruction{path_instruction_type::named});
         path_commands.back().name =
           cudf::string_view(all_names_scalar.data() + name_pos, name.size());
+        // for (size_t i = 0; i <name.size(); ++i)
+        // {
+        //   printf("my debug: ##### :::::      %c\n", *(all_names_scalar.data() + i));
+        // }
+
+        // printf("my debug: ##### :::::      %s\n", all_names.substr(name_pos,
+        // name.size()).c_str());
+
         name_pos += name.size();
         break;
       default: CUDF_FAIL("Invalid path instruction type");
     }
+    // printf("type: %d, name: %s, index: %ld\n", type, name.c_str(), index);
   }
   // convert to uvector
   return cudf::detail::make_device_uvector_sync(path_commands, stream, mr);
 }
-
-/**
- * TODO: JSON generator
- *
- */
-template <int max_json_nesting_depth = curr_max_json_nesting_depth>
-class json_generator {
- public:
-  CUDF_HOST_DEVICE json_generator(char* _output, size_t _output_len)
-    : output(_output), output_len(_output_len)
-  {
-  }
-  CUDF_HOST_DEVICE json_generator() : output(nullptr), output_len(0) {}
-
-  // create a nested child generator based on this parent generator
-  // child generator is a view
-  CUDF_HOST_DEVICE json_generator new_child_generator()
-  {
-    if (nullptr == output) {
-      return json_generator();
-    } else {
-      return json_generator(output + output_len, 0);
-    }
-  }
-
-  CUDF_HOST_DEVICE json_generator finish_child_generator(json_generator const& child_generator)
-  {
-    // logically delete child generator
-    output_len += child_generator.get_output_len();
-  }
-
-  CUDF_HOST_DEVICE void write_start_array()
-  {
-    // TODO
-  }
-
-  CUDF_HOST_DEVICE void write_end_array()
-  {
-    // TODO
-  }
-
-  CUDF_HOST_DEVICE void copy_current_structure(json_parser<max_json_nesting_depth>& parser)
-  {
-    // TODO
-  }
-
-  /**
-   * Get current text from JSON parser and then write the text
-   * Note: Because JSON strings contains '\' to do escape,
-   * JSON parser should do unescape to remove '\' and JSON parser
-   * then can not return a pointer and length pair (char *, len),
-   * For number token, JSON parser can return a pair (char *, len)
-   */
-  CUDF_HOST_DEVICE void write_raw(json_parser<max_json_nesting_depth>& parser)
-  {
-    if (output) {
-      auto copied = parser.try_copy_raw_text(output + output_len);
-      output_len += copied;
-    }
-  }
-
-  CUDF_HOST_DEVICE inline size_t get_output_len() const { return output_len; }
-
- private:
-  char const* const output;
-  size_t output_len;
-};
 
 /**
  * @brief Result of calling a parse function.
@@ -229,7 +143,7 @@ __device__ parse_result parse_json_path(json_parser<max_json_nesting_depth>& j_p
   if (json_token::ERROR == j_parser.get_current_token()) { return parse_result::ERROR; }
 
   auto matched = evaluate_path<max_json_nesting_depth>(
-    j_parser, output, true, write_style::raw_style, path_ptr, path_size);
+    j_parser, output, true, write_style::raw_style, path_commands.data(), path_commands.size());
   return matched ? parse_result::SUCCESS : parse_result::ERROR;
 }
 
@@ -259,7 +173,7 @@ get_json_object_single(char const* input,
 {
   json_parser j_parser(options, input, input_len);
   json_generator generator(out_buf);
-  auto const result = parse_json_path(j_parser, path_commands_ptr, path_commands_size, generator);
+  auto const result = parse_json_path(j_parser, path_commands, generator);
   return {result, generator};
 }
 
@@ -346,19 +260,31 @@ std::unique_ptr<cudf::column> get_json_object(
 {
   if (col.is_empty()) return cudf::make_empty_column(cudf::type_id::STRING);
 
-  // parse the json_path into a command buffer
-  auto path_commands = construct_path_commands(instructions, stream, mr);
+  printf("flag 1\n");
 
-  auto options = json_parser_options{};
+  // parse the json_path into a command buffer
+  // get a string buffer to store all the names and convert to device
+  std::string all_names = "";
+  for (auto const& inst : instructions) {
+    all_names += std::get<1>(inst);
+  }
+  cudf::string_scalar all_names_scalar(all_names, true, stream, mr);
+  auto path_commands = construct_path_commands(instructions, all_names_scalar, stream, mr);
+
+  printf("flag 2\n");
 
   // compute output sizes
   auto sizes = rmm::device_uvector<cudf::size_type>(
     col.size(), stream, rmm::mr::get_current_device_resource());
   auto d_offsets = cudf::detail::offsetalator_factory::make_input_iterator(col.offsets());
 
+  printf("flag 3\n");
+
   constexpr int block_size = 512;
   cudf::detail::grid_1d const grid{col.size(), block_size};
   auto cdv = cudf::column_device_view::create(col.parent(), stream);
+
+  printf("flag 4\n");
 
   // create json parser options
   spark_rapids_jni::json_parser_options options;
@@ -380,21 +306,33 @@ std::unique_ptr<cudf::column> get_json_object(
       thrust::nullopt,
       options);
 
+  printf("flag 5\n");
   // convert sizes to offsets
   auto [offsets, output_size] =
     cudf::strings::detail::make_offsets_child_column(sizes.begin(), sizes.end(), stream, mr);
+
+  printf("flag 6.1 %d", int(output_size));
+
   d_offsets = cudf::detail::offsetalator_factory::make_input_iterator(offsets->view());
+
+  printf("flag 6.15");
 
   // allocate output string column
   rmm::device_uvector<char> chars(output_size, stream, mr);
+
+  printf("flag 6.2 %d", int(output_size));
 
   // potential optimization : if we know that all outputs are valid, we could
   // skip creating the validity mask altogether
   rmm::device_buffer validity =
     cudf::detail::create_null_mask(col.size(), cudf::mask_state::UNINITIALIZED, stream, mr);
 
+  printf("flag 6.3 %d", int(output_size));
+
   // compute results
   rmm::device_scalar<cudf::size_type> d_valid_count{0, stream};
+
+  printf("flag 6\n");
 
   get_json_object_kernel<block_size>
     <<<grid.num_blocks, grid.num_threads_per_block, 0, stream.value()>>>(
@@ -407,6 +345,8 @@ std::unique_ptr<cudf::column> get_json_object(
       d_valid_count.data(),
       options);
 
+  printf("flag 7\n");
+
   auto result = make_strings_column(col.size(),
                                     std::move(offsets),
                                     chars.release(),
@@ -416,6 +356,8 @@ std::unique_ptr<cudf::column> get_json_object(
   if (cudf::detail::has_nonempty_nulls(result->view(), stream)) {
     result = cudf::detail::purge_nonempty_nulls(result->view(), stream, mr);
   }
+
+  printf("flag 8\n");
   return result;
 }
 
@@ -423,12 +365,12 @@ std::unique_ptr<cudf::column> get_json_object(
 
 std::unique_ptr<cudf::column> get_json_object(
   cudf::strings_column_view const& col,
-  std::vector<std::tuple<path_instruction_type, std::string, int64_t>> const& instructions,
+  std::vector<std::tuple<detail::path_instruction_type, std::string, int64_t>> const& instructions,
   rmm::cuda_stream_view stream,
   rmm::mr::device_memory_resource* mr)
 {
   // TODO: here do not know if json path is invalid, should handle it in Plugin
-  return detail::get_json_object(col, json_path, stream, mr);
+  return detail::get_json_object(col, instructions, stream, mr);
 }
 
 }  // namespace spark_rapids_jni

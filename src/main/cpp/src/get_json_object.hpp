@@ -613,18 +613,13 @@ struct path_evaluator {
 }  // namespace detail
 
 /**
- * path instruction type
- */
-enum class path_instruction_type { subscript, wildcard, key, index, named };
-
-/**
  * Extracts json object from a json string based on json path specified, and
  * returns json string of the extracted json object. It will return null if the
  * input json string is invalid.
  */
 std::unique_ptr<cudf::column> get_json_object(
   cudf::strings_column_view const& col,
-  std::vector<std::tuple<path_instruction_type, std::string, int64_t>> const& instructions,
+  std::vector<std::tuple<detail::path_instruction_type, std::string, int64_t>> const& instructions,
   rmm::cuda_stream_view stream        = cudf::get_default_stream(),
   rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
 

@@ -19,9 +19,10 @@
 
 #include <cudf/strings/strings_column_view.hpp>
 
+#include <iostream>
 #include <vector>
 
-using path_instruction_type = spark_rapids_jni::path_instruction_type;
+using path_instruction_type = spark_rapids_jni::detail::path_instruction_type;
 
 extern "C" {
 JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_JSONUtils_getJsonObject(
@@ -57,6 +58,9 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_JSONUtils_getJsonObject
       jlong index = env->GetLongField(instruction, field_id);
 
       instructions.emplace_back(instruction_type, name_str, index);
+
+      std::cout << "instruction_type: " << type << ", name: " << name_str << ", index: " << index
+                << std::endl;
 
       env->ReleaseStringUTFChars(name, name_str);
     }
