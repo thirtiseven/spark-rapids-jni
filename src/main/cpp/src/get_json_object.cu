@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "get_json_object.cuh"
+#include "get_json_object.hpp"
 #include "json_parser.cuh"
 
 #include <cudf/column/column_device_view.cuh>
@@ -48,11 +48,6 @@
 #include <thrust/tuple.h>
 
 namespace spark_rapids_jni {
-
-/**
- * path instruction type
- */
-enum class path_instruction_type { SUBSCRIPT, WILDCARD, KEY, INDEX, NAMED };
 
 namespace detail {
 // namespace {

@@ -26,6 +26,11 @@
 namespace spark_rapids_jni {
 
 /**
+ * path instruction type
+ */
+enum class path_instruction_type { SUBSCRIPT, WILDCARD, KEY, INDEX, NAMED };
+
+/**
  * Extracts json object from a json string based on json path specified, and
  * returns json string of the extracted json object. It will return null if the
  * input json string is invalid.
