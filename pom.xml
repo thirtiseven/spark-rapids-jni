@@ -114,6 +114,7 @@
     <slf4j.version>1.7.30</slf4j.version>
     <iceberg.version>1.6.1</iceberg.version>
     <submodule.check.skip>false</submodule.check.skip>
+    <native.build.skip>false</native.build.skip>
     <!-- This skips applying and unapplying patchs to CUDF. Be aware that if you 
     try to build the main jar without patching CUDF it could result in build
     failures because the two often need to be in sync with each other. So use
@@ -445,6 +446,7 @@
             <id>buildcpp</id>
             <phase>validate</phase>
             <configuration>
+              <skip>${native.build.skip}</skip>
               <target>
                 <exec dir="${project.basedir}"
                       failonerror="true"
@@ -486,6 +488,7 @@
             <id>build-info</id>
             <phase>generate-resources</phase>
             <configuration>
+              <skip>${native.build.skip}</skip>
               <target>
                 <mkdir dir="${project.build.directory}/extra-resources"/>
                 <exec executable="bash"
