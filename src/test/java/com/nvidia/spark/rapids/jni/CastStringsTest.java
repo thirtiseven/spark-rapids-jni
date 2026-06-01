@@ -1426,11 +1426,13 @@ public class CastStringsTest {
   @Test
   void parseTimestampWithFormat_correctedDateTime() {
     long ts = expectedUs(2024, 12, 31, 23, 59, 58);
+    // CORRECTED matches the literal space with exactly one ' ': 'T' and double-space separators
+    // are rejected, mirroring Spark's DateTimeFormatter (both return NULL on CPU).
     assertParsedTimestamp(
         new String[]{"2024-12-31 23:59:58", "2024-12-31T23:59:58",
                      "2024-12-31 23:59:5", "2024-12-31  23:59:58", "2024-12-31 23:59:60"},
         "yyyy-MM-dd HH:mm:ss", false,
-        new Long[]{ts, ts, null, null, null});
+        new Long[]{ts, null, null, null, null});
   }
 
   @Test
@@ -1494,17 +1496,18 @@ public class CastStringsTest {
         new Long[]{expectedUs(2024, 5, 6, 0, 0, 0), null, null,
                     expectedUs(2024, 5, 6, 0, 0, 0)});
 
-    // yyyyMMdd HH:mm:ss
+    // yyyyMMdd HH:mm:ss. The pattern's literal space matches only ' ', so a 'T' separator is
+    // rejected (Spark CPU LEGACY returns NULL for "20241231T23:59:58").
     assertParsedTimestamp(
         new String[]{"20241231 23:59:58", "20241231T23:59:58", "20241231 23:59:58Z"},
         "yyyyMMdd HH:mm:ss", true,
-        new Long[]{ts, ts, ts});
+        new Long[]{ts, null, ts});
 
     // Slash-separated legacy timestamp path.
     assertParsedTimestamp(
         new String[]{"2024/12/31 23:59:58", "2024/12/31T23:59:58", "2024/12/31 23:59:58Z"},
         "yyyy/MM/dd HH:mm:ss", true,
-        new Long[]{ts, ts, ts});
+        new Long[]{ts, null, ts});
   }
 
   @Test
@@ -1579,6 +1582,40 @@ public class CastStringsTest {
         new String[]{"2024/  05/\t\t06"},
         "yyyy/MM/dd", true,
         new Long[]{y2024_05_06});
+  }
+
+  @Test
+  void parseTimestampWithFormat_legacyWhitespaceBeforeEveryField() {
+    // SimpleDateFormat skips leading [ \t] before every numeric field. Verified against
+    // java.text.SimpleDateFormat(lenient): the separator literal matches a single ' ', then the
+    // hour/minute/second fields each absorb any leading whitespace run, so multi-space separators
+    // and "11: 59: 59" both parse. Whitespace BEFORE a literal (e.g. "11 :59") still fails, and a
+    // tab/'T' as the separator fails because the literal space matches only ' '.
+    long ts = expectedUs(1999, 12, 31, 11, 59, 59);
+    assertParsedTimestamp(
+        new String[]{
+            "1999-12-31 11:59:59",     // single space
+            "1999-12-31  11:59:59",    // double space after separator
+            "1999-12-31   11:59:59",   // triple space
+            "1999-12-31 \t 11:59:59",  // mixed space/tab run after separator
+            "1999-12-31 11: 59: 59",   // whitespace after ':' before minute/second
+            " 1999-12-31 11:59:59 ",   // outer trim
+            "1999-12-31\t11:59:59",    // tab separator rejected (literal space != '\t')
+            "1999-12-31T11:59:59",     // 'T' separator rejected (literal space != 'T')
+            "1999-12-31 11 :59:59",    // whitespace before ':' literal rejected
+        },
+        "yyyy-MM-dd HH:mm:ss", true,
+        new Long[]{ts, ts, ts, ts, ts, ts, null, null, null});
+  }
+
+  @Test
+  void parseTimestampWithFormat_correctedSingleSeparatorOnly() {
+    // CORRECTED keeps DateTimeFormatter semantics: exactly one separator, no whitespace fold.
+    long ts = expectedUs(1999, 12, 31, 11, 59, 59);
+    assertParsedTimestamp(
+        new String[]{"1999-12-31 11:59:59", "1999-12-31  11:59:59", "1999-12-31 11: 59:59"},
+        "yyyy-MM-dd HH:mm:ss", false,
+        new Long[]{ts, null, null});
   }
 
   @Test

@@ -71,16 +71,8 @@ __device__ bool try_parse_char(unsigned char const* p, int& pos, int end, unsign
   return true;
 }
 
-__device__ bool try_parse_t_or_space(unsigned char const* p, int& pos, int end)
-{
-  if (pos >= end) { return false; }
-  unsigned char c = p[pos];
-  if (c != ' ' && c != 'T') { return false; }
-  ++pos;
-  return true;
-}
-
-// Skip [ \t]* — used to fold REMOVE_WHITESPACE_FROM_MONTH_DAY into the legacy state machine.
+// Skip [ \t]* — folds SimpleDateFormat's leading-whitespace-before-numeric-field behavior into
+// the legacy state machine (see compile_format).
 __device__ void skip_ht_whitespace(unsigned char const* p, int& pos, int end)
 {
   while (pos < end && (p[pos] == ' ' || p[pos] == '\t')) {
@@ -127,7 +119,6 @@ struct parsed_dt {
 enum tok_kind : uint8_t {
   TOK_DIGITS,           // a = field, b = min_digits, c = max_digits
   TOK_LITERAL,          // a = literal char
-  TOK_T_OR_SPACE,       // 'T' or ' ' between date and time
   TOK_SKIP_HT_WS,       // skip [ \t]* (legacy whitespace fold)
   TOK_TRAIL_EOF,        // pos must equal end
   TOK_TRAIL_NON_DIGIT,  // pos == end OR p[pos] is not a digit (legacy tail rule)
@@ -158,9 +149,15 @@ struct format_token {
 //   - CORRECTED `yyyy/MM/dd` keeps the existing spark-rapids compatibility contract and accepts
 //     1-2 digit month/day fields.
 // Literal handling:
-//   - Space ' ' compiles to TOK_T_OR_SPACE (Spark accepts both as the date/time separator).
-//   - In LEGACY, '-' and '/' literals are followed by TOK_SKIP_HT_WS, folding the legacy
-//     `REMOVE_WHITESPACE_FROM_MONTH_DAY` rewrite into the state machine.
+//   - A space ' ' in the pattern is an ordinary literal that matches exactly one ' '. Spark does
+//     NOT accept 'T' as the separator for a space-separated pattern under either policy
+//     (to_timestamp("1999-12-31T11:59:59", "yyyy-MM-dd HH:mm:ss") is NULL on CPU); the previous
+//     'T'-or-space token over-accepted, diverging from both Spark and the cuDF fallback path's
+//     own ".{10}T" rejection.
+//   - In LEGACY, SimpleDateFormat skips leading [ \t] before every numeric field, so a
+//     TOK_SKIP_HT_WS is emitted ahead of each non-packed digit field. This subsumes the old
+//     `REMOVE_WHITESPACE_FROM_MONTH_DAY` rewrite (whitespace after '-'/'/') and also folds the
+//     whitespace SimpleDateFormat tolerates after the date/time separator and after ':'.
 // The trailing token is TOK_TRAIL_EOF for CORRECTED and TOK_TRAIL_NON_DIGIT for LEGACY.
 
 uint8_t letter_to_field(char c)
@@ -205,21 +202,23 @@ std::vector<format_token> compile_format(std::string const& fmt, bool legacy)
       bool const variable_width = (legacy && !packed) || corrected_variable_width_slash_date;
       uint8_t const min_d       = (c == 'y') ? run : (variable_width ? 1 : run);
       uint8_t const max_d       = run;
+      // LEGACY SimpleDateFormat skips leading [ \t] before every numeric field (e.g.
+      // "2024- 05- 06", "1999-12-31  11:59:59", "11: 59: 59" all parse). Fold that into the token
+      // stream by emitting a skip ahead of each digit field. The skip is suppressed when the field
+      // abuts a preceding digit field (a "packed" run such as yyyyMMdd), since those keep
+      // exact-width parsing and are not whitespace-separable.
+      bool const abuts_prev_field = (i > 0 && std::isalpha(static_cast<unsigned char>(fmt[i - 1])));
+      if (legacy && !abuts_prev_field) { out.push_back({TOK_SKIP_HT_WS, 0, 0, 0}); }
       out.push_back({TOK_DIGITS, letter_to_field(c), min_d, max_d});
       saw_digit_field = true;
       i               = j;
     } else {
-      if (c == ' ') {
-        out.push_back({TOK_T_OR_SPACE, 0, 0, 0});
-      } else {
-        // Literal char must be ASCII; non-ASCII bytes would alias UTF-8 continuation bytes
-        // when matched against the input.
-        if (static_cast<unsigned char>(c) >= 0x80) {
-          throw std::invalid_argument("non-ASCII literal in pattern is not supported");
-        }
-        out.push_back({TOK_LITERAL, static_cast<uint8_t>(c), 0, 0});
-        if (legacy && (c == '-' || c == '/')) { out.push_back({TOK_SKIP_HT_WS, 0, 0, 0}); }
+      // A space is just a literal; it matches exactly one ' ' (not 'T', not a tab). Non-ASCII
+      // bytes would alias UTF-8 continuation bytes when matched against the input.
+      if (static_cast<unsigned char>(c) >= 0x80) {
+        throw std::invalid_argument("non-ASCII literal in pattern is not supported");
       }
+      out.push_back({TOK_LITERAL, static_cast<uint8_t>(c), 0, 0});
       ++i;
     }
   }
@@ -261,7 +260,6 @@ __device__ bool walk_tokens(unsigned char const* p,
         break;
       }
       case TOK_LITERAL: ok = try_parse_char(p, pos, end, t.a); break;
-      case TOK_T_OR_SPACE: ok = try_parse_t_or_space(p, pos, end); break;
       case TOK_SKIP_HT_WS: skip_ht_whitespace(p, pos, end); break;
       case TOK_TRAIL_EOF: ok = (pos == end); break;
       case TOK_TRAIL_NON_DIGIT:
