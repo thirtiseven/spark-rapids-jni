@@ -18,6 +18,7 @@
 
 #include "protobuf/protobuf.hpp"
 
+#include <cstddef>
 #include <string>
 #include <type_traits>
 
@@ -93,32 +94,17 @@ struct field_location {
   int32_t length;  // Length of field data in bytes
 };
 
-struct enum_domain_device_view {
-  int32_t const* valid_values;
-  int size;
-};
-
-struct enum_string_lookup_device_view {
-  enum_domain_device_view domain;
-  int32_t const* name_offsets;
-  uint8_t const* name_chars;
-};
-
-static_assert(std::is_trivially_copyable_v<enum_domain_device_view>);
-static_assert(std::is_standard_layout_v<enum_domain_device_view>);
-static_assert(std::is_trivially_copyable_v<enum_string_lookup_device_view>);
-static_assert(std::is_standard_layout_v<enum_string_lookup_device_view>);
-
 /**
  * Field descriptor passed to the scanning kernel.
  */
 struct field_descriptor {
-  int field_number;                  // Protobuf field number
-  int expected_wire_type;            // Expected wire type for this field
-  bool is_repeated;                  // Repeated children use count/scan kernels
-  bool is_message;                   // Singular messages may need occurrence merging
-  int32_t const* valid_enum_values;  // Sorted closed-enum values, or nullptr
-  int num_valid_enum_values;         // Size of valid_enum_values
+  int field_number;                    // Protobuf field number
+  proto_wire_type expected_wire_type;  // Expected wire type for this field
+  bool is_repeated;                    // Repeated children use count/scan kernels
+  bool is_message;                     // Singular messages may need occurrence merging
+  int32_t const* valid_enum_values;    // Sorted closed-enum values, or nullptr
+  int num_valid_enum_values;           // Size of valid_enum_values
+  int output_index = -1;  // Column within the matching output buffer, or -1 when unused
 };
 
 /**
@@ -143,7 +129,8 @@ struct field_occurrence {
  */
 struct field_occurrence_scan_desc {
   int field_number;
-  int wire_type;
+  proto_wire_type expected_wire_type;
+  static constexpr bool is_repeated = true;
   int32_t const* row_offsets;     // Pre-computed prefix-sum offsets [num_rows + 1]
   field_occurrence* occurrences;  // Output buffer [total_count]
 };
@@ -158,59 +145,106 @@ struct lookup_view {
 
 using field_occurrence_scan_view = lookup_view<field_occurrence_scan_desc>;
 
-/**
- * Device-side descriptor for nested schema fields.
- */
-struct device_nested_field_descriptor {
-  int field_number;
-  int parent_idx;
-  int depth;
-  int wire_type;
-  int output_type_id;
-  int encoding;
-  bool is_repeated;
-  bool is_required;
-  bool has_default_value;
+// ============================================================================
+// Device-facing views and scalar kernel arguments
+// ============================================================================
 
-  device_nested_field_descriptor() = default;
-
-  // Wire type and encoding are stored as int (not typed enums) because CUDA device code
-  // historically had limited constexpr enum support, and the kernel comparison sites use
-  // int-typed wire_type_value()/encoding_value() helpers throughout.
-  explicit device_nested_field_descriptor(nested_field_descriptor const& src)
-    : field_number(src.field_number),
-      parent_idx(src.parent_idx),
-      depth(src.depth),
-      wire_type(static_cast<int>(src.wire_type)),
-      output_type_id(static_cast<int>(src.output_type)),
-      encoding(static_cast<int>(src.encoding)),
-      is_repeated(src.is_repeated),
-      is_required(src.is_required),
-      has_default_value(src.has_default_value)
-  {
-  }
+struct protobuf_input_view {
+  uint8_t const* message_data;
+  cudf::size_type message_data_size;
+  cudf::size_type const* row_offsets;
+  cudf::size_type base_offset;
+  int num_rows;
 };
 
-struct device_schema_view {
-  device_nested_field_descriptor const* fields;
-  int depth;
+struct nested_parent_view {
+  field_location const* locations;
+  std::size_t location_count;
+  int32_t const* top_row_indices;
 };
 
-struct repeated_field_count_view {
-  field_occurrence_count* info;
-  lookup_view<int> schema_lookup;
+struct message_fragment_source_view {
+  field_location const* parent_locations;
+  int32_t const* top_row_indices;
 };
 
-struct nested_field_location_view {
-  field_location* locations;
-  field_occurrence_count* occurrence_info;
-  int* multiple_message_fields;
-  lookup_view<int> schema_lookup;
+enum class enum_error_scope { root, local };
+
+struct protobuf_value_domain_view {
+  int size;
+  int32_t const* top_row_indices;
+  enum_error_scope enum_scope;
+};
+
+struct required_field_input_view {
+  field_location const* locations;
+  protobuf_value_domain_view values;
+  cudf::bitmask_type const* input_null_mask;
+  cudf::size_type input_offset;
+  field_location const* parent_locations;
+};
+
+struct scalar_value_input {
+  uint8_t const* data;
+  int32_t length;
+  bool present;
+};
+
+struct enum_value_device_view {
+  int32_t const* values;
+  bool* valid;
+  int size;
+};
+
+template <typename T>
+struct scalar_value_output {
+  T* values;
+  bool* valid;
+  protobuf_error* error;
+};
+
+template <typename T>
+struct scalar_decode_options {
+  bool has_default;
+  T default_value;
+};
+
+template <typename T>
+struct batched_scalar_desc {
+  int loc_field_idx;
+  T* output;
+  bool* valid;
+  scalar_decode_options<T> options;
+};
+
+template <typename T>
+struct batched_scalar_input_view {
+  protobuf_input_view input;
+  field_location const* locations;
+  int num_location_fields;
+  batched_scalar_desc<T> const* descriptors;
+  int num_descriptors;
+  protobuf_error* error;
+};
+
+struct enum_domain_device_view {
+  int32_t const* valid_values;
+  int size;
+};
+
+struct enum_string_lookup_device_view {
+  enum_domain_device_view domain;
+  int32_t const* name_offsets;
+  uint8_t const* name_chars;
 };
 
 struct field_scan_view {
   field_location* locations;
+  int location_stride;
   field_occurrence_count* repeated_info;
+  int repeated_stride;
+  field_occurrence_count* singular_message_info;
+  int singular_message_stride;
   protobuf_error* deferred_enum_error;
   int* multiple_message_fields;
   lookup_view<field_descriptor> lookup;
@@ -219,5 +253,30 @@ struct field_scan_view {
 struct message_validation_view {
   lookup_view<field_descriptor> lookup;
 };
+
+template <typename T>
+concept device_layout_compatible = std::is_trivially_copyable_v<T> && std::is_standard_layout_v<T>;
+
+static_assert(device_layout_compatible<protobuf_input_view>);
+static_assert(device_layout_compatible<field_descriptor>);
+static_assert(device_layout_compatible<field_occurrence_scan_desc>);
+static_assert(device_layout_compatible<field_occurrence_scan_view>);
+static_assert(device_layout_compatible<lookup_view<field_descriptor>>);
+static_assert(device_layout_compatible<nested_parent_view>);
+static_assert(device_layout_compatible<message_fragment_source_view>);
+static_assert(device_layout_compatible<protobuf_value_domain_view>);
+static_assert(device_layout_compatible<required_field_input_view>);
+static_assert(device_layout_compatible<scalar_value_input>);
+static_assert(device_layout_compatible<enum_value_device_view>);
+static_assert(device_layout_compatible<scalar_value_output<int32_t>>);
+static_assert(device_layout_compatible<scalar_decode_options<int64_t>>);
+static_assert(device_layout_compatible<batched_scalar_desc<int32_t>>);
+static_assert(device_layout_compatible<batched_scalar_input_view<int32_t>>);
+static_assert(device_layout_compatible<batched_scalar_desc<double>>);
+static_assert(device_layout_compatible<batched_scalar_input_view<double>>);
+static_assert(device_layout_compatible<enum_domain_device_view>);
+static_assert(device_layout_compatible<enum_string_lookup_device_view>);
+static_assert(device_layout_compatible<field_scan_view>);
+static_assert(device_layout_compatible<message_validation_view>);
 
 }  // namespace spark_rapids_jni::protobuf::detail

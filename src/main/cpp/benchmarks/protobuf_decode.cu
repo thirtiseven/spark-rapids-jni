@@ -1334,7 +1334,11 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
     parent_locations.data(), parent_locations.size(), nullptr};
   protobuf_detail::field_scan_view field_scan{
     field_locations.data(),
+    num_repeated_children,
     occurrence_counts.data(),
+    num_repeated_children,
+    nullptr,
+    0,
     nullptr,
     nullptr,
     {field_descriptors.device.data(), num_repeated_children, nullptr, 0}};

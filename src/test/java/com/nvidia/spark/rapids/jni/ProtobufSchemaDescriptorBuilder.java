@@ -18,6 +18,7 @@ package com.nvidia.spark.rapids.jni;
 
 import ai.rapids.cudf.DType;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -210,12 +211,16 @@ public final class ProtobufSchemaDescriptorBuilder {
     return this;
   }
 
-  /** Provide enum-as-string metadata for the current field (also sets ENC_ENUM_STRING). */
-  public ProtobufSchemaDescriptorBuilder enumMetadata(int[] validValues, byte[][] names) {
+  /** Provide zero-based enum-as-string metadata for the current field. */
+  public ProtobufSchemaDescriptorBuilder enumMetadata(String... names) {
     Field f = current();
     f.encoding = Protobuf.ENC_ENUM_STRING;
-    f.enumValidValues = validValues;
-    f.enumNames = names;
+    f.enumValidValues = new int[names.length];
+    f.enumNames = new byte[names.length][];
+    for (int i = 0; i < names.length; i++) {
+      f.enumValidValues[i] = i;
+      f.enumNames[i] = names[i].getBytes(StandardCharsets.UTF_8);
+    }
     return this;
   }
 

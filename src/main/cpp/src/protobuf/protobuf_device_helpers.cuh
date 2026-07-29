@@ -82,23 +82,23 @@ void set_error_once_async(protobuf_error* error_flag,
                           protobuf_error error,
                           rmm::cuda_stream_view stream);
 
-__device__ inline int get_wire_type_size(int wt, uint8_t const* cur, uint8_t const* end)
+__device__ inline int get_wire_type_size(proto_wire_type wt, uint8_t const* cur, uint8_t const* end)
 {
   switch (wt) {
-    case wire_type_value(proto_wire_type::VARINT): {
+    case proto_wire_type::VARINT: {
       uint64_t value;
       int bytes;
       return read_varint(cur, end, value, bytes) ? bytes : -1;
     }
-    case wire_type_value(proto_wire_type::I64BIT):
+    case proto_wire_type::I64BIT:
       // Check if there's enough data for 8 bytes
       if (end - cur < 8) return -1;
       return 8;
-    case wire_type_value(proto_wire_type::I32BIT):
+    case proto_wire_type::I32BIT:
       // Check if there's enough data for 4 bytes
       if (end - cur < 4) return -1;
       return 4;
-    case wire_type_value(proto_wire_type::LEN): {
+    case proto_wire_type::LEN: {
       uint64_t len;
       int n;
       if (!read_varint(cur, end, len, n)) return -1;
@@ -108,8 +108,8 @@ __device__ inline int get_wire_type_size(int wt, uint8_t const* cur, uint8_t con
       }
       return n + static_cast<int>(len);
     }
-    case wire_type_value(proto_wire_type::SGROUP):
-    case wire_type_value(proto_wire_type::EGROUP): return -1;
+    case proto_wire_type::SGROUP:
+    case proto_wire_type::EGROUP: return -1;
     default: return -1;
   }
 }
@@ -136,8 +136,8 @@ static __device__ __noinline__ bool skip_group(uint8_t const* cur,
     if (inner_field_number == 0 || inner_field_number > static_cast<uint64_t>(MAX_FIELD_NUMBER)) {
       return false;
     }
-    int const inner_wire_type = static_cast<int>(key & 0x7);
-    if (inner_wire_type == wire_type_value(proto_wire_type::EGROUP)) {
+    auto const inner_wire_type = static_cast<proto_wire_type>(key & 0x7);
+    if (inner_wire_type == proto_wire_type::EGROUP) {
       if (static_cast<int>(inner_field_number) != group_fields[depth - 1]) return false;
       if (--depth == 0) {
         out_cur = cur;
@@ -145,7 +145,7 @@ static __device__ __noinline__ bool skip_group(uint8_t const* cur,
       }
       continue;
     }
-    if (inner_wire_type == wire_type_value(proto_wire_type::SGROUP)) {
+    if (inner_wire_type == proto_wire_type::SGROUP) {
       if (depth == max_group_depth) return false;
       group_fields[depth++] = static_cast<int>(inner_field_number);
       continue;
@@ -161,15 +161,15 @@ static __device__ __noinline__ bool skip_group(uint8_t const* cur,
 __device__ inline bool skip_field(uint8_t const* cur,
                                   uint8_t const* end,
                                   int field_number,
-                                  int wt,
+                                  proto_wire_type wt,
                                   int max_group_depth,
                                   uint8_t const*& out_cur)
 {
   // A bare end-group is only valid while a start-group payload is being parsed by skip_group.
   // The scan/count kernels should never accept it as a standalone field because Spark CPU treats
   // unmatched end-groups as malformed protobuf.
-  if (wt == wire_type_value(proto_wire_type::EGROUP)) { return false; }
-  if (wt == wire_type_value(proto_wire_type::SGROUP)) {
+  if (wt == proto_wire_type::EGROUP) { return false; }
+  if (wt == proto_wire_type::SGROUP) {
     return skip_group(cur, end, field_number, max_group_depth, out_cur);
   }
 
@@ -185,10 +185,13 @@ __device__ inline bool skip_field(uint8_t const* cur,
  * Get the data offset and length for a field at current position.
  * Returns true on success, false on error.
  */
-__device__ inline bool get_field_data_location(
-  uint8_t const* cur, uint8_t const* end, int wt, int32_t& data_offset, int32_t& data_length)
+__device__ inline bool get_field_data_location(uint8_t const* cur,
+                                               uint8_t const* end,
+                                               proto_wire_type wt,
+                                               int32_t& data_offset,
+                                               int32_t& data_length)
 {
-  if (wt == wire_type_value(proto_wire_type::LEN)) {
+  if (wt == proto_wire_type::LEN) {
     // For length-delimited, read the length prefix
     uint64_t len;
     int len_bytes;
@@ -246,7 +249,7 @@ __device__ inline bool check_message_bounds(T start,
 
 struct proto_tag {
   int field_number;
-  int wire_type;
+  proto_wire_type wire_type;
 };
 
 __device__ inline bool decode_tag(uint8_t const*& cur,
@@ -268,7 +271,7 @@ __device__ inline bool decode_tag(uint8_t const*& cur,
     return false;
   }
   tag.field_number = static_cast<int>(fn);
-  tag.wire_type    = static_cast<int>(key & 0x7);
+  tag.wire_type    = static_cast<proto_wire_type>(key & 0x7);
   return true;
 }
 
