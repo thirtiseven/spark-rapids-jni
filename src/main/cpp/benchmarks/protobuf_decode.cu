@@ -69,13 +69,13 @@ void encode_tag(std::vector<uint8_t>& buf, int field_number, int wire_type)
 
 void encode_varint_field(std::vector<uint8_t>& buf, int field_number, int64_t value)
 {
-  encode_tag(buf, field_number, protobuf::wire_type_value(protobuf::proto_wire_type::VARINT));
+  encode_tag(buf, field_number, static_cast<int>(protobuf::proto_wire_type::VARINT));
   encode_varint(buf, static_cast<uint64_t>(value));
 }
 
 void encode_fixed32_field(std::vector<uint8_t>& buf, int field_number, float value)
 {
-  encode_tag(buf, field_number, protobuf::wire_type_value(protobuf::proto_wire_type::I32BIT));
+  encode_tag(buf, field_number, static_cast<int>(protobuf::proto_wire_type::I32BIT));
   uint32_t bits;
   std::memcpy(&bits, &value, sizeof(bits));
   for (int i = 0; i < 4; i++) {
@@ -86,7 +86,7 @@ void encode_fixed32_field(std::vector<uint8_t>& buf, int field_number, float val
 
 void encode_fixed64_field(std::vector<uint8_t>& buf, int field_number, double value)
 {
-  encode_tag(buf, field_number, protobuf::wire_type_value(protobuf::proto_wire_type::I64BIT));
+  encode_tag(buf, field_number, static_cast<int>(protobuf::proto_wire_type::I64BIT));
   uint64_t bits;
   std::memcpy(&bits, &value, sizeof(bits));
   for (int i = 0; i < 8; i++) {
@@ -97,7 +97,7 @@ void encode_fixed64_field(std::vector<uint8_t>& buf, int field_number, double va
 
 void encode_len_field(std::vector<uint8_t>& buf, int field_number, void const* data, size_t len)
 {
-  encode_tag(buf, field_number, protobuf::wire_type_value(protobuf::proto_wire_type::LEN));
+  encode_tag(buf, field_number, static_cast<int>(protobuf::proto_wire_type::LEN));
   encode_varint(buf, len);
   auto const* p = static_cast<uint8_t const*>(data);
   buf.insert(buf.end(), p, p + len);
@@ -808,7 +808,7 @@ void encode_string_field_record(std::vector<uint8_t>& buf,
                                 std::vector<protobuf_detail::field_occurrence>& occurrences,
                                 int32_t row_idx)
 {
-  encode_tag(buf, field_number, protobuf::wire_type_value(proto_wire_type::LEN));
+  encode_tag(buf, field_number, static_cast<int>(proto_wire_type::LEN));
   encode_varint(buf, value.size());
   auto const data_offset = static_cast<int32_t>(buf.size());
   buf.insert(buf.end(), value.begin(), value.end());
@@ -1319,10 +1319,8 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
     auto const total_count = static_cast<int32_t>(data.occurrences_by_child[child_idx].size());
     auto& work             = *child_work.emplace_back(
       std::make_unique<repeated_child_count_scan_work>(num_rows, total_count, stream, mr));
-    host_scan_descriptors[child_idx] = {child_idx + 1,
-                                        protobuf::wire_type_value(proto_wire_type::LEN),
-                                        work.offsets.data(),
-                                        work.occurrences.data()};
+    host_scan_descriptors[child_idx] = {
+      child_idx + 1, proto_wire_type::LEN, work.offsets.data(), work.occurrences.data()};
   }
   auto occurrence_scan =
     protobuf_detail::make_field_occurrence_scan_bundle(host_scan_descriptors, stream, mr);
