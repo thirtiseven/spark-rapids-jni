@@ -104,7 +104,7 @@ struct field_descriptor {
   bool is_message;                     // Singular messages may need occurrence merging
   int32_t const* valid_enum_values;    // Sorted closed-enum values, or nullptr
   int num_valid_enum_values;           // Size of valid_enum_values
-  int output_index = -1;  // Column within the matching output buffer, or -1 when unused
+  int output_index = -1;               // Matching output column, or -1 when unused
 };
 
 /**

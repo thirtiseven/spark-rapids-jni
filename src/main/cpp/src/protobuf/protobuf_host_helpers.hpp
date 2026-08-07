@@ -273,11 +273,10 @@ inline list_offsets_from_counts_result make_list_offsets_from_counts(
   return {total_count, std::move(offsets)};
 }
 
-template <typename PositionRange, typename SchemaIndexFn>
+template <typename PositionRange>
 inline repeated_field_work_bundle make_repeated_field_work_bundle(
   PositionRange const& field_positions,
-  int num_fields,
-  SchemaIndexFn get_schema_index,
+  std::vector<int> const& schema_indices,
   field_occurrence_count const* repeated_info,
   int num_rows,
   protobuf_schema const& schema,
@@ -286,7 +285,7 @@ inline repeated_field_work_bundle make_repeated_field_work_bundle(
   rmm::device_async_resource_ref output_mr,
   rmm::device_async_resource_ref scratch_mr)
 {
-  CUDF_EXPECTS(num_fields >= 0, std::string{__func__} + ": field count must be non-negative");
+  auto const num_fields = static_cast<int>(schema_indices.size());
   repeated_field_work_bundle result{
     std::vector<std::optional<repeated_field_work>>(num_fields),
     cudf::detail::make_pinned_vector_async<field_occurrence_scan_desc>(0, stream)};
@@ -297,7 +296,7 @@ inline repeated_field_work_bundle make_repeated_field_work_bundle(
                  std::string{__func__} + ": field position is out of bounds");
     CUDF_EXPECTS(repeated_info != nullptr,
                  std::string{__func__} + ": repeated count buffer must be non-null");
-    auto const schema_idx = get_schema_index(field_position);
+    auto const schema_idx = schema_indices[field_position];
     auto counts_begin     = thrust::make_transform_iterator(
       thrust::make_counting_iterator<int>(0),
       extract_strided_count{repeated_info, field_position, num_fields});
