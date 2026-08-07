@@ -356,14 +356,7 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
           " must provide non-empty enumValidValues and enumNames");
     }
     if (validValues != null) {
-      for (int j = 1; j < validValues.length; j++) {
-        if (validValues[j] <= validValues[j - 1]) {
-          throw new IllegalArgumentException(
-              "enumValidValues[" + index + "] must be strictly sorted in ascending order " +
-              "(binary search requires unique values), but found " + validValues[j - 1] +
-              " followed by " + validValues[j]);
-        }
-      }
+      validateEnumValuesSorted(index, validValues);
       if (names != null && names.length != validValues.length) {
         throw new IllegalArgumentException(
             "enumNames[" + index + "].length (" + names.length + ") must equal " +
@@ -373,6 +366,17 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
       throw new IllegalArgumentException(
           "enumNames[" + index + "] is non-null but enumValidValues[" + index + "] is null; " +
           "both must be provided together for enum-as-string fields");
+    }
+  }
+
+  private static void validateEnumValuesSorted(int index, int[] validValues) {
+    for (int j = 1; j < validValues.length; j++) {
+      if (validValues[j] <= validValues[j - 1]) {
+        throw new IllegalArgumentException(
+            "enumValidValues[" + index + "] must be strictly sorted in ascending order " +
+            "(binary search requires unique values), but found " + validValues[j - 1] +
+            " followed by " + validValues[j]);
+      }
     }
   }
 
