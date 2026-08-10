@@ -104,11 +104,10 @@ __device__ bool scan_message_field_locations(message_scan_context context,
   auto const* msg_end  = context.end;
   auto* error_flag     = context.error;
   bool scan_succeeded  = true;
-  auto wt              = static_cast<proto_wire_type>(-1);
-  int field_number     = 0;
+  auto tag             = proto_tag{0, static_cast<proto_wire_type>(-1)};
   auto advance         = [&](uint8_t const* cur) {
     uint8_t const* next;
-    if (!skip_field(cur, msg_end, field_number, wt, context.max_group_depth, next)) {
+    if (!skip_field(cur, msg_end, tag, context.max_group_depth, next)) {
       set_error_once(error_flag, protobuf_error::SKIP);
       scan_succeeded = false;
       return msg_end;
@@ -116,25 +115,22 @@ __device__ bool scan_message_field_locations(message_scan_context context,
     return next;
   };
   for (uint8_t const* cur = msg_base; cur < msg_end; cur = advance(cur)) {
-    proto_tag tag;
     if (!decode_tag(cur, msg_end, tag, error_flag)) return false;
-    wt           = tag.wire_type;
-    field_number = tag.field_number;
 
     int const f = lookup_field(tag.field_number, fields);
     if (f < 0) continue;
 
     auto const& field = fields.data[f];
     if (field.is_repeated) {
-      if (!on_repeated(f, cur, wt)) { return false; }
+      if (!on_repeated(f, cur, tag.wire_type)) { return false; }
       continue;
     }
-    if (wt != field.expected_wire_type) continue;
+    if (tag.wire_type != field.expected_wire_type) continue;
 
     int const data_offset = static_cast<int>(cur - msg_base);
     field_location location;
-    if (wt == proto_wire_type::LEN) {
-      // Length-delimited: skip past the length prefix and record (data offset, data length).
+    if (tag.wire_type == proto_wire_type::LEN) {
+      // Length prefixes use raw-varint32 semantics and may consume up to ten bytes.
       uint32_t len;
       int len_bytes;
       if (!read_varint32(cur, msg_end, len, len_bytes)) {
@@ -154,7 +150,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
       location = {data_location, static_cast<int32_t>(len)};
     } else {
       // Fixed-width / varint: record the offset and the wire-type-derived size.
-      int field_size = get_wire_type_size(wt, cur, msg_end);
+      int field_size = get_wire_type_size(tag.wire_type, cur, msg_end);
       if (field_size < 0) {
         set_error_once(error_flag, protobuf_error::FIELD_SIZE);
         return false;
@@ -909,7 +905,7 @@ void set_error_once_async(protobuf_error* error_flag,
                           rmm::cuda_stream_view stream)
 {
   set_error_if_unset_kernel<<<1, 1, 0, stream.value()>>>(error_flag, error);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_all_fields(cudf::column_device_view const& d_in,
@@ -923,7 +919,7 @@ void launch_scan_all_fields(cudf::column_device_view const& d_in,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_all_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     d_in, fields, error_flag, row_has_invalid_data);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_count_repeated_fields(cudf::column_device_view const& d_in,
@@ -937,7 +933,7 @@ void launch_count_repeated_fields(cudf::column_device_view const& d_in,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   count_repeated_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     d_in, fields, error_flag, row_has_invalid_data);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
@@ -950,7 +946,7 @@ void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     d_in, fields, error_flag);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_singular_message_occurrences(cudf::column_device_view const& d_in,
@@ -963,7 +959,7 @@ void launch_scan_singular_message_occurrences(cudf::column_device_view const& d_
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     d_in, fields, error_flag);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_extract_strided_locations(field_location const* nested_locations,
@@ -977,7 +973,7 @@ void launch_extract_strided_locations(field_location const* nested_locations,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   extract_strided_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     nested_locations, field_idx, num_fields, parent_locs, num_rows);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_nested_message_fields(protobuf_input_view input,
@@ -994,7 +990,7 @@ void launch_scan_nested_message_fields(protobuf_input_view input,
     static_cast<int>((input.num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_nested_message_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     input, parent, fields, error_flag, row_has_invalid_data, max_group_depth);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
@@ -1010,7 +1006,7 @@ void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
     static_cast<int>((input.num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_all_field_occurrences_in_nested_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     input, parent, fields, error_flag, max_group_depth);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_validate_message_fragments(message_fragment_location_provider locations,
@@ -1034,7 +1030,7 @@ void launch_validate_message_fragments(message_fragment_location_provider locati
     row_has_invalid_data,
     error_flag,
     max_group_depth);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_compute_grandchild_parent_locations(nested_location_provider loc_provider,
@@ -1047,7 +1043,7 @@ void launch_compute_grandchild_parent_locations(nested_location_provider loc_pro
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   compute_grandchild_parent_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     loc_provider, gc_parent_locs, num_rows, error_flag);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_compute_virtual_parents_for_nested_repeated(protobuf_input_view input,
@@ -1071,7 +1067,7 @@ void launch_compute_virtual_parents_for_nested_repeated(protobuf_input_view inpu
                                                                          virtual_parent_locs,
                                                                          work.total_count,
                                                                          decode_ctx.error->data());
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_compute_msg_locations_from_occurrences(protobuf_input_view input,
@@ -1092,7 +1088,7 @@ void launch_compute_msg_locations_from_occurrences(protobuf_input_view input,
     msg_row_offsets,
     work.total_count,
     decode_ctx.error->data());
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_validate_enum_values(enum_value_device_view input,
@@ -1102,7 +1098,7 @@ void launch_validate_enum_values(enum_value_device_view input,
   if (input.size == 0) return;
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   validate_enum_values_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(input, domain);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_compute_enum_string_lengths(enum_value_device_view input,
@@ -1114,7 +1110,7 @@ void launch_compute_enum_string_lengths(enum_value_device_view input,
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   compute_enum_string_lengths_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     input, lookup, lengths);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_copy_enum_string_chars(enum_value_device_view input,
@@ -1127,7 +1123,7 @@ void launch_copy_enum_string_chars(enum_value_device_view input,
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   copy_enum_string_chars_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     input, lookup, output_offsets, out_chars);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void maybe_check_required_fields(required_field_input_view input,
@@ -1163,7 +1159,7 @@ void maybe_check_required_fields(required_field_input_view input,
     static_cast<int>(field_indices.size()),
     row_force_null,
     decode_ctx.error->data());
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void validate_enum_values(rmm::device_uvector<int32_t> const& values,

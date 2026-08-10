@@ -18,6 +18,7 @@
 
 #include "protobuf/protobuf_types.cuh"
 
+#include <cudf/strings/detail/utf8.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -34,6 +35,11 @@ namespace spark_rapids_jni::protobuf::detail {
 // ============================================================================
 // Device helper functions
 // ============================================================================
+
+struct proto_tag {
+  int field_number;
+  proto_wire_type wire_type;
+};
 
 __device__ inline bool read_varint64(uint8_t const* cur,
                                      uint8_t const* end,
@@ -66,6 +72,7 @@ __device__ inline bool read_varint32(uint8_t const* cur,
                                      uint32_t& out,
                                      int& bytes)
 {
+  // protobuf-java's raw-varint32 path consumes up to ten bytes and keeps the low 32 bits.
   out   = 0;
   bytes = 0;
   while (cur < end && bytes < MAX_VARINT_BYTES) {
@@ -178,20 +185,19 @@ static __device__ __noinline__ bool skip_group(uint8_t const* cur,
 
 __device__ inline bool skip_field(uint8_t const* cur,
                                   uint8_t const* end,
-                                  int field_number,
-                                  proto_wire_type wt,
+                                  proto_tag tag,
                                   int max_group_depth,
                                   uint8_t const*& out_cur)
 {
   // A bare end-group is only valid while a start-group payload is being parsed by skip_group.
   // The scan/count kernels should never accept it as a standalone field because Spark CPU treats
   // unmatched end-groups as malformed protobuf.
-  if (wt == proto_wire_type::EGROUP) { return false; }
-  if (wt == proto_wire_type::SGROUP) {
-    return skip_group(cur, end, field_number, max_group_depth, out_cur);
+  if (tag.wire_type == proto_wire_type::EGROUP) { return false; }
+  if (tag.wire_type == proto_wire_type::SGROUP) {
+    return skip_group(cur, end, tag.field_number, max_group_depth, out_cur);
   }
 
-  int size = get_wire_type_size(wt, cur, end);
+  int size = get_wire_type_size(tag.wire_type, cur, end);
   if (size < 0) return false;
   // Ensure we don't skip past the end of the buffer
   if (cur + size > end) return false;
@@ -255,8 +261,6 @@ struct utf8_sequence {
   bool valid;
 };
 
-__device__ inline bool is_utf8_continuation(uint8_t byte) { return (byte & 0xC0u) == 0x80u; }
-
 __device__ inline utf8_sequence inspect_utf8_sequence(uint8_t const* cur, uint8_t const* end)
 {
   auto const b0 = *cur;
@@ -264,20 +268,25 @@ __device__ inline utf8_sequence inspect_utf8_sequence(uint8_t const* cur, uint8_
   if (b0 < 0xC2u || b0 > 0xF4u) return {1, false};
 
   if (b0 <= 0xDFu) {
-    return cur + 1 < end && is_utf8_continuation(cur[1]) ? utf8_sequence{2, true}
-                                                         : utf8_sequence{1, false};
+    return cur + 1 < end && cudf::strings::detail::is_utf8_continuation_char(cur[1])
+             ? utf8_sequence{2, true}
+             : utf8_sequence{1, false};
   }
 
   if (cur + 1 >= end) return {1, false};
   auto const b1           = cur[1];
-  bool const valid_second = is_utf8_continuation(b1) && (b0 != 0xE0u || b1 >= 0xA0u) &&
-                            (b0 != 0xEDu || b1 < 0xA0u) && (b0 != 0xF0u || b1 >= 0x90u) &&
-                            (b0 != 0xF4u || b1 < 0x90u);
+  bool const valid_second = cudf::strings::detail::is_utf8_continuation_char(b1) &&
+                            (b0 != 0xE0u || b1 >= 0xA0u) && (b0 != 0xEDu || b1 < 0xA0u) &&
+                            (b0 != 0xF0u || b1 >= 0x90u) && (b0 != 0xF4u || b1 < 0x90u);
   if (!valid_second) return {1, false};
 
-  if (cur + 2 >= end || !is_utf8_continuation(cur[2])) return {2, false};
+  if (cur + 2 >= end || !cudf::strings::detail::is_utf8_continuation_char(cur[2])) {
+    return {2, false};
+  }
   if (b0 <= 0xEFu) return {3, true};
-  if (cur + 3 >= end || !is_utf8_continuation(cur[3])) return {3, false};
+  if (cur + 3 >= end || !cudf::strings::detail::is_utf8_continuation_char(cur[3])) {
+    return {3, false};
+  }
   return {4, true};
 }
 
@@ -327,11 +336,6 @@ __device__ inline bool check_message_bounds(T start,
   }
   return true;
 }
-
-struct proto_tag {
-  int field_number;
-  proto_wire_type wire_type;
-};
 
 __device__ inline bool decode_tag(uint8_t const*& cur,
                                   uint8_t const* end,

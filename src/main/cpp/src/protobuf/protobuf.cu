@@ -367,7 +367,8 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
 
   auto d_error = cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(
     1, stream, cudf::get_current_device_resource_ref());
-  // PERMISSIVE-mode row nulling support.
+  // Only malformed input forces a PERMISSIVE row null; unknown enum occurrences are filtered
+  // without invalidating the containing row.
   bool const track_permissive_null_rows = !fail_on_errors;
   rmm::device_uvector<bool> d_row_force_null(
     track_permissive_null_rows ? num_rows : 0, stream, cudf::get_current_device_resource_ref());
@@ -375,7 +376,8 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     CUDF_CUDA_TRY(
       cudaMemsetAsync(d_row_force_null.data(), 0, num_rows * sizeof(bool), stream.value()));
   }
-  auto const decode_ctx = protobuf_decode_runtime_context{&d_row_force_null, &d_error};
+  auto const decode_ctx        = protobuf_decode_runtime_context{&d_row_force_null, &d_error};
+  auto const recursive_context = recursive_decode_context{schema_context, decode_ctx};
 
   auto const threads = THREADS_PER_BLOCK;
 
@@ -410,24 +412,27 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     auto d_field_lookup =
       cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
 
+    auto const descriptor_lookup =
+      lookup_view<field_descriptor>{field_descs.device.data(),
+                                    static_cast<int>(field_descs.host.size()),
+                                    h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
+                                    static_cast<int>(h_field_lookup.size())};
+    auto const fields = field_scan_view{d_nested_locations.data(),
+                                        num_nested,
+                                        d_repeated_info.data(),
+                                        num_repeated,
+                                        d_nested_occurrence_info.data(),
+                                        num_nested,
+                                        d_multiple_nested_fields.data(),
+                                        descriptor_lookup};
     launch_count_repeated_fields(*d_in,
-                                 {d_nested_locations.data(),
-                                  num_nested,
-                                  d_repeated_info.data(),
-                                  num_repeated,
-                                  d_nested_occurrence_info.data(),
-                                  num_nested,
-                                  d_multiple_nested_fields.data(),
-                                  {field_descs.device.data(),
-                                   static_cast<int>(field_descs.host.size()),
-                                   h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
-                                   static_cast<int>(h_field_lookup.size())}},
+                                 fields,
                                  d_error.data(),
                                  track_permissive_null_rows ? d_row_force_null.data() : nullptr,
                                  stream);
   }
 
-  std::vector<std::optional<singular_message_merge_work>> nested_merge_work(num_nested);
+  std::vector<std::optional<singular_message_merge_buffers>> nested_merge_buffers(num_nested);
   if (num_nested > 0) {
     auto h_multiple_nested_fields = cudf::detail::make_pinned_vector_async<int>(num_nested, stream);
     CUDF_CUDA_TRY(cudf::detail::memcpy_async(h_multiple_nested_fields.data(),
@@ -450,7 +455,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                                         scratch_mr,
                                                         scratch_mr);
     for (auto const ni : merge_positions) {
-      nested_merge_work[ni].emplace(std::move(*merge_bundle.fields[ni]));
+      nested_merge_buffers[ni].emplace(std::move(*merge_bundle.fields[ni]));
     }
     launch_occurrence_scan_batches(
       merge_bundle.scan_descriptors, stream, scratch_mr, [&](field_occurrence_scan_view fields) {
@@ -475,18 +480,15 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     auto d_field_lookup =
       cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
 
+    auto const descriptor_lookup =
+      lookup_view<field_descriptor>{d_field_descs.data(),
+                                    num_scalar,
+                                    h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
+                                    static_cast<int>(h_field_lookup.size())};
+    auto const fields = field_scan_view{
+      d_locations.data(), num_scalar, nullptr, 0, nullptr, 0, nullptr, descriptor_lookup};
     launch_scan_all_fields(*d_in,
-                           {d_locations.data(),
-                            num_scalar,
-                            nullptr,
-                            0,
-                            nullptr,
-                            0,
-                            nullptr,
-                            {d_field_descs.data(),
-                             num_scalar,
-                             h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
-                             static_cast<int>(h_field_lookup.size())}},
+                           fields,
                            d_error.data(),
                            track_permissive_null_rows ? d_row_force_null.data() : nullptr,
                            stream);
@@ -560,7 +562,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
             input, d_locations.data(), num_scalar, d_descs.data(), nf, d_error.data()};
           extract_scalar_batched_kernel<T, DecodeFn>
             <<<grid, threads, 0, stream.value()>>>(batch_input);
-          CUDF_CUDA_TRY(cudaPeekAtLastError());
+          CUDF_CHECK_CUDA(stream.value());
         }
 
         for (int j = 0; j < nf; j++) {
@@ -589,11 +591,9 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
         int schema_idx = scalar_field_indices[i];
         top_level_location_provider loc_provider{
           list_offsets, base_offset, d_locations.data(), i, num_scalar};
-        column_map[schema_idx] = extract_typed_column(
-          {{schema_context, decode_ctx}, message_data, schema_idx, {num_rows, nullptr}},
-          loc_provider,
-          stream,
-          mr);
+        auto const request =
+          protobuf_field_decode_request{recursive_context, message_data, schema_idx, num_rows};
+        column_map[schema_idx] = extract_typed_column(request, loc_provider, stream, mr);
       }
     }
 
@@ -611,12 +611,10 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
         [locs = d_locations.data(), i, num_scalar, has_default] __device__(cudf::size_type row) {
           return locs[flat_index(row, num_scalar, i)].offset >= 0 || has_default;
         };
-      column_map[schema_idx] = build_protobuf_field_values_column_shared(
-        {{schema_context, decode_ctx}, message_data, schema_idx, {num_rows, nullptr}},
-        loc_provider,
-        valid_fn,
-        stream,
-        mr);
+      auto const request =
+        protobuf_field_decode_request{recursive_context, message_data, schema_idx, num_rows};
+      column_map[schema_idx] =
+        build_protobuf_field_values_column_shared(request, loc_provider, valid_fn, stream, mr);
     }
   }
 
@@ -637,11 +635,12 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     std::vector<int> repeated_work_positions;
     repeated_work_positions.reserve(num_repeated);
     for (int ri = 0; ri < num_repeated; ++ri) {
-      auto const schema_idx = repeated_field_indices[ri];
-      if (schema_context.is_output(schema_idx) ||
-          schema[schema_idx].output_type == cudf::type_id::STRUCT) {
-        repeated_work_positions.push_back(ri);
-      }
+      auto const schema_idx          = repeated_field_indices[ri];
+      auto const materializes_output = schema_context.is_output(schema_idx);
+      auto const validates_children  = schema[schema_idx].output_type == cudf::type_id::STRUCT;
+      // Hidden scalars were already validated by the count pass. Hidden messages still recurse so
+      // missing required descendants can invalidate their top-level row.
+      if (materializes_output || validates_children) { repeated_work_positions.push_back(ri); }
     }
     auto rep_work = make_repeated_field_work_bundle(repeated_work_positions,
                                                     repeated_field_indices,
@@ -739,7 +738,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
           auto repeated_struct            = build_repeated_struct_column(binary_input,
                                                               input,
                                                               child_field_indices,
-                                                                         {schema_context, decode_ctx},
+                                                              recursive_context,
                                                               std::move(w),
                                                               is_output,
                                                               stream,
@@ -763,12 +762,12 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
 
     // Hidden nested messages still need row-force-null tracking for required-field failures.
     std::unique_ptr<cudf::column> nested_col;
-    if (nested_merge_work[ni].has_value()) {
+    if (nested_merge_buffers[ni].has_value()) {
       nested_col = build_merged_singular_struct_column(input,
                                                        {nullptr, nullptr},
                                                        child_field_indices,
-                                                       {schema_context, decode_ctx},
-                                                       std::move(*nested_merge_work[ni]),
+                                                       recursive_context,
+                                                       std::move(*nested_merge_buffers[ni]),
                                                        0,
                                                        is_output,
                                                        stream,
@@ -780,7 +779,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
       nested_col = build_nested_struct_column(input,
                                               {d_parent_locs.data(), d_parent_locs.size(), nullptr},
                                               child_field_indices,
-                                              {schema_context, decode_ctx},
+                                              recursive_context,
                                               0,
                                               is_output,
                                               stream,
@@ -801,7 +800,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
 
   {
     using enum protobuf_error;
-    CUDF_CUDA_TRY(cudaPeekAtLastError());
+    CUDF_CHECK_CUDA(stream.value());
     protobuf_error h_error = NONE;
     CUDF_CUDA_TRY(
       cudf::detail::memcpy_async(&h_error, d_error.data(), sizeof(protobuf_error), stream));

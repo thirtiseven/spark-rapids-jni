@@ -100,8 +100,7 @@ std::unique_ptr<cudf::column> build_enum_string_column_with_lookup(
   rmm::device_uvector<int32_t>& enum_values,
   rmm::device_uvector<bool>& valid,
   enum_string_lookup_tables const& lookup,
-  protobuf_decode_runtime_context runtime,
-  protobuf_value_domain_view values,
+  int num_values,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 
@@ -409,13 +408,12 @@ std::unique_ptr<cudf::column> build_enum_string_column_with_lookup(
   rmm::device_uvector<int32_t>& enum_values,
   rmm::device_uvector<bool>& valid,
   enum_string_lookup_tables const& lookup,
-  protobuf_decode_runtime_context runtime,
-  protobuf_value_domain_view values,
+  int num_values,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
   validate_enum_values(enum_values, valid, lookup.view().domain, stream);
-  return build_enum_string_values_column(enum_values, valid, lookup, values.size, stream, mr);
+  return build_enum_string_values_column(enum_values, valid, lookup, num_values, stream, mr);
 }
 
 }  // namespace
@@ -428,7 +426,7 @@ std::unique_ptr<cudf::column> build_enum_string_column(rmm::device_uvector<int32
 {
   auto const lookup = request.context.schema.enum_lookup(request.schema_idx, stream);
   return build_enum_string_column_with_lookup(
-    enum_values, valid, lookup, request.context.runtime, request.values, stream, mr);
+    enum_values, valid, lookup, request.num_values, stream, mr);
 }
 
 std::unique_ptr<cudf::column> build_repeated_enum_string_column(
@@ -459,17 +457,16 @@ std::unique_ptr<cudf::column> build_repeated_enum_string_column(
     {enum_ints.data(), elem_valid.data(), decode_ctx.error->data()},
     stream);
 
-  auto child_col = build_enum_string_column(
-    enum_ints,
-    elem_valid,
-    {{schema, decode_ctx}, input.message_data, work.schema_idx, {total_count, nullptr}},
-    stream,
-    mr);
+  auto const context = recursive_decode_context{schema, decode_ctx};
+  auto const request =
+    protobuf_field_decode_request{context, input.message_data, work.schema_idx, total_count};
+  auto child_col = build_enum_string_column(enum_ints, elem_valid, request, stream, mr);
 
   auto list_offs_col = make_offsets_column(input.num_rows, std::move(work.offsets));
 
   auto result = make_list_column_with_input_nulls(
     input.num_rows, std::move(list_offs_col), std::move(child_col), binary_input, stream, mr);
+  // Proto2 repeated enums omit unrecognized values without invalidating sibling fields.
   return drop_unknown_repeated_enum_values(std::move(result), stream, mr);
 }
 
@@ -491,6 +488,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(cudf::column_view con
   auto const threads = THREADS_PER_BLOCK;
   auto const blocks  = static_cast<int>((total_count + threads - 1u) / threads);
   repeated_location_provider loc_provider{input.row_offsets, input.base_offset, occurrences.data()};
+  // STRING must size repaired UTF-8; BYTES can reuse the encoded payload length.
   if (is_bytes) {
     extract_lengths_kernel<repeated_location_provider>
       <<<blocks, threads, 0, stream.value()>>>(loc_provider, total_count, str_lengths.data());
@@ -498,7 +496,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(cudf::column_view con
     extract_utf8_lengths_kernel<repeated_location_provider><<<blocks, threads, 0, stream.value()>>>(
       input.message_data, loc_provider, total_count, str_lengths.data(), nullptr);
   }
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 
   auto [str_offsets_col, total_chars] = cudf::strings::detail::make_offsets_child_column(
     str_lengths.begin(), str_lengths.end(), stream, mr);
@@ -514,7 +512,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(cudf::column_view con
     if (!is_bytes) {
       copy_repaired_utf8_kernel<repeated_location_provider><<<blocks, threads, 0, stream.value()>>>(
         input.message_data, copy_provider, total_count, offsets_data, chars_ptr);
-      CUDF_CUDA_TRY(cudaPeekAtLastError());
+      CUDF_CHECK_CUDA(stream.value());
     } else {
       auto src_iter = cudf::detail::make_counting_transform_iterator(
         0,
@@ -581,16 +579,16 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
   message_fragment_source_view source,
   std::vector<int> const& child_field_indices,
   recursive_decode_context context,
-  singular_message_merge_work work,
+  singular_message_merge_buffers buffers,
   int depth,
   bool materialize_output,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(work.total_fragments > 1, "duplicate merge requires multiple fragments");
-  CUDF_EXPECTS(work.row_offsets.size() == static_cast<size_t>(input.num_rows) + 1,
+  CUDF_EXPECTS(buffers.total_fragments > 1, "duplicate merge requires multiple fragments");
+  CUDF_EXPECTS(buffers.row_offsets.size() == static_cast<size_t>(input.num_rows) + 1,
                "fragment offsets size must match row count");
-  CUDF_EXPECTS(work.fragments.size() == static_cast<size_t>(work.total_fragments),
+  CUDF_EXPECTS(buffers.fragments.size() == static_cast<size_t>(buffers.total_fragments),
                "fragment count mismatch");
   auto const scratch_mr = cudf::get_current_device_resource_ref();
 
@@ -602,14 +600,14 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
 
   auto invalid_rows =
     cudf::detail::make_zeroed_device_uvector_async<bool>(input.num_rows, stream, scratch_mr);
-  message_fragment_location_provider fragment_locations{input, source, work.fragments.data()};
+  message_fragment_location_provider fragment_locations{input, source, buffers.fragments.data()};
   launch_validate_message_fragments(
     fragment_locations,
     {{validation_fields.device.data(),
       static_cast<int>(validation_fields.device.size()),
       d_field_lookup.is_empty() ? nullptr : d_field_lookup.data(),
       static_cast<int>(d_field_lookup.size())}},
-    work.total_fragments,
+    buffers.total_fragments,
     invalid_rows.data(),
     context.runtime.row_force_null->is_empty() ? nullptr : context.runtime.row_force_null->data(),
     context.runtime.error->data(),
@@ -617,10 +615,10 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
     stream);
 
   auto fragment_lengths = thrust::make_transform_iterator(
-    work.fragments.begin(),
+    buffers.fragments.begin(),
     [] __device__(field_occurrence const& fragment) -> int32_t { return fragment.length; });
   auto fragment_byte_offsets = make_list_offsets_from_counts(fragment_lengths,
-                                                             work.total_fragments,
+                                                             buffers.total_fragments,
                                                              "Merged singular message",
                                                              stream,
                                                              scratch_mr,
@@ -632,7 +630,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
                     thrust::make_counting_iterator<int>(0),
                     thrust::make_counting_iterator<int>(input.num_rows + 1),
                     merged_row_offsets.begin(),
-                    [row_fragment_offsets = work.row_offsets.data(),
+                    [row_fragment_offsets = buffers.row_offsets.data(),
                      fragment_offsets = fragment_byte_offsets.offsets.data()] __device__(int row) {
                       return fragment_offsets[row_fragment_offsets[row]];
                     });
@@ -640,7 +638,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
   rmm::device_uvector<uint8_t> merged_data(std::max<int32_t>(total_bytes, 1), stream, scratch_mr);
   if (total_bytes > 0) {
     auto const* invalid          = invalid_rows.data();
-    auto const* fragments        = work.fragments.data();
+    auto const* fragments        = buffers.fragments.data();
     auto const* fragment_offsets = fragment_byte_offsets.offsets.data();
     auto* output                 = merged_data.data();
 
@@ -671,7 +669,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
                                              src_iter,
                                              dst_iter,
                                              size_iter,
-                                             work.total_fragments,
+                                             buffers.total_fragments,
                                              stream.value()));
     rmm::device_buffer temp_storage(temp_storage_bytes, stream, scratch_mr);
     CUDF_CUDA_TRY(cub::DeviceMemcpy::Batched(temp_storage.data(),
@@ -679,7 +677,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
                                              src_iter,
                                              dst_iter,
                                              size_iter,
-                                             work.total_fragments,
+                                             buffers.total_fragments,
                                              stream.value()));
   }
 
@@ -689,7 +687,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
     thrust::make_counting_iterator<int>(0),
     thrust::make_counting_iterator<int>(input.num_rows),
     merged_parent_locations.begin(),
-    [row_fragment_offsets = work.row_offsets.data(),
+    [row_fragment_offsets = buffers.row_offsets.data(),
      row_byte_offsets     = merged_row_offsets.data(),
      invalid              = invalid_rows.data()] __device__(int row) {
       if (invalid[row] || row_fragment_offsets[row] == row_fragment_offsets[row + 1]) {
@@ -809,7 +807,8 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
                               decode_ctx,
                               stream);
 
-  std::vector<std::optional<singular_message_merge_work>> message_merge_work(num_child_fields);
+  std::vector<std::optional<singular_message_merge_buffers>> message_merge_buffers(
+    num_child_fields);
   if (!singular_message_positions.empty()) {
     auto h_multiple_message_fields =
       cudf::detail::make_pinned_vector_async<int>(num_child_fields, stream);
@@ -833,7 +832,7 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
                                                         scratch_mr,
                                                         scratch_mr);
     for (auto const ci : merge_positions) {
-      message_merge_work[ci].emplace(std::move(*merge_bundle.fields[ci]));
+      message_merge_buffers[ci].emplace(std::move(*merge_bundle.fields[ci]));
     }
     launch_occurrence_scan_batches(
       merge_bundle.scan_descriptors, stream, scratch_mr, [&](field_occurrence_scan_view fields) {
@@ -880,12 +879,12 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
 
     if (dt.id() == cudf::type_id::STRUCT) {
       auto const& gc_indices = schema_context.children(child_schema_idx);
-      if (message_merge_work[ci].has_value()) {
+      if (message_merge_buffers[ci].has_value()) {
         auto child = build_merged_singular_struct_column(input,
                                                          {parent.locations, parent.top_row_indices},
                                                          gc_indices,
                                                          context,
-                                                         std::move(*message_merge_work[ci]),
+                                                         std::move(*message_merge_buffers[ci]),
                                                          depth + 1,
                                                          materialize_output,
                                                          stream,
@@ -928,14 +927,10 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
     auto valid_fn = [loc_provider, has_def] __device__(cudf::size_type row) {
       return has_def || loc_provider.valid(row);
     };
-    auto child = build_protobuf_field_values_column({{schema_context, decode_ctx},
-                                                     input.message_data,
-                                                     child_schema_idx,
-                                                     {input.num_rows, nullptr}},
-                                                    loc_provider,
-                                                    valid_fn,
-                                                    stream,
-                                                    materialize_output ? mr : scratch_mr);
+    auto const request =
+      protobuf_field_decode_request{context, input.message_data, child_schema_idx, input.num_rows};
+    auto child = build_protobuf_field_values_column(
+      request, loc_provider, valid_fn, stream, materialize_output ? mr : scratch_mr);
     if (materialize_output) { struct_children.push_back(std::move(child)); }
   }
 
@@ -1037,12 +1032,10 @@ std::unique_ptr<cudf::column> build_repeated_child_list_column(protobuf_input_vi
     nested_repeated_location_provider loc_provider{
       input.row_offsets, input.base_offset, parent.locations, d_occurrences.data()};
     auto valid_fn = [] __device__(cudf::size_type) { return true; };
-    child_values  = build_protobuf_field_values_column(
-      {{schema_context, decode_ctx}, input.message_data, child_schema_idx, {total_count, nullptr}},
-      loc_provider,
-      valid_fn,
-      stream,
-      materialize_output ? mr : scratch_mr);
+    auto const request =
+      protobuf_field_decode_request{context, input.message_data, child_schema_idx, total_count};
+    child_values = build_protobuf_field_values_column(
+      request, loc_provider, valid_fn, stream, materialize_output ? mr : scratch_mr);
   }
 
   if (!materialize_output) { return nullptr; }

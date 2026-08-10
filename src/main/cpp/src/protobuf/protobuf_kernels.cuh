@@ -563,7 +563,7 @@ inline void extract_scalar_into_buffers(uint8_t const* message_data,
   dispatch_scalar_decoder<T>(get_scalar_decode_kind<T>(encoding), [&]<auto DecodeFn>() {
     extract_scalar_kernel<T, DecodeFn><<<blocks, threads, 0, stream.value()>>>(
       message_data, loc_provider, num_rows, output, options);
-    CUDF_CUDA_TRY(cudaPeekAtLastError());
+    CUDF_CHECK_CUDA(stream.value());
   });
 }
 
@@ -586,14 +586,15 @@ std::unique_ptr<cudf::column> extract_and_build_scalar_field_column(
   protobuf_field_meta_view field,
   uint8_t const* message_data,
   LocationProvider const& loc_provider,
-  protobuf_value_domain_view value_domain,
+  int num_values,
   protobuf_decode_runtime_context decode_ctx,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  auto const num_rows = value_domain.size;
+  auto const num_rows = num_values;
   if (num_rows == 0) { return cudf::make_empty_column(field.output_type); }
   rmm::device_uvector<T> out(num_rows, stream, mr);
+  // Validity is temporary extraction state; only output data and its null mask use the caller MR.
   auto const scratch_mr = cudf::get_current_device_resource_ref();
   rmm::device_uvector<bool> valid(num_rows, stream, scratch_mr);
   extract_scalar_into_buffers<T, LocationProvider>(
@@ -652,7 +653,7 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
                                                  has_default ? d_default.data() : nullptr,
                                                  def_len);
     }
-    CUDF_CUDA_TRY(cudaPeekAtLastError());
+    CUDF_CHECK_CUDA(stream.value());
   }
 
   auto [offsets_col, total_size] =
@@ -673,7 +674,7 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
                                                  chars_ptr,
                                                  has_default ? default_ptr : nullptr,
                                                  def_len);
-      CUDF_CUDA_TRY(cudaPeekAtLastError());
+      CUDF_CHECK_CUDA(stream.value());
     } else {
       auto src_iter = cudf::detail::make_counting_transform_iterator(
         0,
@@ -756,31 +757,31 @@ inline std::unique_ptr<cudf::column> extract_typed_column(protobuf_field_decode_
   auto const field        = request.context.schema.field(request.schema_idx);
   auto const message_data = request.message_data;
   auto const decode_ctx   = request.context.runtime;
-  auto const num_items    = request.values.size;
+  auto const num_items    = request.num_values;
   auto const dt           = field.output_type;
 
   switch (dt.id()) {
     case cudf::type_id::BOOL8:
       return extract_and_build_scalar_field_column<uint8_t>(
-        field, message_data, loc_provider, request.values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
     case cudf::type_id::INT32:
       return extract_and_build_scalar_field_column<int32_t>(
-        field, message_data, loc_provider, request.values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
     case cudf::type_id::UINT32:
       return extract_and_build_scalar_field_column<uint32_t>(
-        field, message_data, loc_provider, request.values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
     case cudf::type_id::INT64:
       return extract_and_build_scalar_field_column<int64_t>(
-        field, message_data, loc_provider, request.values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
     case cudf::type_id::UINT64:
       return extract_and_build_scalar_field_column<uint64_t>(
-        field, message_data, loc_provider, request.values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
     case cudf::type_id::FLOAT32:
       return extract_and_build_scalar_field_column<float>(
-        field, message_data, loc_provider, request.values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
     case cudf::type_id::FLOAT64:
       return extract_and_build_scalar_field_column<double>(
-        field, message_data, loc_provider, request.values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
     default:
       // Preserve protobuf-java-compatible null output when invalid input reaches this fallback.
       return make_null_column(dt, num_items, stream, mr);
@@ -798,7 +799,7 @@ inline std::unique_ptr<cudf::column> build_protobuf_field_values_column_shared(
   auto const message_data = request.message_data;
   auto const field        = request.context.schema.field(request.schema_idx);
   auto const decode_ctx   = request.context.runtime;
-  auto const num_values   = request.values.size;
+  auto const num_values   = request.num_values;
   CUDF_EXPECTS(num_values > 0, std::string{__func__} + ": value count must be positive");
   auto const value_type  = field.output_type;
   auto const has_default = field.schema.has_default_value;
@@ -860,11 +861,10 @@ inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
   std::unique_ptr<cudf::column> child_col;
   if constexpr (std::is_same_v<T, int32_t>) {
     if (!field.enum_valid_values.empty()) {
-      child_col = extract_typed_column(
-        {{schema, decode_ctx}, input.message_data, work.schema_idx, {total_count, nullptr}},
-        loc_provider,
-        stream,
-        mr);
+      auto const context = recursive_decode_context{schema, decode_ctx};
+      auto const request =
+        protobuf_field_decode_request{context, input.message_data, work.schema_idx, total_count};
+      child_col = extract_typed_column(request, loc_provider, stream, mr);
     }
   }
 

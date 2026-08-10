@@ -40,7 +40,8 @@ constexpr int FIELD_LOOKUP_TABLE_MAX = 4096;
 // Maximum number of repeated fields in one message the combined occurrence-scan kernel can process
 // in a single launch. The kernel keeps a per-thread `int write_idx[MAX_REPEATED_FIELDS_PER_KERNEL]`
 // array on the stack; raising the limit pushes the array into local memory, which would otherwise
-// cost 4x the per-thread footprint and pressure occupancy. Host launchers chunk larger schemas.
+// cost 4x the per-thread footprint and pressure occupancy. Host launchers chunk larger schemas,
+// so this is a native launch detail rather than a Java/schema limit.
 constexpr int MAX_REPEATED_FIELDS_PER_KERNEL = 32;
 
 enum class protobuf_error : int {

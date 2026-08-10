@@ -132,7 +132,7 @@ struct protobuf_field_decode_request {
   recursive_decode_context context;
   uint8_t const* message_data;
   int schema_idx;
-  protobuf_value_domain_view values;
+  int num_values;
 };
 
 struct list_offsets_from_counts_result {
@@ -175,16 +175,17 @@ struct extract_strided_count {
   }
 };
 
-struct singular_message_merge_work {
+// Buffers that gather duplicate singular-message fragments by row before recursive decoding.
+struct singular_message_merge_buffers {
   int schema_idx;
   int32_t total_fragments;
   rmm::device_uvector<int32_t> row_offsets;
   rmm::device_uvector<field_occurrence> fragments;
 
-  singular_message_merge_work(int schema_index,
-                              list_offsets_from_counts_result offsets_result,
-                              rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr)
+  singular_message_merge_buffers(int schema_index,
+                                 list_offsets_from_counts_result offsets_result,
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
     : schema_idx(schema_index),
       total_fragments(offsets_result.total_count),
       row_offsets(std::move(offsets_result.offsets)),
@@ -192,7 +193,7 @@ struct singular_message_merge_work {
   {
   }
 
-  explicit singular_message_merge_work(repeated_field_work&& work)
+  explicit singular_message_merge_buffers(repeated_field_work&& work)
     : schema_idx(work.schema_idx),
       total_fragments(work.total_count),
       row_offsets(std::move(work.offsets)),
@@ -626,7 +627,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
   message_fragment_source_view source,
   std::vector<int> const& child_field_indices,
   recursive_decode_context context,
-  singular_message_merge_work work,
+  singular_message_merge_buffers buffers,
   int depth,
   bool materialize_output,
   rmm::cuda_stream_view stream,
