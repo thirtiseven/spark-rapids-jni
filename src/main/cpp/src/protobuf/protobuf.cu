@@ -791,12 +791,14 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
 
     // Phase C: Build columns per field.
     for (int ri = 0; ri < num_repeated; ri++) {
-      auto& w             = rep_work.fields[ri].value();
-      int schema_idx      = w.schema_idx;
-      auto element_type   = cudf::data_type{schema[schema_idx].output_type};
-      int32_t total_count = w.total_count;
+      auto& w              = rep_work.fields[ri].value();
+      int schema_idx       = w.schema_idx;
+      auto element_type    = cudf::data_type{schema[schema_idx].output_type};
+      int32_t total_count  = w.total_count;
+      auto const is_output = schema_context.is_output(schema_idx);
 
       if (total_count <= 0) {
+        if (!is_output) { continue; }
         // All rows empty: w.offsets is already a zero-filled buffer from Phase A.
         auto offsets_col = make_offsets_column(num_rows, std::move(w.offsets));
 
@@ -864,13 +866,15 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
           break;
         case cudf::type_id::STRUCT: {
           auto const& child_field_indices = schema_context.children(schema_idx);
-          column_map[schema_idx]          = build_repeated_struct_column(binary_input,
-                                                                input,
-                                                                child_field_indices,
+          auto repeated_struct            = build_repeated_struct_column(binary_input,
+                                                              input,
+                                                              child_field_indices,
                                                                          {schema_context, decode_ctx},
-                                                                std::move(w),
-                                                                stream,
-                                                                mr);
+                                                              std::move(w),
+                                                              is_output,
+                                                              stream,
+                                                              mr);
+          if (is_output) { column_map[schema_idx] = std::move(repeated_struct); }
           break;
         }
         default:
@@ -885,6 +889,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   for (int ni = 0; ni < num_nested; ni++) {
     int parent_schema_idx           = nested_field_indices[ni];
     auto const& child_field_indices = schema_context.children(parent_schema_idx);
+    bool const is_output            = schema_context.is_output(parent_schema_idx);
 
     // Keep row-force-null tracking for nested required-field failures, but do not let invalid
     // nested enum values null the top-level row.
@@ -896,6 +901,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                                        {schema_context, decode_ctx},
                                                        std::move(*nested_merge_work[ni]),
                                                        0,
+                                                       is_output,
                                                        stream,
                                                        mr);
     } else {
@@ -907,11 +913,14 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                               child_field_indices,
                                               {schema_context, decode_ctx},
                                               0,
+                                              is_output,
                                               stream,
                                               mr);
     }
-    propagate_nulls_to_descendants(*nested_col, stream, mr);
-    column_map[parent_schema_idx] = std::move(nested_col);
+    if (is_output) {
+      propagate_nulls_to_descendants(*nested_col, stream, mr);
+      column_map[parent_schema_idx] = std::move(nested_col);
+    }
   }
 
   // Assemble top_level_children in schema order (not processing order). Hidden fields are

@@ -302,8 +302,12 @@ inline repeated_field_work_bundle make_repeated_field_work_bundle(
       extract_strided_count{repeated_info, field_position, num_fields});
     auto& work = result.fields[field_position].emplace(
       schema_idx,
-      make_list_offsets_from_counts(
-        counts_begin, num_rows, count_context, stream, output_mr, scratch_mr),
+      make_list_offsets_from_counts(counts_begin,
+                                    num_rows,
+                                    count_context,
+                                    stream,
+                                    schema.is_output(schema_idx) ? output_mr : scratch_mr,
+                                    scratch_mr),
       schema[schema_idx].depth);
 
     if (work.total_count > 0) {
@@ -550,6 +554,7 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
   std::vector<int> const& child_field_indices,
   recursive_decode_context context,
   int depth,
+  bool materialize_output,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 
@@ -560,6 +565,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
   recursive_decode_context context,
   singular_message_merge_work work,
   int depth,
+  bool materialize_output,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 
@@ -567,6 +573,7 @@ std::unique_ptr<cudf::column> build_repeated_child_list_column(protobuf_input_vi
                                                                nested_parent_view parent,
                                                                recursive_decode_context context,
                                                                repeated_field_work work,
+                                                               bool materialize_output,
                                                                rmm::cuda_stream_view stream,
                                                                rmm::device_async_resource_ref mr);
 
@@ -576,6 +583,7 @@ std::unique_ptr<cudf::column> build_repeated_struct_column(
   std::vector<int> const& child_field_indices,
   recursive_decode_context context,
   repeated_field_work work,
+  bool materialize_output,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 

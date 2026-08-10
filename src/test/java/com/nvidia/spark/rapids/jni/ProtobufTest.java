@@ -445,15 +445,14 @@ public class ProtobufTest {
 
   @Test
   void testVarintOverEncodedZero() {
-    // Zero over-encoded as 10 bytes (all continuation bits except last)
-    // This is valid per protobuf spec - parsers must accept non-canonical varints
+    // protobuf-java sign-extends any terminated 10-byte encoding from the ninth byte.
     Byte[] row = concat(
         box(tag(1, WT_VARINT)),
         new Byte[]{(byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80,
                    (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x00});
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector expectedInt = ColumnVector.fromBoxedLongs(0L);
+         ColumnVector expectedInt = ColumnVector.fromBoxedLongs(Long.MIN_VALUE);
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedInt);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -466,22 +465,29 @@ public class ProtobufTest {
   }
 
   @Test
-  void testVarint10thByteInvalid() {
-    // 10th byte with more than 1 significant bit is invalid
-    // (uint64 can only hold 64 bits: 9*7=63 bits + 1 bit from 10th byte)
+  void testVarint10thByteMatchesProtobufJava() {
     Byte[] row = concat(
         box(tag(1, WT_VARINT)),
         new Byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0x02});  // 0x02 has 2nd bit set
+                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0x02});
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector result = Protobuf.decodeToStruct(
+         ColumnVector expectedValue = ColumnVector.fromBoxedLongs(-1L);
+         ColumnVector expected = ColumnVector.makeStruct(expectedValue);
+         ColumnVector actualPermissive = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.INT64)
                  .build(),
-             false)) {
-      assertSingleNullStructRow(result, "Overflowing varint should null the struct row");
+             false);
+         ColumnVector actualFailfast = Protobuf.decodeToStruct(
+             input.getColumn(0),
+             new ProtobufSchemaDescriptorBuilder()
+                 .addField(1, DType.INT64)
+                 .build(),
+             true)) {
+      AssertUtils.assertStructColumnsAreEqual(expected, actualPermissive);
+      AssertUtils.assertStructColumnsAreEqual(expected, actualFailfast);
     }
   }
 
@@ -3509,6 +3515,35 @@ public class ProtobufTest {
              struct(struct(7, 8, Collections.emptyList())),
              struct((Object) null),
              (StructData) null);
+         ColumnVector actualPermissive = Protobuf.decodeToStruct(
+             input.getColumn(0), schema, false);
+         ColumnVector actualFailfast = Protobuf.decodeToStruct(
+             input.getColumn(0), schema, true)) {
+      AssertUtils.assertStructColumnsAreEqual(expected, actualPermissive);
+      AssertUtils.assertStructColumnsAreEqual(expected, actualFailfast);
+    }
+  }
+
+  @Test
+  void testDuplicateSingularMessageWithTenByteVarintMergesInBothModes() {
+    Byte[] firstFragment = concat(
+        box(tag(1, WT_VARINT)),
+        new Byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF,
+                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0x02});
+    Byte[] secondFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(2)));
+    Byte[] row = concat(
+        box(tag(1, WT_LEN)), encodeMessage(firstFragment),
+        box(tag(1, WT_LEN)), encodeMessage(secondFragment));
+    ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
+        .addField(1, DType.STRUCT).down()
+            .addField(1, DType.INT64)
+        .up()
+        .build();
+
+    try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
+         ColumnVector expectedValue = ColumnVector.fromBoxedLongs(2L);
+         ColumnVector expectedChild = ColumnVector.makeStruct(expectedValue);
+         ColumnVector expected = ColumnVector.makeStruct(expectedChild);
          ColumnVector actualPermissive = Protobuf.decodeToStruct(
              input.getColumn(0), schema, false);
          ColumnVector actualFailfast = Protobuf.decodeToStruct(

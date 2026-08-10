@@ -49,6 +49,12 @@ namespace {
 namespace protobuf        = spark_rapids_jni::protobuf;
 namespace protobuf_detail = spark_rapids_jni::protobuf::detail;
 
+int sample_count_around_average(int average, std::mt19937& rng)
+{
+  auto const radius = average / 2;
+  return std::uniform_int_distribution<int>(average - radius, average + radius)(rng);
+}
+
 // ---------------------------------------------------------------------------
 // Protobuf wire-format encoding helpers (host side, for generating test data)
 // ---------------------------------------------------------------------------
@@ -429,13 +435,6 @@ struct RepeatedFieldCase {
       return s;
     };
 
-    // Vary count per row around the average (±50%)
-    auto vary = [&](int avg) -> int {
-      int lo = std::max(0, avg / 2);
-      int hi = avg + avg / 2;
-      return std::uniform_int_distribution<int>(lo, std::max(lo, hi))(rng);
-    };
-
     for (int r = 0; r < num_rows; r++) {
       auto& buf = messages[r];
 
@@ -444,7 +443,7 @@ struct RepeatedFieldCase {
 
       // tags (packed repeated int32)
       {
-        int n = vary(avg_tags_per_row);
+        int n = sample_count_around_average(avg_tags_per_row, rng);
         std::vector<int32_t> tags(n);
         for (auto& t : tags)
           t = int_dist(rng);
@@ -453,7 +452,7 @@ struct RepeatedFieldCase {
 
       // labels (unpacked repeated string)
       {
-        int n = vary(avg_labels_per_row);
+        int n = sample_count_around_average(avg_labels_per_row, rng);
         for (int i = 0; i < n; i++) {
           encode_string_field(buf, 3, random_string(str_len_dist(rng)));
         }
@@ -461,7 +460,7 @@ struct RepeatedFieldCase {
 
       // items (repeated nested message)
       {
-        int n = vary(avg_items_per_row);
+        int n = sample_count_around_average(avg_items_per_row, rng);
         for (int i = 0; i < n; i++) {
           encode_nested_message(buf, 4, [&](std::vector<uint8_t>& inner) {
             encode_varint_field(inner, 1, int_dist(rng));
@@ -548,17 +547,11 @@ struct WideRepeatedMessageCase {
       return s;
     };
 
-    auto vary = [&](int avg) -> int {
-      int lo = std::max(0, avg / 2);
-      int hi = avg + avg / 2;
-      return std::uniform_int_distribution<int>(lo, std::max(lo, hi))(rng);
-    };
-
     for (int r = 0; r < num_rows; r++) {
       auto& buf = messages[r];
       encode_varint_field(buf, 1, int_dist(rng));
 
-      int n = vary(avg_items_per_row);
+      int n = sample_count_around_average(avg_items_per_row, rng);
       for (int item_idx = 0; item_idx < n; item_idx++) {
         encode_nested_message(buf, 2, [&](std::vector<uint8_t>& inner) {
           for (int i = 0; i < num_child_fields; i++) {
@@ -646,23 +639,17 @@ struct RepeatedChildListCase {
       return s;
     };
 
-    auto vary = [&](int avg) -> int {
-      int lo = std::max(0, avg / 2);
-      int hi = avg + avg / 2;
-      return std::uniform_int_distribution<int>(lo, std::max(lo, hi))(rng);
-    };
-
     for (int r = 0; r < num_rows; r++) {
       auto& buf = messages[r];
       encode_varint_field(buf, 1, int_dist(rng));
 
-      int num_items = vary(avg_items_per_row);
+      int num_items = sample_count_around_average(avg_items_per_row, rng);
       for (int item_idx = 0; item_idx < num_items; item_idx++) {
         encode_nested_message(buf, 2, [&](std::vector<uint8_t>& inner) {
           for (int child_idx = 0; child_idx < num_repeated_children; child_idx++) {
             int fn        = child_idx + 1;
             bool is_str   = child_is_string(child_idx);
-            int num_elems = vary(avg_child_elems);
+            int num_elems = sample_count_around_average(avg_child_elems, rng);
             if (is_str) {
               for (int j = 0; j < num_elems; j++) {
                 encode_string_field(inner, fn, random_string(str_len_dist(rng)));
@@ -721,17 +708,11 @@ struct RepeatedMessageNestingCase {
       }
       return value;
     };
-    auto vary = [&](int average) {
-      auto const lower = std::max(0, average / 2);
-      auto const upper = average + average / 2;
-      return std::uniform_int_distribution<int>(lower, std::max(lower, upper))(rng);
-    };
-
     for (auto& message : messages) {
-      auto const num_outer_items = vary(avg_outer_items);
+      auto const num_outer_items = sample_count_around_average(avg_outer_items, rng);
       for (int outer_idx = 0; outer_idx < num_outer_items; ++outer_idx) {
         encode_nested_message(message, 1, [&](std::vector<uint8_t>& outer) {
-          auto const num_inner_items = vary(avg_inner_items);
+          auto const num_inner_items = sample_count_around_average(avg_inner_items, rng);
           for (int inner_idx = 0; inner_idx < num_inner_items; ++inner_idx) {
             encode_nested_message(outer, 1, [&](std::vector<uint8_t>& inner) {
               encode_varint_field(inner, 1, value_dist(rng));
@@ -853,16 +834,10 @@ struct RepeatedChildStringOnlyCase {
       }
       return value;
     };
-    auto vary = [&](int average) {
-      auto const lower = std::max(0, average / 2);
-      auto const upper = average + average / 2;
-      return std::uniform_int_distribution<int>(lower, std::max(lower, upper))(rng);
-    };
-
     for (int row = 0; row < num_rows; ++row) {
       auto& message = result.messages[row];
       for (int child_idx = 0; child_idx < num_repeated_children; ++child_idx) {
-        auto const num_elements = vary(avg_child_elems);
+        auto const num_elements = sample_count_around_average(avg_child_elems, rng);
         result.counts_by_child[child_idx].push_back(num_elements);
         for (int element_idx = 0; element_idx < num_elements; ++element_idx) {
           encode_string_field_record(message,
@@ -970,12 +945,6 @@ struct ManyRepeatedFieldsCase {
         s[c] = alphabet[rng() % alphabet.size()];
       return s;
     };
-    auto vary = [&](int avg) -> int {
-      int lo = std::max(0, avg / 2);
-      int hi = avg + avg / 2;
-      return std::uniform_int_distribution<int>(lo, std::max(lo, hi))(rng);
-    };
-
     for (int r = 0; r < num_rows; r++) {
       auto& buf = messages[r];
       int fn    = 1;
@@ -984,7 +953,7 @@ struct ManyRepeatedFieldsCase {
 
       for (int i = 0; i < num_repeated_int; i++) {
         int cur_fn = fn++;
-        int n      = vary(avg_elems_per_field);
+        int n      = sample_count_around_average(avg_elems_per_field, rng);
         if (n > 0) {
           std::vector<int32_t> vals(n);
           for (auto& v : vals)
@@ -994,7 +963,7 @@ struct ManyRepeatedFieldsCase {
       }
       for (int i = 0; i < num_repeated_str; i++) {
         int cur_fn = fn++;
-        int n      = vary(avg_elems_per_field);
+        int n      = sample_count_around_average(avg_elems_per_field, rng);
         for (int j = 0; j < n; j++) {
           encode_string_field(buf, cur_fn, random_string(str_len_dist(rng)));
         }
