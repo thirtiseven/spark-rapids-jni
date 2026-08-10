@@ -1307,7 +1307,6 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
     nullptr,
     0,
     nullptr,
-    nullptr,
     {field_descriptors.device.data(), num_repeated_children, nullptr, 0}};
 
   size_t total_bytes = 0;

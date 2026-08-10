@@ -35,10 +35,10 @@ namespace spark_rapids_jni::protobuf::detail {
 // Device helper functions
 // ============================================================================
 
-__device__ inline bool read_varint(uint8_t const* cur,
-                                   uint8_t const* end,
-                                   uint64_t& out,
-                                   int& bytes)
+__device__ inline bool read_varint64(uint8_t const* cur,
+                                     uint8_t const* end,
+                                     uint64_t& out,
+                                     int& bytes)
 {
   out       = 0;
   bytes     = 0;
@@ -57,6 +57,22 @@ __device__ inline bool read_varint(uint8_t const* cur,
     bytes++;
     if ((b & 0x80u) == 0) { return true; }
     shift += 7;
+  }
+  return false;
+}
+
+__device__ inline bool read_varint32(uint8_t const* cur,
+                                     uint8_t const* end,
+                                     uint32_t& out,
+                                     int& bytes)
+{
+  out   = 0;
+  bytes = 0;
+  while (cur < end && bytes < MAX_VARINT_BYTES) {
+    uint8_t const b = *cur++;
+    if (bytes < 5) { out |= static_cast<uint32_t>(b & 0x7Fu) << (bytes * 7); }
+    bytes++;
+    if ((b & 0x80u) == 0) { return true; }
   }
   return false;
 }
@@ -90,7 +106,7 @@ __device__ inline int get_wire_type_size(proto_wire_type wt, uint8_t const* cur,
     case proto_wire_type::VARINT: {
       uint64_t value;
       int bytes;
-      return read_varint(cur, end, value, bytes) ? bytes : -1;
+      return read_varint64(cur, end, value, bytes) ? bytes : -1;
     }
     case proto_wire_type::I64BIT:
       // Check if there's enough data for 8 bytes
@@ -101,11 +117,11 @@ __device__ inline int get_wire_type_size(proto_wire_type wt, uint8_t const* cur,
       if (end - cur < 4) return -1;
       return 4;
     case proto_wire_type::LEN: {
-      uint64_t len;
+      uint32_t len;
       int n;
-      if (!read_varint(cur, end, len, n)) return -1;
-      if (len > static_cast<uint64_t>(end - cur - n) ||
-          len > static_cast<uint64_t>(cuda::std::numeric_limits<int>::max() - n)) {
+      if (!read_varint32(cur, end, len, n)) return -1;
+      if (len > static_cast<uint32_t>(end - cur - n) ||
+          len > static_cast<uint32_t>(cuda::std::numeric_limits<int>::max() - n)) {
         return -1;
       }
       return n + static_cast<int>(len);
@@ -129,13 +145,13 @@ static __device__ __noinline__ bool skip_group(uint8_t const* cur,
   group_fields[0] = field_number;
 
   while (cur < end) {
-    uint64_t key;
+    uint32_t key;
     int key_bytes;
-    if (!read_varint(cur, end, key, key_bytes)) return false;
+    if (!read_varint32(cur, end, key, key_bytes)) return false;
     cur += key_bytes;
 
     auto const inner_field_number = key >> 3;
-    if (inner_field_number == 0 || inner_field_number > static_cast<uint64_t>(MAX_FIELD_NUMBER)) {
+    if (inner_field_number == 0 || inner_field_number > static_cast<uint32_t>(MAX_FIELD_NUMBER)) {
       return false;
     }
     auto const inner_wire_type = static_cast<proto_wire_type>(key & 0x7);
@@ -195,11 +211,11 @@ __device__ inline bool get_field_data_location(uint8_t const* cur,
 {
   if (wt == proto_wire_type::LEN) {
     // For length-delimited, read the length prefix
-    uint64_t len;
+    uint32_t len;
     int len_bytes;
-    if (!read_varint(cur, end, len, len_bytes)) return false;
-    if (len > static_cast<uint64_t>(end - cur - len_bytes) ||
-        len > static_cast<uint64_t>(cuda::std::numeric_limits<int>::max())) {
+    if (!read_varint32(cur, end, len, len_bytes)) return false;
+    if (len > static_cast<uint32_t>(end - cur - len_bytes) ||
+        len > static_cast<uint32_t>(cuda::std::numeric_limits<int>::max())) {
       return false;
     }
     data_offset = len_bytes;  // offset past the length prefix
@@ -234,6 +250,69 @@ __device__ inline bool checked_add_int32(int32_t lhs, int32_t rhs, int32_t& out)
   return true;
 }
 
+struct utf8_sequence {
+  int bytes;
+  bool valid;
+};
+
+__device__ inline bool is_utf8_continuation(uint8_t byte) { return (byte & 0xC0u) == 0x80u; }
+
+__device__ inline utf8_sequence inspect_utf8_sequence(uint8_t const* cur, uint8_t const* end)
+{
+  auto const b0 = *cur;
+  if (b0 < 0x80u) return {1, true};
+  if (b0 < 0xC2u || b0 > 0xF4u) return {1, false};
+
+  if (b0 <= 0xDFu) {
+    return cur + 1 < end && is_utf8_continuation(cur[1]) ? utf8_sequence{2, true}
+                                                         : utf8_sequence{1, false};
+  }
+
+  if (cur + 1 >= end) return {1, false};
+  auto const b1           = cur[1];
+  bool const valid_second = is_utf8_continuation(b1) && (b0 != 0xE0u || b1 >= 0xA0u) &&
+                            (b0 != 0xEDu || b1 < 0xA0u) && (b0 != 0xF0u || b1 >= 0x90u) &&
+                            (b0 != 0xF4u || b1 < 0x90u);
+  if (!valid_second) return {1, false};
+
+  if (cur + 2 >= end || !is_utf8_continuation(cur[2])) return {2, false};
+  if (b0 <= 0xEFu) return {3, true};
+  if (cur + 3 >= end || !is_utf8_continuation(cur[3])) return {3, false};
+  return {4, true};
+}
+
+__device__ inline int64_t repaired_utf8_length(uint8_t const* data, int32_t size)
+{
+  int64_t result  = 0;
+  auto const* cur = data;
+  auto const* end = data + size;
+  while (cur < end) {
+    auto const sequence = inspect_utf8_sequence(cur, end);
+    result += sequence.valid ? sequence.bytes : 3;
+    cur += sequence.bytes;
+  }
+  return result;
+}
+
+__device__ inline void copy_repaired_utf8(uint8_t const* data, int32_t size, char* output)
+{
+  auto const* cur = data;
+  auto const* end = data + size;
+  while (cur < end) {
+    auto const sequence = inspect_utf8_sequence(cur, end);
+    if (sequence.valid) {
+      for (int i = 0; i < sequence.bytes; ++i) {
+        *output++ = static_cast<char>(cur[i]);
+      }
+    } else {
+      *output++ = static_cast<char>(0xEFu);
+      *output++ = static_cast<char>(0xBFu);
+      *output++ = static_cast<char>(0xBDu);
+    }
+    cur += sequence.bytes;
+  }
+}
+
 // `T` defaults to int32 for the top-level callers; nested message offsets are computed in int64
 // (parent row offset + relative field offset) and instantiate the int64 form.
 template <std::integral T = int32_t>
@@ -259,16 +338,16 @@ __device__ inline bool decode_tag(uint8_t const*& cur,
                                   proto_tag& tag,
                                   protobuf_error* error_flag)
 {
-  uint64_t key;
+  uint32_t key;
   int key_bytes;
-  if (!read_varint(cur, end, key, key_bytes)) {
+  if (!read_varint32(cur, end, key, key_bytes)) {
     set_error_once(error_flag, protobuf_error::VARINT);
     return false;
   }
 
   cur += key_bytes;
-  uint64_t fn = key >> 3;
-  if (fn == 0 || fn > static_cast<uint64_t>(MAX_FIELD_NUMBER)) {
+  uint32_t fn = key >> 3;
+  if (fn == 0 || fn > static_cast<uint32_t>(MAX_FIELD_NUMBER)) {
     set_error_once(error_flag, protobuf_error::FIELD_NUMBER);
     return false;
   }

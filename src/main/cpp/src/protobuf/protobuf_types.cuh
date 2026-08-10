@@ -40,8 +40,7 @@ constexpr int FIELD_LOOKUP_TABLE_MAX = 4096;
 // Maximum number of repeated fields in one message the combined occurrence-scan kernel can process
 // in a single launch. The kernel keeps a per-thread `int write_idx[MAX_REPEATED_FIELDS_PER_KERNEL]`
 // array on the stack; raising the limit pushes the array into local memory, which would otherwise
-// cost 4x the per-thread footprint and pressure occupancy. Validated at the host level so the
-// error surface depends on the schema, not on which fields happen to have data in a given batch.
+// cost 4x the per-thread footprint and pressure occupancy. Host launchers chunk larger schemas.
 constexpr int MAX_REPEATED_FIELDS_PER_KERNEL = 32;
 
 enum class protobuf_error : int {
@@ -54,7 +53,6 @@ enum class protobuf_error : int {
   FIELD_SIZE,
   SKIP,
   FIXED_LEN,
-  INVALID_ENUM,
   REQUIRED,
   SCHEMA_TOO_LARGE,
   REPEATED_COUNT_MISMATCH,
@@ -73,11 +71,9 @@ inline std::string error_message(protobuf_error error)
     case FIELD_SIZE: return "Protobuf decode error: invalid field size";
     case SKIP: return "Protobuf decode error: unable to skip unknown field";
     case FIXED_LEN: return "Protobuf decode error: invalid fixed-width or packed field length";
-    case INVALID_ENUM: return "Protobuf decode error: unknown enum value";
     case REQUIRED: return "Protobuf decode error: missing required field";
     case SCHEMA_TOO_LARGE:
-      return "Protobuf decode error: schema exceeds maximum supported repeated fields per "
-             "kernel (" +
+      return "Protobuf decode internal error: occurrence scan exceeds fields per kernel (" +
              std::to_string(MAX_REPEATED_FIELDS_PER_KERNEL) + ")";
     case REPEATED_COUNT_MISMATCH:
       return "Protobuf decode error: repeated-field count/scan mismatch";
@@ -168,12 +164,9 @@ struct message_fragment_source_view {
   int32_t const* top_row_indices;
 };
 
-enum class enum_error_scope { root, local };
-
 struct protobuf_value_domain_view {
   int size;
   int32_t const* top_row_indices;
-  enum_error_scope enum_scope;
 };
 
 struct required_field_input_view {
@@ -245,7 +238,6 @@ struct field_scan_view {
   int repeated_stride;
   field_occurrence_count* singular_message_info;
   int singular_message_stride;
-  protobuf_error* deferred_enum_error;
   int* multiple_message_fields;
   lookup_view<field_descriptor> lookup;
 };
