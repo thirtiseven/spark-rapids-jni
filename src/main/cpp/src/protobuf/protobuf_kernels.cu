@@ -28,6 +28,12 @@ namespace spark_rapids_jni::protobuf::detail {
 
 namespace {
 
+enum class wire_type_mismatch_policy {
+  report_error_and_abort,
+  report_error_and_continue,
+  continue_silently,
+};
+
 // ============================================================================
 // Pass 1: Scan all fields kernel - records (offset, length) for each field
 // ============================================================================
@@ -76,7 +82,6 @@ __device__ bool is_recognized_enum_value(field_descriptor const& descriptor,
  * (`scan_nested_message_fields_kernel`), and occurrence
  * (`scan_all_field_occurrences_kernel`) scanners. The caller owns output initialization and
  * fatal row-level error marking. Parse errors that leave the cursor unsafe return false.
- * Known fields with mismatched wire types are skipped as unknown fields.
  *
  * `fields` owns the field-number lookup and descriptor attributes used by every scanner.
  * Singular fields are delegated to `on_singular(f, location)` after their location is decoded.
@@ -84,7 +89,8 @@ __device__ bool is_recognized_enum_value(field_descriptor const& descriptor,
  * false aborts the scan.
  *
  * Matched repeated fields are delegated to `on_repeated(f, cur, wt)`. Callers capture message
- * bounds only when their repeated handler needs them.
+ * bounds only when their repeated handler needs them. The mismatch policy controls singular
+ * fields; repeated handlers apply the same depth-specific policy while accepting packed encoding.
  */
 struct message_scan_context {
   uint8_t const* begin;
@@ -94,7 +100,7 @@ struct message_scan_context {
   int max_group_depth;  // Enclosing messages share protobuf-java's recursion budget.
 };
 
-template <typename Descriptor>
+template <wire_type_mismatch_policy MismatchPolicy, typename Descriptor>
 __device__ bool scan_message_field_locations(message_scan_context context,
                                              lookup_view<Descriptor> fields,
                                              auto&& on_singular,
@@ -125,7 +131,16 @@ __device__ bool scan_message_field_locations(message_scan_context context,
       if (!on_repeated(f, cur, tag.wire_type)) { return false; }
       continue;
     }
-    if (tag.wire_type != field.expected_wire_type) continue;
+    if (tag.wire_type != field.expected_wire_type) {
+      if constexpr (MismatchPolicy == wire_type_mismatch_policy::report_error_and_abort) {
+        set_error_once(error_flag, protobuf_error::WIRE_TYPE);
+        return false;
+      } else if constexpr (MismatchPolicy == wire_type_mismatch_policy::report_error_and_continue) {
+        set_error_once(error_flag, protobuf_error::WIRE_TYPE);
+        if (context.row_invalid != nullptr) { *context.row_invalid = true; }
+      }
+      continue;
+    }
 
     int const data_offset = static_cast<int>(cur - msg_base);
     field_location location;
@@ -170,6 +185,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
 CUDF_KERNEL void scan_all_fields_kernel(cudf::column_device_view const d_in,
                                         field_scan_view fields,
                                         protobuf_error* error_flag,
+                                        protobuf_error* deferred_enum_error,
                                         bool* row_has_invalid_data)
 {
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -209,15 +225,20 @@ CUDF_KERNEL void scan_all_fields_kernel(cudf::column_device_view const d_in,
           descriptor, value_start, value_start + location.length, error_flag, recognized)) {
       return false;
     }
-    if (recognized) {
-      // Last recognized value wins; unknown proto2 enum occurrences are ignored.
+    if (!recognized) {
+      if (row_has_invalid_data != nullptr) {
+        mark_row_error();
+      } else {
+        set_error_once(deferred_enum_error, protobuf_error::INVALID_ENUM);
+      }
+    } else {
       field_locations[f] = location;
     }
     return true;
   };
   // Top-level scalar descriptors are never repeated, so the repeated handler is unreachable.
   auto unreachable_repeated = [](int, uint8_t const*, proto_wire_type) { return true; };
-  if (!scan_message_field_locations(
+  if (!scan_message_field_locations<wire_type_mismatch_policy::report_error_and_abort>(
         {msg_base, msg_end, error_flag, nullptr, PROTOBUF_JAVA_RECURSION_LIMIT},
         fields.lookup,
         record_singular,
@@ -238,7 +259,7 @@ CUDF_KERNEL void scan_all_fields_kernel(cudf::column_device_view const d_in,
  * The walker handles wire-type validation, packed-vs-unpacked dispatch, varint/fixed-width
  * length decoding, and packed-buffer bounds checking.
  */
-template <typename F>
+template <wire_type_mismatch_policy MismatchPolicy, typename F>
   requires std::is_invocable_r_v<bool, F, int32_t /*elem_offset*/, int32_t /*elem_len*/>
 __device__ bool walk_repeated_element(uint8_t const* cur,
                                       uint8_t const* msg_base,
@@ -250,7 +271,14 @@ __device__ bool walk_repeated_element(uint8_t const* cur,
 {
   bool is_packed = wt == proto_wire_type::LEN && expected_wt != proto_wire_type::LEN;
 
-  if (!is_packed && wt != expected_wt) return true;
+  if (!is_packed && wt != expected_wt) {
+    if constexpr (MismatchPolicy == wire_type_mismatch_policy::continue_silently) {
+      return true;
+    } else {
+      set_error_once(error_flag, protobuf_error::WIRE_TYPE);
+      return MismatchPolicy == wire_type_mismatch_policy::report_error_and_continue;
+    }
+  }
 
   if (is_packed) {
     uint32_t packed_len;
@@ -375,16 +403,17 @@ CUDF_KERNEL void validate_message_fragments_kernel(message_fragment_location_pro
     auto ignore_occurrence = []([[maybe_unused]] int32_t offset, [[maybe_unused]] int32_t length) {
       return true;
     };
-    return walk_repeated_element(cur,
-                                 fragment_begin,
-                                 fragment_limit,
-                                 wire_type,
-                                 fields.lookup.data[f].expected_wire_type,
-                                 error_flag,
-                                 ignore_occurrence);
+    return walk_repeated_element<wire_type_mismatch_policy::continue_silently>(
+      cur,
+      fragment_begin,
+      fragment_limit,
+      wire_type,
+      fields.lookup.data[f].expected_wire_type,
+      error_flag,
+      ignore_occurrence);
   };
 
-  if (!scan_message_field_locations(
+  if (!scan_message_field_locations<wire_type_mismatch_policy::continue_silently>(
         {fragment_begin, fragment_limit, error_flag, nullptr, max_group_depth},
         fields.lookup,
         record_singular,
@@ -407,6 +436,7 @@ CUDF_KERNEL void validate_message_fragments_kernel(message_fragment_location_pro
 CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_in,
                                               field_scan_view fields,
                                               protobuf_error* error_flag,
+                                              protobuf_error* deferred_enum_error,
                                               bool* row_has_invalid_data)
 {
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -449,6 +479,7 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
 
   uint8_t const* const msg_base = bytes + start;
   uint8_t const* const msg_end  = bytes + end;
+  auto* row_invalid = row_has_invalid_data != nullptr ? row_has_invalid_data + row : nullptr;
 
   auto record_nested = [&](int f, field_location location) {
     auto const& field                   = fields.lookup.data[f];
@@ -460,16 +491,28 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
   auto count_repeated = [&](int f, uint8_t const* cur, proto_wire_type wire_type) {
     auto const& field = fields.lookup.data[f];
     auto& info        = field_repeated_info[field.output_index];
-    auto count_action = [&info]([[maybe_unused]] int32_t off, [[maybe_unused]] int32_t len) {
+    auto count_action = [&](int32_t offset, int32_t length) {
+      bool recognized;
+      auto const* value_start = msg_base + offset;
+      if (!is_recognized_enum_value(
+            field, value_start, value_start + length, error_flag, recognized)) {
+        return false;
+      }
+      if (!recognized) {
+        if (row_invalid != nullptr) {
+          *row_invalid = true;
+        } else {
+          set_error_once(deferred_enum_error, protobuf_error::INVALID_ENUM);
+        }
+      }
       info.count++;
       return true;
     };
-    return walk_repeated_element(
+    return walk_repeated_element<wire_type_mismatch_policy::report_error_and_abort>(
       cur, msg_base, msg_end, wire_type, field.expected_wire_type, error_flag, count_action);
   };
 
-  auto* row_invalid = row_has_invalid_data != nullptr ? row_has_invalid_data + row : nullptr;
-  if (!scan_message_field_locations(
+  if (!scan_message_field_locations<wire_type_mismatch_policy::report_error_and_continue>(
         {msg_base, msg_end, error_flag, row_invalid, PROTOBUF_JAVA_RECURSION_LIMIT},
         fields.lookup,
         record_nested,
@@ -481,6 +524,7 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
 /**
  * Scan each message once and write occurrences for every selected field.
  */
+template <wire_type_mismatch_policy MismatchPolicy>
 __device__ bool scan_all_field_occurrences_in_message(uint8_t const* msg_base,
                                                       uint8_t const* msg_end,
                                                       field_occurrence_scan_view fields,
@@ -519,14 +563,15 @@ __device__ bool scan_all_field_occurrences_in_message(uint8_t const* msg_base,
       wi++;
       return true;
     };
-    return walk_repeated_element(
+    return walk_repeated_element<MismatchPolicy>(
       cur, msg_base, msg_end, wt, field.expected_wire_type, error_flag, scan_action);
   };
 
-  if (!scan_message_field_locations({msg_base, msg_end, error_flag, nullptr, max_group_depth},
-                                    fields,
-                                    unreachable_singular,
-                                    on_repeated_scan)) {
+  if (!scan_message_field_locations<MismatchPolicy>(
+        {msg_base, msg_end, error_flag, nullptr, max_group_depth},
+        fields,
+        unreachable_singular,
+        on_repeated_scan)) {
     return false;
   }
 
@@ -556,8 +601,9 @@ CUDF_KERNEL void scan_all_field_occurrences_kernel(cudf::column_device_view cons
   int32_t end       = in.offset_at(row + 1) - base;
   if (!check_message_bounds(start, end, child.size(), error_flag)) return;
 
-  [[maybe_unused]] auto const scan_succeeded = scan_all_field_occurrences_in_message(
-    bytes + start, bytes + end, fields, error_flag, row, PROTOBUF_JAVA_RECURSION_LIMIT);
+  [[maybe_unused]] auto const scan_succeeded =
+    scan_all_field_occurrences_in_message<wire_type_mismatch_policy::report_error_and_abort>(
+      bytes + start, bytes + end, fields, error_flag, row, PROTOBUF_JAVA_RECURSION_LIMIT);
 }
 
 // ============================================================================
@@ -642,13 +688,13 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
       if (field_repeated_info != nullptr) { field_repeated_info[f].count++; }
       return true;
     };
-    return walk_repeated_element(
+    return walk_repeated_element<wire_type_mismatch_policy::continue_silently>(
       cur, nested_start, nested_end, wt, expected_wire_type, error_flag, count_occurrence);
   };
 
   // protobuf-java preserves wrong-wire known fields in UnknownFieldSet; this projected API has no
   // compatible output channel for nested fields.
-  if (!scan_message_field_locations(
+  if (!scan_message_field_locations<wire_type_mismatch_policy::continue_silently>(
         {nested_start, nested_end, error_flag, nullptr, max_group_depth},
         fields.lookup,
         record_singular,
@@ -677,12 +723,13 @@ CUDF_KERNEL void scan_all_field_occurrences_in_nested_kernel(protobuf_input_view
   }
 
   [[maybe_unused]] auto const scan_succeeded =
-    scan_all_field_occurrences_in_message(input.message_data + msg_start_off,
-                                          input.message_data + msg_end_off,
-                                          fields,
-                                          error_flag,
-                                          row,
-                                          max_group_depth);
+    scan_all_field_occurrences_in_message<wire_type_mismatch_policy::continue_silently>(
+      input.message_data + msg_start_off,
+      input.message_data + msg_end_off,
+      fields,
+      error_flag,
+      row,
+      max_group_depth);
 }
 
 CUDF_KERNEL void compute_grandchild_parent_locations_kernel(nested_location_provider loc_provider,
@@ -911,6 +958,7 @@ void set_error_once_async(protobuf_error* error_flag,
 void launch_scan_all_fields(cudf::column_device_view const& d_in,
                             field_scan_view fields,
                             protobuf_error* error_flag,
+                            protobuf_error* deferred_enum_error,
                             bool* row_has_invalid_data,
                             rmm::cuda_stream_view stream)
 {
@@ -918,13 +966,14 @@ void launch_scan_all_fields(cudf::column_device_view const& d_in,
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_all_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
-    d_in, fields, error_flag, row_has_invalid_data);
+    d_in, fields, error_flag, deferred_enum_error, row_has_invalid_data);
   CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_count_repeated_fields(cudf::column_device_view const& d_in,
                                   field_scan_view fields,
                                   protobuf_error* error_flag,
+                                  protobuf_error* deferred_enum_error,
                                   bool* row_has_invalid_data,
                                   rmm::cuda_stream_view stream)
 {
@@ -932,7 +981,7 @@ void launch_count_repeated_fields(cudf::column_device_view const& d_in,
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   count_repeated_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
-    d_in, fields, error_flag, row_has_invalid_data);
+    d_in, fields, error_flag, deferred_enum_error, row_has_invalid_data);
   CUDF_CHECK_CUDA(stream.value());
 }
 

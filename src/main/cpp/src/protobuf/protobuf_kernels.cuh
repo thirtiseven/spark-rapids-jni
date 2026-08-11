@@ -459,6 +459,7 @@ CUDF_KERNEL void copy_repaired_utf8_kernel(uint8_t const* message_data,
 void launch_count_repeated_fields(cudf::column_device_view const& d_in,
                                   field_scan_view fields,
                                   protobuf_error* error_flag,
+                                  protobuf_error* deferred_enum_error,
                                   bool* row_has_invalid_data,
                                   rmm::cuda_stream_view stream);
 
@@ -900,6 +901,7 @@ inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
 void launch_scan_all_fields(cudf::column_device_view const& d_in,
                             field_scan_view fields,
                             protobuf_error* error_flag,
+                            protobuf_error* deferred_enum_error,
                             bool* row_has_invalid_data,
                             rmm::cuda_stream_view stream);
 

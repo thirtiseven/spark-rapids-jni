@@ -361,10 +361,14 @@ inline repeated_field_work_bundle make_repeated_field_work_bundle(
     if (work.total_count > 0) {
       work.occurrences = std::make_unique<rmm::device_uvector<field_occurrence>>(
         work.total_count, stream, scratch_mr);
-      auto const& field = schema[schema_idx];
-      result.scan_descriptors.push_back(field_occurrence_scan_desc{
-        field.field_number, field.wire_type, work.offsets.data(), work.occurrences->data()});
     }
+    // Zero-count descriptors keep malformed rows aligned with the count pass.
+    auto const& field = schema[schema_idx];
+    result.scan_descriptors.push_back(
+      field_occurrence_scan_desc{field.field_number,
+                                 field.wire_type,
+                                 work.offsets.data(),
+                                 work.occurrences == nullptr ? nullptr : work.occurrences->data()});
   }
   return result;
 }
@@ -605,12 +609,14 @@ std::unique_ptr<cudf::column> build_repeated_enum_string_column(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 
-std::unique_ptr<cudf::column> build_repeated_string_column(cudf::column_view const& binary_input,
-                                                           protobuf_input_view input,
-                                                           protobuf_field_meta_view field,
-                                                           repeated_field_work work,
-                                                           rmm::cuda_stream_view stream,
-                                                           rmm::device_async_resource_ref mr);
+std::unique_ptr<cudf::column> build_repeated_string_column(
+  cudf::column_view const& binary_input,
+  protobuf_input_view input,
+  protobuf_field_meta_view field,
+  repeated_field_work work,
+  rmm::device_uvector<protobuf_error>& d_error,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 std::unique_ptr<cudf::column> build_nested_struct_column(
   protobuf_input_view input,

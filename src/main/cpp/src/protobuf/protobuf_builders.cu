@@ -470,12 +470,14 @@ std::unique_ptr<cudf::column> build_repeated_enum_string_column(
   return drop_unknown_repeated_enum_values(std::move(result), stream, mr);
 }
 
-std::unique_ptr<cudf::column> build_repeated_string_column(cudf::column_view const& binary_input,
-                                                           protobuf_input_view input,
-                                                           protobuf_field_meta_view field,
-                                                           repeated_field_work work,
-                                                           rmm::cuda_stream_view stream,
-                                                           rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::column> build_repeated_string_column(
+  cudf::column_view const& binary_input,
+  protobuf_input_view input,
+  protobuf_field_meta_view field,
+  repeated_field_work work,
+  rmm::device_uvector<protobuf_error>& d_error,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   validate_nonempty_repeated_field_work(work, input.num_rows);
 
@@ -494,7 +496,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(cudf::column_view con
       <<<blocks, threads, 0, stream.value()>>>(loc_provider, total_count, str_lengths.data());
   } else {
     extract_utf8_lengths_kernel<repeated_location_provider><<<blocks, threads, 0, stream.value()>>>(
-      input.message_data, loc_provider, total_count, str_lengths.data(), nullptr);
+      input.message_data, loc_provider, total_count, str_lengths.data(), d_error.data());
   }
   CUDF_CHECK_CUDA(stream.value());
 

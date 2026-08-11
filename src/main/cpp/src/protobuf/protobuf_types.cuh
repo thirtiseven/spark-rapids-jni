@@ -54,6 +54,7 @@ enum class protobuf_error : int {
   FIELD_SIZE,
   SKIP,
   FIXED_LEN,
+  INVALID_ENUM,
   REQUIRED,
   SCHEMA_TOO_LARGE,
   REPEATED_COUNT_MISMATCH,
@@ -72,6 +73,7 @@ inline std::string error_message(protobuf_error error)
     case FIELD_SIZE: return "Protobuf decode error: invalid field size";
     case SKIP: return "Protobuf decode error: unable to skip unknown field";
     case FIXED_LEN: return "Protobuf decode error: invalid fixed-width or packed field length";
+    case INVALID_ENUM: return "Protobuf decode error: unknown enum value";
     case REQUIRED: return "Protobuf decode error: missing required field";
     case SCHEMA_TOO_LARGE:
       return "Protobuf decode internal error: occurrence scan exceeds fields per kernel (" +

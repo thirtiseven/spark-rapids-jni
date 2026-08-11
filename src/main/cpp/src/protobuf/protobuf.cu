@@ -367,8 +367,10 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
 
   auto d_error = cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(
     1, stream, cudf::get_current_device_resource_ref());
-  // Only malformed input forces a PERMISSIVE row null; unknown enum occurrences are filtered
-  // without invalidating the containing row.
+  auto d_deferred_enum_error = cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(
+    1, stream, cudf::get_current_device_resource_ref());
+  // PERMISSIVE-mode row nulling support for malformed input, root enum mismatches, and missing
+  // required fields.
   bool const track_permissive_null_rows = !fail_on_errors;
   rmm::device_uvector<bool> d_row_force_null(
     track_permissive_null_rows ? num_rows : 0, stream, cudf::get_current_device_resource_ref());
@@ -428,6 +430,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     launch_count_repeated_fields(*d_in,
                                  fields,
                                  d_error.data(),
+                                 d_deferred_enum_error.data(),
                                  track_permissive_null_rows ? d_row_force_null.data() : nullptr,
                                  stream);
   }
@@ -490,6 +493,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     launch_scan_all_fields(*d_in,
                            fields,
                            d_error.data(),
+                           d_deferred_enum_error.data(),
                            track_permissive_null_rows ? d_row_force_null.data() : nullptr,
                            stream);
 
@@ -725,13 +729,13 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
               binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
           } else {
             column_map[schema_idx] = build_repeated_string_column(
-              binary_input, input, field_meta, std::move(w), stream, mr);
+              binary_input, input, field_meta, std::move(w), d_error, stream, mr);
           }
           break;
         }
         case cudf::type_id::LIST:  // bytes as LIST<INT8>
-          column_map[schema_idx] =
-            build_repeated_string_column(binary_input, input, field_meta, std::move(w), stream, mr);
+          column_map[schema_idx] = build_repeated_string_column(
+            binary_input, input, field_meta, std::move(w), d_error, stream, mr);
           break;
         case cudf::type_id::STRUCT: {
           auto const& child_field_indices = schema_context.children(schema_idx);
@@ -801,10 +805,14 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   {
     using enum protobuf_error;
     CUDF_CHECK_CUDA(stream.value());
-    protobuf_error h_error = NONE;
+    protobuf_error h_error               = NONE;
+    protobuf_error h_deferred_enum_error = NONE;
     CUDF_CUDA_TRY(
       cudf::detail::memcpy_async(&h_error, d_error.data(), sizeof(protobuf_error), stream));
+    CUDF_CUDA_TRY(cudf::detail::memcpy_async(
+      &h_deferred_enum_error, d_deferred_enum_error.data(), sizeof(protobuf_error), stream));
     stream.synchronize();
+    if (h_error == NONE) { h_error = h_deferred_enum_error; }
     if (h_error == SCHEMA_TOO_LARGE || h_error == REPEATED_COUNT_MISMATCH) {
       throw cudf::logic_error(error_message(h_error));
     }
