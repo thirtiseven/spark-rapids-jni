@@ -3614,26 +3614,20 @@ public class ProtobufTest {
     Byte[] malformedLast = concat(
         box(tag(1, WT_LEN)), encodeMessage(validUnknownFixed64),
         box(tag(1, WT_LEN)), encodeMessage(truncatedVarint));
-    Byte[] validFirst = concat(box(tag(1, WT_VARINT)), box(encodeVarint(1)));
-    Byte[] validSecond = concat(box(tag(1, WT_VARINT)), box(encodeVarint(2)));
-    Byte[] wrongWireBeforeDuplicates = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(7)),
-        box(tag(1, WT_LEN)), encodeMessage(validFirst),
-        box(tag(1, WT_LEN)), encodeMessage(validSecond));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
             .addField(1, DType.INT32)
         .up()
         .build();
 
-    try (Table input = new Table.TestBuilder().column(
-             new Byte[][]{malformedFirst, malformedLast, wrongWireBeforeDuplicates}).build();
+    try (Table input = new Table.TestBuilder()
+             .column(new Byte[][]{malformedFirst, malformedLast})
+             .build();
          ColumnVector expected = ColumnVector.fromStructs(
              new StructType(true,
                  new StructType(true, new BasicType(true, DType.INT32))),
              (StructData) null,
-             (StructData) null,
-             struct(struct(2)));
+             (StructData) null);
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0), schema, false)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actual);
@@ -3661,6 +3655,27 @@ public class ProtobufTest {
             input.getColumn(0), schema, true)) {
         }
       });
+    }
+  }
+
+  @Test
+  void testWrongWireBeforeDuplicateSingularMessageOccurrences_Permissive() {
+    Byte[] firstFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(1)));
+    Byte[] secondFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(2)));
+    Byte[] row = concat(
+        box(tag(1, WT_VARINT)), box(encodeVarint(7)),
+        box(tag(1, WT_LEN)), encodeMessage(firstFragment),
+        box(tag(1, WT_LEN)), encodeMessage(secondFragment));
+    ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
+        .addField(1, DType.STRUCT).down()
+            .addField(1, DType.INT32)
+        .up()
+        .build();
+
+    try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
+         ColumnVector actual = Protobuf.decodeToStruct(input.getColumn(0), schema, false)) {
+      assertSingleNullStructRow(
+          actual, "Wrong top-level wire type should null the struct row");
     }
   }
 
