@@ -439,18 +439,6 @@ void maybe_check_required_fields(required_field_input_view input,
                                  protobuf_decode_runtime_context decode_ctx,
                                  rmm::cuda_stream_view stream);
 
-void propagate_invalid_enum_flags_to_rows(rmm::device_uvector<bool> const& item_invalid,
-                                          protobuf_decode_runtime_context decode_ctx,
-                                          protobuf_value_domain_view value_domain,
-                                          rmm::cuda_stream_view stream);
-
-void validate_enum_and_propagate_rows(rmm::device_uvector<int32_t> const& values,
-                                      rmm::device_uvector<bool>& valid,
-                                      enum_domain_device_view enum_domain,
-                                      protobuf_decode_runtime_context decode_ctx,
-                                      protobuf_value_domain_view value_domain,
-                                      rmm::cuda_stream_view stream);
-
 void validate_enum_values(rmm::device_uvector<int32_t> const& values,
                           rmm::device_uvector<bool>& valid,
                           enum_domain_device_view enum_domain,
@@ -460,13 +448,6 @@ void validate_enum_values(rmm::device_uvector<int32_t> const& values,
                           rmm::device_uvector<bool>& valid,
                           cudf::detail::host_vector<int32_t> const& valid_enums,
                           rmm::cuda_stream_view stream);
-
-void validate_enum_and_propagate_rows(rmm::device_uvector<int32_t> const& values,
-                                      rmm::device_uvector<bool>& valid,
-                                      cudf::detail::host_vector<int32_t> const& valid_enums,
-                                      protobuf_decode_runtime_context decode_ctx,
-                                      protobuf_value_domain_view value_domain,
-                                      rmm::cuda_stream_view stream);
 
 // ============================================================================
 // Forward declarations of builder/utility functions

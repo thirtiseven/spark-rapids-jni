@@ -274,10 +274,17 @@ __device__ inline utf8_sequence inspect_utf8_sequence(uint8_t const* cur, uint8_
   }
 
   if (cur + 1 >= end) return {1, false};
-  auto const b1           = cur[1];
-  bool const valid_second = cudf::strings::detail::is_utf8_continuation_char(b1) &&
-                            (b0 != 0xE0u || b1 >= 0xA0u) && (b0 != 0xEDu || b1 < 0xA0u) &&
-                            (b0 != 0xF0u || b1 >= 0x90u) && (b0 != 0xF4u || b1 < 0x90u);
+  auto const b1                     = cur[1];
+  bool const second_is_continuation = cudf::strings::detail::is_utf8_continuation_char(b1);
+  // Java consumes a UTF-8-encoded surrogate as one malformed subsequence.
+  if (b0 == 0xEDu && second_is_continuation && b1 >= 0xA0u) {
+    auto const bytes =
+      cur + 2 < end && cudf::strings::detail::is_utf8_continuation_char(cur[2]) ? 3 : 2;
+    return {bytes, false};
+  }
+  bool const valid_second = second_is_continuation && (b0 != 0xE0u || b1 >= 0xA0u) &&
+                            (b0 != 0xEDu || b1 < 0xA0u) && (b0 != 0xF0u || b1 >= 0x90u) &&
+                            (b0 != 0xF4u || b1 < 0x90u);
   if (!valid_second) return {1, false};
 
   if (cur + 2 >= end || !cudf::strings::detail::is_utf8_continuation_char(cur[2])) {

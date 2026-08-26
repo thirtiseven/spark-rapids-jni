@@ -24,9 +24,6 @@
 #include <rmm/exec_policy.hpp>
 
 #include <thrust/fill.h>
-#include <thrust/for_each.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/transform.h>
 
 #include <type_traits>
 
@@ -633,10 +630,7 @@ CUDF_KERNEL void scan_all_field_occurrences_in_nested_kernel(protobuf_input_view
       max_group_depth);
 }
 
-CUDF_KERNEL void compute_grandchild_parent_locations_kernel(field_location const* parent_locs,
-                                                            field_location const* child_locs,
-                                                            int child_idx,
-                                                            int num_child_fields,
+CUDF_KERNEL void compute_grandchild_parent_locations_kernel(nested_location_provider loc_provider,
                                                             field_location* gc_parent_locs,
                                                             int num_rows,
                                                             protobuf_error* error_flag)
@@ -644,8 +638,6 @@ CUDF_KERNEL void compute_grandchild_parent_locations_kernel(field_location const
   int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= num_rows) return;
 
-  nested_location_provider loc_provider{
-    nullptr, 0, parent_locs, child_locs, child_idx, num_child_fields};
   gc_parent_locs[row] = loc_provider.get_rebased_child_location(row, error_flag);
 }
 
@@ -803,7 +795,7 @@ void set_error_once_async(protobuf_error* error_flag,
                           rmm::cuda_stream_view stream)
 {
   set_error_if_unset_kernel<<<1, 1, 0, stream.value()>>>(error_flag, error);
-  CUDF_CUDA_TRY(cudaPeekAtLastError());
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_all_fields(cudf::column_device_view const& d_in,
@@ -818,6 +810,7 @@ void launch_scan_all_fields(cudf::column_device_view const& d_in,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_all_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     d_in, fields, error_flag, deferred_enum_error, row_has_invalid_data);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_count_repeated_fields(cudf::column_device_view const& d_in,
@@ -832,6 +825,7 @@ void launch_count_repeated_fields(cudf::column_device_view const& d_in,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   count_repeated_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     d_in, fields, error_flag, deferred_enum_error, row_has_invalid_data);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
@@ -844,6 +838,7 @@ void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     d_in, fields, error_flag);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_extract_strided_locations(field_location const* nested_locations,
@@ -857,6 +852,7 @@ void launch_extract_strided_locations(field_location const* nested_locations,
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   extract_strided_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     nested_locations, field_idx, num_fields, parent_locs, num_rows);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_scan_nested_message_fields(protobuf_input_view input,
@@ -892,10 +888,7 @@ void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
   CUDF_CHECK_CUDA(stream.value());
 }
 
-void launch_compute_grandchild_parent_locations(field_location const* parent_locs,
-                                                field_location const* child_locs,
-                                                int child_idx,
-                                                int num_child_fields,
+void launch_compute_grandchild_parent_locations(nested_location_provider loc_provider,
                                                 field_location* gc_parent_locs,
                                                 int num_rows,
                                                 protobuf_error* error_flag,
@@ -904,7 +897,8 @@ void launch_compute_grandchild_parent_locations(field_location const* parent_loc
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   compute_grandchild_parent_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
-    parent_locs, child_locs, child_idx, num_child_fields, gc_parent_locs, num_rows, error_flag);
+    loc_provider, gc_parent_locs, num_rows, error_flag);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_validate_enum_values(enum_value_device_view input,
@@ -916,6 +910,7 @@ void launch_validate_enum_values(enum_value_device_view input,
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   validate_enum_values_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     input, row_has_invalid_enum, domain);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_compute_enum_string_lengths(enum_value_device_view input,
@@ -927,6 +922,7 @@ void launch_compute_enum_string_lengths(enum_value_device_view input,
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   compute_enum_string_lengths_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     input, lookup, lengths);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void launch_copy_enum_string_chars(enum_value_device_view input,
@@ -939,6 +935,7 @@ void launch_copy_enum_string_chars(enum_value_device_view input,
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   copy_enum_string_chars_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
     input, lookup, output_offsets, out_chars);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void maybe_check_required_fields(required_field_input_view input,
@@ -970,88 +967,7 @@ void maybe_check_required_fields(required_field_input_view input,
     static_cast<int>(field_indices.size()),
     !decode_ctx.row_force_null->is_empty() ? decode_ctx.row_force_null->data() : nullptr,
     decode_ctx.error->data());
-}
-
-void propagate_invalid_enum_flags_to_rows(rmm::device_uvector<bool> const& item_invalid,
-                                          protobuf_decode_runtime_context decode_ctx,
-                                          protobuf_value_domain_view value_domain,
-                                          rmm::cuda_stream_view stream)
-{
-  auto& row_invalid            = *decode_ctx.row_force_null;
-  auto const num_items         = value_domain.size;
-  auto const top_row_indices   = value_domain.top_row_indices;
-  auto const propagate_to_rows = decode_ctx.propagate_invalid_enum_rows;
-  if (num_items == 0 || row_invalid.size() == 0 || !propagate_to_rows) return;
-
-  auto const scratch_mr = cudf::get_current_device_resource_ref();
-  if (top_row_indices == nullptr) {
-    CUDF_EXPECTS(static_cast<size_t>(num_items) <= row_invalid.size(),
-                 "enum invalid-row propagation exceeded row buffer");
-    thrust::transform(rmm::exec_policy_nosync(stream, scratch_mr),
-                      row_invalid.begin(),
-                      row_invalid.begin() + num_items,
-                      item_invalid.begin(),
-                      row_invalid.begin(),
-                      [] __device__(bool row_is_invalid, bool item_is_invalid) {
-                        return row_is_invalid || item_is_invalid;
-                      });
-    return;
-  }
-
-  // Multiple items may share the same `top_row_indices[idx]` (e.g. several occurrences of a
-  // packed repeated enum within one row), so concurrent threads can race on the same byte.
-  // Although every racing write stores the same value (`true`), non-atomic concurrent writes
-  // to the same address are UB under the CUDA memory model. Use atomic_ref like set_error_once.
-  thrust::for_each(
-    rmm::exec_policy_nosync(stream, scratch_mr),
-    thrust::make_counting_iterator(0),
-    thrust::make_counting_iterator(num_items),
-    [item_invalid = item_invalid.data(),
-     top_row_indices,
-     row_invalid = row_invalid.data()] __device__(int idx) {
-      if (item_invalid[idx]) {
-        cuda::atomic_ref<bool, cuda::thread_scope_device> ref(row_invalid[top_row_indices[idx]]);
-        ref.store(true, cuda::memory_order_relaxed);
-      }
-    });
-}
-
-void validate_enum_and_propagate_rows(rmm::device_uvector<int32_t> const& values,
-                                      rmm::device_uvector<bool>& valid,
-                                      enum_domain_device_view enum_domain,
-                                      protobuf_decode_runtime_context decode_ctx,
-                                      protobuf_value_domain_view value_domain,
-                                      rmm::cuda_stream_view stream)
-{
-  if (value_domain.size == 0 || enum_domain.size == 0) return;
-
-  auto const scratch_mr = cudf::get_current_device_resource_ref();
-  rmm::device_uvector<bool> item_invalid(value_domain.size, stream, scratch_mr);
-  thrust::fill(
-    rmm::exec_policy_nosync(stream, scratch_mr), item_invalid.begin(), item_invalid.end(), false);
-  launch_validate_enum_values(
-    {values.data(), valid.data(), value_domain.size}, item_invalid.data(), enum_domain, stream);
-
-  propagate_invalid_enum_flags_to_rows(item_invalid, decode_ctx, value_domain, stream);
-}
-
-void validate_enum_and_propagate_rows(rmm::device_uvector<int32_t> const& values,
-                                      rmm::device_uvector<bool>& valid,
-                                      cudf::detail::host_vector<int32_t> const& valid_enums,
-                                      protobuf_decode_runtime_context decode_ctx,
-                                      protobuf_value_domain_view value_domain,
-                                      rmm::cuda_stream_view stream)
-{
-  if (value_domain.size == 0 || valid_enums.empty()) return;
-
-  auto const scratch_mr = cudf::get_current_device_resource_ref();
-  auto d_valid_enums    = cudf::detail::make_device_uvector_async(valid_enums, stream, scratch_mr);
-  validate_enum_and_propagate_rows(values,
-                                   valid,
-                                   {d_valid_enums.data(), static_cast<int>(valid_enums.size())},
-                                   decode_ctx,
-                                   value_domain,
-                                   stream);
+  CUDF_CHECK_CUDA(stream.value());
 }
 
 void validate_enum_values(rmm::device_uvector<int32_t> const& values,
