@@ -238,8 +238,8 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
       validateUniqueFieldKey(i, parentIndices[i], fieldNumbers[i], seenFieldNumbers);
       validateWireTypeAndEncoding(i, wireTypes[i], outputTypeIds[i], encodings[i]);
       validateFieldFlags(i, isRepeated[i], isRequired[i], hasDefaultValue[i], outputTypeIds[i]);
-      validateEnumMetadata(
-          i, outputTypeIds[i], encodings[i], enumValidValues[i], enumNames[i]);
+      validateEnumMetadata(i, outputTypeIds[i], encodings[i], hasDefaultValue[i], defaultInts[i],
+          enumValidValues[i], enumNames[i]);
     }
   }
 
@@ -338,10 +338,16 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
   }
 
   private static void validateEnumMetadata(int index, int outputTypeId, int encoding,
+                                            boolean hasDefault, long defaultValue,
                                             int[] validValues, byte[][] names) {
     validateEnumTypeAndEncoding(index, outputTypeId, encoding, validValues);
     validateEnumAsStringMetadata(index, encoding, validValues, names);
     validateEnumValuesAndNamesPairing(index, validValues, names);
+    if (!isNullOrEmpty(validValues) && hasDefault &&
+        Arrays.binarySearch(validValues, (int) defaultValue) < 0) {
+      throw new IllegalArgumentException(
+          "Enum default at index " + index + " must be present in enumValidValues");
+    }
   }
 
   private static void validateEnumTypeAndEncoding(int index, int outputTypeId, int encoding,

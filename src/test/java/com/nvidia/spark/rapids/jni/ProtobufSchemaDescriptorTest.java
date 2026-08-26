@@ -105,6 +105,28 @@ public class ProtobufSchemaDescriptorTest {
   }
 
   @Test
+  void testEnumDefaultMustBeRecognized() {
+    assertDoesNotThrow(() ->
+        new ProtobufSchemaDescriptorBuilder()
+            .addField(1, DType.INT32)
+                .enumValidValues(new int[]{0, 1})
+                .defaultValue(1)
+            .build());
+    assertThrows(IllegalArgumentException.class, () ->
+        new ProtobufSchemaDescriptorBuilder()
+            .addField(1, DType.INT32)
+                .enumValidValues(new int[]{0, 1})
+                .defaultValue(2)
+            .build());
+    assertThrows(IllegalArgumentException.class, () ->
+        new ProtobufSchemaDescriptorBuilder()
+            .addField(1, DType.STRING)
+                .enumMetadata("A", "B")
+                .defaultValue(2)
+            .build());
+  }
+
+  @Test
   void testDuplicateFieldNumbersUnderSameParentRejected() {
     assertThrows(IllegalArgumentException.class, () ->
         new ProtobufSchemaDescriptorBuilder()
@@ -224,7 +246,7 @@ public class ProtobufSchemaDescriptorTest {
         .addField(1, DType.STRING)
             .enumMetadata("A", "B")
             .defaultValue("def".getBytes())
-            .defaultValue(7)  // non-zero numeric default to exercise scalar round-trip
+            .defaultValue(1)  // non-zero numeric default to exercise scalar round-trip
         .build();
 
     ByteArrayOutputStream baos = new ByteArrayOutputStream();

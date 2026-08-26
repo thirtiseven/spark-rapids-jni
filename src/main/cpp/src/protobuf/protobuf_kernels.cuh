@@ -176,14 +176,22 @@ __device__ inline void decode_varint_value(scalar_value_input input,
   uint8_t const* cur     = input.data;
   uint8_t const* cur_end = cur + input.length;
 
-  uint64_t v;
+  using varint_type = std::conditional_t<sizeof(OutputType) == 4, uint32_t, uint64_t>;
+  varint_type v;
   int n;
-  if (!read_varint64(cur, cur_end, v, n)) {
+  bool decoded;
+  if constexpr (sizeof(OutputType) == 4) {
+    decoded = read_varint32(cur, cur_end, v, n);
+  } else {
+    decoded = read_varint64(cur, cur_end, v, n);
+  }
+  if (!decoded) {
     set_error_once(output.error, protobuf_error::VARINT);
     if (output.valid) output.valid[index] = false;
     return;
   }
 
+  // protobuf-java applies ZigZag after width-specific raw-varint decoding.
   if constexpr (ZigZag) { v = (v >> 1) ^ (-(v & 1)); }
   write_varint_value(&output.values[index], v);
   if (output.valid) output.valid[index] = true;
