@@ -1193,8 +1193,8 @@ void maybe_check_required_fields(required_field_input_view input,
   }
   if (!has_required) { return; }
 
-  auto d_is_required = cudf::detail::make_device_uvector_async(
-    h_is_required, stream, cudf::get_current_device_resource_ref());
+  auto const scratch_mr = cudf::get_current_device_resource_ref();
+  auto d_is_required = cudf::detail::make_device_uvector_async(h_is_required, stream, scratch_mr);
 
   auto const blocks =
     static_cast<int>((input.values.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
@@ -1233,8 +1233,8 @@ void validate_enum_values(rmm::device_uvector<int32_t> const& values,
   CUDF_EXPECTS(values.size() == valid.size(), "enum values and validity sizes must match");
   if (values.is_empty() || valid_enums.empty()) return;
 
-  auto d_valid_enums = cudf::detail::make_device_uvector_async(
-    valid_enums, stream, cudf::get_current_device_resource_ref());
+  auto const scratch_mr = cudf::get_current_device_resource_ref();
+  auto d_valid_enums    = cudf::detail::make_device_uvector_async(valid_enums, stream, scratch_mr);
   validate_enum_values(
     values, valid, {d_valid_enums.data(), static_cast<int>(d_valid_enums.size())}, stream);
 }
