@@ -768,16 +768,17 @@ public class ProtobufTest {
   }
 
   @Test
-  void testInvalidUtf8StringIsRepaired() {
+  void testInvalidUtf8SurrogateSequenceIsRepairedAsOneSubsequence() {
+    byte[] invalidUtf8 = new byte[]{(byte) 0xED, (byte) 0xA0, (byte) 0x80};
     Byte[] row = concat(
-        box(tag(1, WT_LEN)), encodeBytes(new byte[]{(byte) 0xFF}),
-        box(tag(2, WT_LEN)), encodeBytes(new byte[]{(byte) 0xFF}));
+        box(tag(1, WT_LEN)), encodeBytes(invalidUtf8),
+        box(tag(2, WT_LEN)), encodeBytes(invalidUtf8));
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expected = ColumnVector.makeStruct(
              ColumnVector.fromStrings("\uFFFD"),
              ColumnVector.fromLists(
                  new ListType(true, new BasicType(true, DType.UINT8)),
-                 Arrays.asList((byte) 0xFF)));
+                 Arrays.asList((byte) 0xED, (byte) 0xA0, (byte) 0x80)));
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
