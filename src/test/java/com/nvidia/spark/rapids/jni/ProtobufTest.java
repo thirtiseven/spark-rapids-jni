@@ -3633,7 +3633,7 @@ public class ProtobufTest {
                  new StructType(true, new BasicType(true, DType.INT32))),
              (StructData) null,
              (StructData) null,
-             struct(struct(2)));
+             (StructData) null);
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0), schema, false)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actual);
