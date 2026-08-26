@@ -338,8 +338,8 @@ enum_string_lookup_tables make_enum_string_lookup_tables(
                "protobuf enum metadata exceeds supported value count");
   CUDF_EXPECTS(valid_enums.size() == enum_name_bytes.size(),
                "protobuf enum values and names must have matching sizes");
-  auto d_valid_enums = cudf::detail::make_device_uvector_async(
-    valid_enums, stream, cudf::get_current_device_resource_ref());
+  auto const scratch_mr = cudf::get_current_device_resource_ref();
+  auto d_valid_enums    = cudf::detail::make_device_uvector_async(valid_enums, stream, scratch_mr);
 
   // Stream-ordered pinned deallocation keeps these staging buffers safe without a local sync.
   auto h_name_offsets =
@@ -362,15 +362,13 @@ enum_string_lookup_tables make_enum_string_lookup_tables(
     }
   }
 
-  auto d_name_offsets = cudf::detail::make_device_uvector_async(
-    h_name_offsets, stream, cudf::get_current_device_resource_ref());
+  auto d_name_offsets = cudf::detail::make_device_uvector_async(h_name_offsets, stream, scratch_mr);
 
   auto d_name_chars = [&]() {
     if (total_name_chars > 0) {
-      return cudf::detail::make_device_uvector_async(
-        h_name_chars, stream, cudf::get_current_device_resource_ref());
+      return cudf::detail::make_device_uvector_async(h_name_chars, stream, scratch_mr);
     }
-    return rmm::device_uvector<uint8_t>(0, stream, cudf::get_current_device_resource_ref());
+    return rmm::device_uvector<uint8_t>(0, stream, scratch_mr);
   }();
 
   return {std::move(d_valid_enums), std::move(d_name_offsets), std::move(d_name_chars)};
@@ -384,7 +382,8 @@ std::unique_ptr<cudf::column> build_enum_string_values_column(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  rmm::device_uvector<int32_t> lengths(num_rows, stream, cudf::get_current_device_resource_ref());
+  auto const scratch_mr = cudf::get_current_device_resource_ref();
+  rmm::device_uvector<int32_t> lengths(num_rows, stream, scratch_mr);
   auto const input = enum_value_device_view{enum_values.data(), valid.data(), num_rows};
   launch_compute_enum_string_lengths(input, lookup.view(), lengths.data(), stream);
 

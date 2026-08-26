@@ -365,15 +365,15 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   // Validate empty schemas through the field scan without rescanning repeated-only schemas.
   bool const run_field_scan = num_scalar > 0 || !run_count_scan;
 
-  auto d_error = cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(
-    1, stream, cudf::get_current_device_resource_ref());
-  auto d_deferred_enum_error = cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(
-    1, stream, cudf::get_current_device_resource_ref());
+  auto d_error =
+    cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(1, stream, scratch_mr);
+  auto d_deferred_enum_error =
+    cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(1, stream, scratch_mr);
   // PERMISSIVE-mode row nulling support for malformed input, root enum mismatches, and missing
   // required fields.
   bool const track_permissive_null_rows = !fail_on_errors;
   rmm::device_uvector<bool> d_row_force_null(
-    track_permissive_null_rows ? num_rows : 0, stream, cudf::get_current_device_resource_ref());
+    track_permissive_null_rows ? num_rows : 0, stream, scratch_mr);
   if (track_permissive_null_rows) {
     CUDF_CUDA_TRY(
       cudaMemsetAsync(d_row_force_null.data(), 0, num_rows * sizeof(bool), stream.value()));
@@ -553,14 +553,13 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
           int si           = scalar_field_indices[li];
           auto const field = schema_context.field(si);
           outputs.emplace_back(num_rows, stream, mr);
-          valid.emplace_back(num_rows, stream, cudf::get_current_device_resource_ref());
+          valid.emplace_back(num_rows, stream, scratch_mr);
           h_descs[j] = {
             li, outputs.back().data(), valid.back().data(), make_scalar_decode_options<T>(field)};
         }
 
         if (num_rows > 0) {
-          auto d_descs = cudf::detail::make_device_uvector_async(
-            h_descs, stream, cudf::get_current_device_resource_ref());
+          auto d_descs = cudf::detail::make_device_uvector_async(h_descs, stream, scratch_mr);
           dim3 grid((num_rows + threads - 1u) / threads, nf);
           auto const batch_input = batched_scalar_input_view<T>{
             input, d_locations.data(), num_scalar, d_descs.data(), nf, d_error.data()};
