@@ -445,7 +445,7 @@ public class ProtobufTest {
 
   @Test
   void testTenByteVarintWithZeroTerminatorMatchesSparkCpu() {
-    // protobuf-java sign-extends after the ninth continuation byte.
+    // Spark's protobuf-java byte-array fast path sign-extends after the ninth continuation byte.
     Byte[] row = concat(
         box(tag(1, WT_VARINT)),
         new Byte[]{(byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80,

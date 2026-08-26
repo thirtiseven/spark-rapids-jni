@@ -53,8 +53,8 @@ __device__ inline bool read_varint64(uint8_t const* cur,
   // A 64-bit value requires at most ceil(64/7) = 10 bytes.
   while (cur < end && bytes < MAX_VARINT_BYTES) {
     uint8_t b = *cur++;
-    // Spark's protobuf-java parser sign-extends after the ninth continuation byte and uses the
-    // tenth byte only to determine whether the varint terminates.
+    // Spark calls DynamicMessage.parseFrom(byte[]), whose protobuf-java array fast path
+    // sign-extends after the ninth continuation byte and uses the tenth only for termination.
     if (bytes == 9) {
       out |= uint64_t{1} << 63;
     } else {
