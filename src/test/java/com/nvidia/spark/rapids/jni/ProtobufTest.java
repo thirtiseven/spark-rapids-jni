@@ -445,7 +445,7 @@ public class ProtobufTest {
 
   @Test
   void testVarintOverEncodedZero() {
-    // protobuf-java sign-extends any terminated 10-byte encoding from the ninth byte.
+    // Spark's protobuf-java byte-array fast path sign-extends after the ninth continuation byte.
     Byte[] row = concat(
         box(tag(1, WT_VARINT)),
         new Byte[]{(byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80,
@@ -494,6 +494,25 @@ public class ProtobufTest {
   // ============================================================================
   // ZigZag Boundary Tests
   // ============================================================================
+
+  @Test
+  void testZigzagInt32UsesRawVarint32Semantics() {
+    Byte[] row = concat(
+        box(tag(1, WT_VARINT)),
+        box(new byte[]{(byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, 0x10}));
+
+    try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
+         ColumnVector expectedInt = ColumnVector.fromBoxedInts(0);
+         ColumnVector expectedStruct = ColumnVector.makeStruct(expectedInt);
+         ColumnVector actualStruct = Protobuf.decodeToStruct(
+             input.getColumn(0),
+             new ProtobufSchemaDescriptorBuilder()
+                 .addField(1, DType.INT32).encoding(Protobuf.ENC_ZIGZAG)
+                 .build(),
+             true)) {
+      AssertUtils.assertStructColumnsAreEqual(expectedStruct, actualStruct);
+    }
+  }
 
   @Test
   void testZigzagInt32Min() {
@@ -787,6 +806,32 @@ public class ProtobufTest {
                  .build(),
              true)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actual);
+    }
+  }
+
+  @Test
+  void testInvalidUtf8SubsequenceBoundariesMatchSparkCpu() {
+    byte[][] invalidUtf8 = new byte[][]{
+        new byte[]{(byte) 0xE2, 0x28, (byte) 0xA1},
+        new byte[]{(byte) 0xE2, (byte) 0x82},
+        new byte[]{(byte) 0xF0, (byte) 0x9F, (byte) 0x92},
+        new byte[]{(byte) 0xF4, (byte) 0x90, (byte) 0x80, (byte) 0x80},
+        new byte[]{(byte) 0xE0, (byte) 0x80, (byte) 0x80}
+    };
+    Byte[][] rows = Arrays.stream(invalidUtf8)
+        .map(bytes -> concat(box(tag(1, WT_LEN)), encodeBytes(bytes)))
+        .toArray(Byte[][]::new);
+
+    try (Table input = new Table.TestBuilder().column(rows).build();
+         ColumnVector expectedValue = ColumnVector.fromStrings(
+             "\uFFFD(\uFFFD", "\uFFFD", "\uFFFD", "\uFFFD\uFFFD\uFFFD\uFFFD",
+             "\uFFFD\uFFFD\uFFFD");
+         ColumnVector expectedStruct = ColumnVector.makeStruct(expectedValue);
+         ColumnVector actualStruct = Protobuf.decodeToStruct(
+             input.getColumn(0),
+             new ProtobufSchemaDescriptorBuilder().addField(1, DType.STRING).build(),
+             true)) {
+      AssertUtils.assertStructColumnsAreEqual(expectedStruct, actualStruct);
     }
   }
 
@@ -4046,6 +4091,7 @@ public class ProtobufTest {
     byte[] p1 = new byte[]{0x03};
     Byte[] inner = concat(
         box(tag(1, WT_LEN)), encodeString("alpha"),
+        box(tag(1, WT_LEN)), encodeBytes(new byte[]{(byte) 0xE2, (byte) 0x82}),
         box(tag(1, WT_LEN)), encodeString("beta"),
         box(tag(2, WT_LEN)), encodeBytes(p0),
         box(tag(2, WT_LEN)), encodeBytes(p1));
@@ -4057,7 +4103,7 @@ public class ProtobufTest {
     try (Table input = new Table.TestBuilder().column(rows).build();
          ColumnVector expectedNames = ColumnVector.fromLists(
              new ListType(true, new BasicType(true, DType.STRING)),
-             Arrays.asList("alpha", "beta"),
+             Arrays.asList("alpha", "\uFFFD", "beta"),
              Collections.emptyList());
          ColumnVector expectedPayloads = ColumnVector.fromLists(
              new ListType(true, new ListType(true, new BasicType(true, DType.UINT8))),
@@ -4871,6 +4917,28 @@ public class ProtobufTest {
                  .addField(1, DType.INT32).repeated().encoding(Protobuf.ENC_ZIGZAG)
                  .build(),
              false)) {
+      AssertUtils.assertStructColumnsAreEqual(expectedStruct, actualStruct);
+    }
+  }
+
+  @Test
+  void testPackedRepeatedSint32UsesRawVarint32Semantics() {
+    Byte[] payload = concat(
+        box(new byte[]{(byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, 0x10}),
+        box(encodeVarint(2L)));
+    Byte[] row = concat(box(tag(1, WT_LEN)), encodeMessage(payload));
+
+    try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
+         ColumnVector expectedValues = ColumnVector.fromLists(
+             new ListType(true, new BasicType(true, DType.INT32)),
+             Arrays.asList(0, 1));
+         ColumnVector expectedStruct = ColumnVector.makeStruct(expectedValues);
+         ColumnVector actualStruct = Protobuf.decodeToStruct(
+             input.getColumn(0),
+             new ProtobufSchemaDescriptorBuilder()
+                 .addField(1, DType.INT32).repeated().encoding(Protobuf.ENC_ZIGZAG)
+                 .build(),
+             true)) {
       AssertUtils.assertStructColumnsAreEqual(expectedStruct, actualStruct);
     }
   }
