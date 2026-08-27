@@ -197,14 +197,22 @@ __device__ inline void decode_varint_value(scalar_value_input input,
   uint8_t const* cur     = input.data;
   uint8_t const* cur_end = cur + input.length;
 
-  uint64_t v;
+  using varint_type = cuda::std::conditional_t<sizeof(OutputType) == 4, uint32_t, uint64_t>;
+  varint_type v;
   int n;
-  if (!read_varint64(cur, cur_end, v, n)) {
+  bool decoded;
+  if constexpr (sizeof(OutputType) == 4) {
+    decoded = read_varint32(cur, cur_end, v, n);
+  } else {
+    decoded = read_varint64(cur, cur_end, v, n);
+  }
+  if (!decoded) {
     set_error_once(output.error, protobuf_error::VARINT);
     if (output.valid) output.valid[index] = false;
     return;
   }
 
+  // protobuf-java applies ZigZag after width-specific raw-varint decoding.
   if constexpr (ZigZag) { v = (v >> 1) ^ (-(v & 1)); }
   write_varint_value(&output.values[index], v);
   if (output.valid) output.valid[index] = true;
@@ -546,6 +554,7 @@ inline std::pair<rmm::device_buffer, cudf::size_type> make_null_mask_from_valid(
     return static_cast<bool>(ptr[i]);
   };
   auto [mask, null_count] = cudf::detail::valid_if(begin, end, pred, stream, mr);
+  // Discarding an all-valid mask keeps the resulting column non-nullable.
   if (null_count == 0) { mask = rmm::device_buffer{}; }
   return {std::move(mask), null_count};
 }
@@ -633,8 +642,7 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
   auto const scratch_mr     = cudf::get_current_device_resource_ref();
   rmm::device_uvector<uint8_t> d_default(0, stream, scratch_mr);
   if (has_default && def_len > 0) {
-    d_default = cudf::detail::make_device_uvector_async(
-      default_bytes, stream, cudf::get_current_device_resource_ref());
+    d_default = cudf::detail::make_device_uvector_async(default_bytes, stream, scratch_mr);
   }
 
   rmm::device_uvector<int32_t> lengths(num_rows, stream, scratch_mr);
