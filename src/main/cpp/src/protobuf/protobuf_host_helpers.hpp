@@ -361,6 +361,24 @@ inline field_occurrence_scan_bundle make_field_occurrence_scan_bundle(
   return {std::move(descriptors), std::move(lookup)};
 }
 
+template <typename LaunchFn>
+inline void for_each_field_occurrence_scan_batch(
+  cudf::detail::host_vector<field_occurrence_scan_desc> const& host_descriptors,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  LaunchFn&& launch)
+{
+  auto constexpr max_batch_size = static_cast<size_t>(MAX_REPEATED_FIELDS_PER_KERNEL);
+  for (size_t begin = 0; begin < host_descriptors.size(); begin += max_batch_size) {
+    auto const batch_size = std::min(max_batch_size, host_descriptors.size() - begin);
+    auto batch =
+      cudf::detail::make_pinned_vector_async<field_occurrence_scan_desc>(batch_size, stream);
+    std::copy_n(host_descriptors.begin() + begin, batch_size, batch.begin());
+    auto scan_bundle = make_field_occurrence_scan_bundle(batch, stream, mr);
+    launch(scan_bundle.view());
+  }
+}
+
 /**
  * Find all child field indices for a given parent index in the schema.
  * This is a commonly used pattern throughout the codebase.

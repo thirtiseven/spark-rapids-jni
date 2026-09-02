@@ -719,12 +719,11 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
     for (auto const ci : merge_positions) {
       message_merge_buffers[ci].emplace(std::move(*merge_bundle.fields[ci]));
     }
-    if (!merge_bundle.scan_descriptors.empty()) {
-      auto scan_bundle =
-        make_field_occurrence_scan_bundle(merge_bundle.scan_descriptors, stream, scratch_mr);
-      launch_scan_all_field_occurrences_in_nested(
-        input, parent, scan_bundle.view(), decode_ctx.error->data(), stream);
-    }
+    for_each_field_occurrence_scan_batch(
+      merge_bundle.scan_descriptors, stream, scratch_mr, [&](field_occurrence_scan_view fields) {
+        launch_scan_all_field_occurrences_in_nested(
+          input, parent, fields, decode_ctx.error->data(), stream);
+      });
   }
 
   auto repeated_work = make_repeated_field_work_bundle(repeated_child_positions,

@@ -2756,6 +2756,48 @@ public class ProtobufTest {
   }
 
   @Test
+  void testMoreThan32DuplicateSingularMessageFields() {
+    int numMessageFields = 33;
+    ProtobufSchemaDescriptorBuilder builder = new ProtobufSchemaDescriptorBuilder();
+    ByteArrayOutputStream row = new ByteArrayOutputStream();
+    try {
+      for (int i = 0; i < numMessageFields; i++) {
+        builder.addField(i + 1, DType.STRUCT).down()
+            .addField(1, DType.INT32)
+            .addField(2, DType.INT32)
+            .up();
+
+        byte[] firstFragment = concatBytes(tag(1, WT_VARINT), encodeVarint(i));
+        byte[] secondFragment = concatBytes(tag(2, WT_VARINT), encodeVarint(i + 100));
+        row.write(tag(i + 1, WT_LEN));
+        row.write(encodeVarint(firstFragment.length));
+        row.write(firstFragment);
+        row.write(tag(i + 1, WT_LEN));
+        row.write(encodeVarint(secondFragment.length));
+        row.write(secondFragment);
+      }
+    } catch (java.io.IOException e) {
+      throw new RuntimeException(e);
+    }
+
+    try (Table input = new Table.TestBuilder().column(new Byte[][]{box(row.toByteArray())}).build();
+         ColumnVector actual = Protobuf.decodeToStruct(input.getColumn(0), builder.build(), true)) {
+      assertEquals(numMessageFields, actual.getNumChildren());
+      for (int i = 0; i < numMessageFields; i++) {
+        try (ColumnVector message = actual.getChildColumnView(i).copyToColumnVector();
+             ColumnVector first = message.getChildColumnView(0).copyToColumnVector();
+             ColumnVector second = message.getChildColumnView(1).copyToColumnVector();
+             HostColumnVector hostFirst = first.copyToHost();
+             HostColumnVector hostSecond = second.copyToHost()) {
+          assertEquals(i, hostFirst.getInt(0), "Unexpected first fragment value at field " + i);
+          assertEquals(i + 100, hostSecond.getInt(0),
+              "Unexpected second fragment value at field " + i);
+        }
+      }
+    }
+  }
+
+  @Test
   void testDuplicateSingularMessageOccurrencesMergeRecursivelyInBothModes() {
     Byte[] childFirst = concat(
         box(tag(1, WT_VARINT)), box(encodeVarint(1)),
@@ -2847,20 +2889,24 @@ public class ProtobufTest {
         box(tag(1, WT_VARINT)), box(encodeVarint(7)),
         box(tag(1, WT_LEN)), encodeMessage(validFirst),
         box(tag(1, WT_LEN)), encodeMessage(validSecond));
+    Byte[] validDuplicates = concat(
+        box(tag(1, WT_LEN)), encodeMessage(validFirst),
+        box(tag(1, WT_LEN)), encodeMessage(validSecond));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
             .addField(1, DType.INT32)
         .up()
         .build();
 
-    try (Table input = new Table.TestBuilder().column(
-             new Byte[][]{malformedFirst, malformedLast, wrongWireBeforeDuplicates}).build();
+    try (Table input = new Table.TestBuilder().column(new Byte[][]{
+             malformedFirst, malformedLast, wrongWireBeforeDuplicates, validDuplicates}).build();
          ColumnVector expected = ColumnVector.fromStructs(
              new StructType(true,
                  new StructType(true, new BasicType(true, DType.INT32))),
              (StructData) null,
              (StructData) null,
-             (StructData) null);
+             (StructData) null,
+             struct(struct(2)));
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0), schema, false)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actual);

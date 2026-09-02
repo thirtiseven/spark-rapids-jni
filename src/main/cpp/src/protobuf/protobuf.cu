@@ -459,11 +459,10 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     for (auto const ni : merge_positions) {
       nested_merge_buffers[ni].emplace(std::move(*merge_bundle.fields[ni]));
     }
-    if (!merge_bundle.scan_descriptors.empty()) {
-      auto scan_bundle =
-        make_field_occurrence_scan_bundle(merge_bundle.scan_descriptors, stream, scratch_mr);
-      launch_scan_singular_message_occurrences(*d_in, scan_bundle.view(), d_error.data(), stream);
-    }
+    for_each_field_occurrence_scan_batch(
+      merge_bundle.scan_descriptors, stream, scratch_mr, [&](field_occurrence_scan_view fields) {
+        launch_scan_singular_message_occurrences(*d_in, fields, d_error.data(), stream);
+      });
   }
 
   // Store decoded columns by schema index for ordered assembly at the end.
