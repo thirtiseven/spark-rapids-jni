@@ -61,7 +61,7 @@ struct invalid_like_pattern_fn {
 void validate_patterns(cudf::strings_column_view const& input,
                        cudf::strings_column_view const& patterns,
                        cudf::string_scalar const& escape_character,
-                       rmm::cuda_stream_view stream)
+                       cuda::stream_ref stream)
 {
   if (input.is_empty()) { return; }
 
@@ -91,7 +91,7 @@ void validate_patterns(cudf::strings_column_view const& input,
 std::unique_ptr<cudf::column> like(cudf::strings_column_view const& input,
                                    cudf::strings_column_view const& patterns,
                                    cudf::string_scalar const& escape_character,
-                                   rmm::cuda_stream_view stream,
+                                   cuda::stream_ref stream,
                                    rmm::device_async_resource_ref mr)
 {
   SRJ_FUNC_RANGE();
