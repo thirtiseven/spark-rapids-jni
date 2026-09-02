@@ -144,6 +144,22 @@ struct repeated_field_work_bundle {
   cudf::detail::host_vector<field_occurrence_scan_desc> scan_descriptors;
 };
 
+// Buffers that gather duplicate singular-message fragments by row before recursive decoding.
+struct singular_message_merge_buffers {
+  int schema_idx;
+  int32_t total_fragments;
+  rmm::device_uvector<int32_t> row_offsets;
+  rmm::device_uvector<field_occurrence> fragments;
+
+  explicit singular_message_merge_buffers(repeated_field_work&& work)
+    : schema_idx(work.schema_idx),
+      total_fragments(work.total_count),
+      row_offsets(std::move(work.offsets)),
+      fragments(std::move(*work.occurrences))
+  {
+  }
+};
+
 struct extract_strided_count {
   field_occurrence_count const* info;
   int field_position;
@@ -511,6 +527,16 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
   nested_parent_view parent,
   std::vector<int> const& child_field_indices,
   recursive_decode_context context,
+  int depth,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
+
+std::unique_ptr<cudf::column> build_merged_singular_struct_column(
+  protobuf_input_view input,
+  message_fragment_source_view source,
+  std::vector<int> const& child_field_indices,
+  recursive_decode_context context,
+  singular_message_merge_buffers buffers,
   int depth,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);

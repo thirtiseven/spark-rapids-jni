@@ -95,6 +95,7 @@ struct field_descriptor {
   int field_number;                    // Protobuf field number
   proto_wire_type expected_wire_type;  // Expected wire type for this field
   bool is_repeated;                    // Repeated children are scanned via count/scan kernels
+  bool is_message;                     // Singular messages may need occurrence merging
   int output_index = -1;               // Matching output column, or -1 when unused
 };
 
@@ -151,6 +152,11 @@ struct protobuf_input_view {
 struct nested_parent_view {
   field_location const* locations;
   std::size_t location_count;
+  int32_t const* top_row_indices;
+};
+
+struct message_fragment_source_view {
+  field_location const* parent_locations;
   int32_t const* top_row_indices;
 };
 
@@ -226,6 +232,13 @@ struct field_scan_view {
   int location_stride;
   field_occurrence_count* repeated_info;
   int repeated_stride;
+  field_occurrence_count* singular_message_info;
+  int singular_message_stride;
+  int* multiple_message_fields;
+  lookup_view<field_descriptor> lookup;
+};
+
+struct message_validation_view {
   lookup_view<field_descriptor> lookup;
 };
 
@@ -238,6 +251,7 @@ static_assert(device_layout_compatible<field_occurrence_scan_desc>);
 static_assert(device_layout_compatible<field_occurrence_scan_view>);
 static_assert(device_layout_compatible<lookup_view<field_descriptor>>);
 static_assert(device_layout_compatible<nested_parent_view>);
+static_assert(device_layout_compatible<message_fragment_source_view>);
 static_assert(device_layout_compatible<protobuf_value_domain_view>);
 static_assert(device_layout_compatible<required_field_input_view>);
 static_assert(device_layout_compatible<scalar_value_input>);
@@ -248,6 +262,7 @@ static_assert(device_layout_compatible<batched_scalar_desc<int32_t>>);
 static_assert(device_layout_compatible<batched_scalar_input_view<int32_t>>);
 static_assert(device_layout_compatible<batched_scalar_desc<double>>);
 static_assert(device_layout_compatible<batched_scalar_input_view<double>>);
+static_assert(device_layout_compatible<message_validation_view>);
 static_assert(device_layout_compatible<enum_domain_device_view>);
 static_assert(device_layout_compatible<enum_string_lookup_device_view>);
 static_assert(device_layout_compatible<field_scan_view>);

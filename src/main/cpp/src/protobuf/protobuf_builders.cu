@@ -22,6 +22,7 @@
 #include <cuda/stream>
 #include <thrust/fill.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -46,7 +47,10 @@ field_descriptor_bundle make_field_descriptors(std::vector<int> const& field_ind
     cudf::detail::make_pinned_vector_async<field_descriptor>(field_indices.size(), stream);
   for (size_t i = 0; i < field_indices.size(); ++i) {
     auto const& field = schema[field_indices[i]];
-    host[i]           = {field.field_number, field.wire_type, field.is_repeated};
+    host[i]           = {field.field_number,
+                         field.wire_type,
+                         field.is_repeated,
+                         field.output_type == cudf::type_id::STRUCT};
     if (!output_indices.empty()) { host[i].output_index = output_indices[i]; }
   }
 
@@ -470,6 +474,140 @@ std::unique_ptr<cudf::column> build_repeated_string_column(cudf::column_view con
 // Nested struct column builder
 // ============================================================================
 
+std::unique_ptr<cudf::column> build_merged_singular_struct_column(
+  protobuf_input_view input,
+  message_fragment_source_view source,
+  std::vector<int> const& child_field_indices,
+  recursive_decode_context context,
+  singular_message_merge_buffers buffers,
+  int depth,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(buffers.total_fragments > 1, "duplicate merge requires multiple fragments");
+  CUDF_EXPECTS(buffers.row_offsets.size() == static_cast<size_t>(input.num_rows) + 1,
+               "fragment offsets size must match row count");
+  CUDF_EXPECTS(buffers.fragments.size() == static_cast<size_t>(buffers.total_fragments),
+               "fragment count mismatch");
+  auto const scratch_mr = cudf::get_current_device_resource_ref();
+
+  auto validation_fields =
+    make_field_descriptors(child_field_indices, context.schema, stream, scratch_mr);
+  auto h_field_lookup = build_field_lookup_table(
+    validation_fields.host.data(), static_cast<int>(validation_fields.host.size()), stream);
+  auto d_field_lookup = cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
+
+  auto invalid_rows =
+    cudf::detail::make_zeroed_device_uvector_async<bool>(input.num_rows, stream, scratch_mr);
+  message_fragment_location_provider fragment_locations{input, source, buffers.fragments.data()};
+  launch_validate_message_fragments(
+    fragment_locations,
+    {{validation_fields.device.data(),
+      static_cast<int>(validation_fields.device.size()),
+      h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
+      static_cast<int>(d_field_lookup.size())}},
+    buffers.total_fragments,
+    invalid_rows.data(),
+    context.runtime.row_force_null->is_empty() ? nullptr : context.runtime.row_force_null->data(),
+    context.runtime.error->data(),
+    stream);
+
+  auto fragment_lengths = thrust::make_transform_iterator(
+    buffers.fragments.begin(),
+    [] __device__(field_occurrence const& fragment) -> int32_t { return fragment.length; });
+  auto fragment_byte_offsets = make_list_offsets_from_counts(fragment_lengths,
+                                                             buffers.total_fragments,
+                                                             "Merged singular message",
+                                                             stream,
+                                                             scratch_mr,
+                                                             scratch_mr);
+  auto const total_bytes     = fragment_byte_offsets.total_count;
+
+  rmm::device_uvector<cudf::size_type> merged_row_offsets(input.num_rows + 1, stream, scratch_mr);
+  thrust::transform(rmm::exec_policy_nosync(stream, scratch_mr),
+                    thrust::make_counting_iterator<int>(0),
+                    thrust::make_counting_iterator<int>(input.num_rows + 1),
+                    merged_row_offsets.begin(),
+                    [row_fragment_offsets = buffers.row_offsets.data(),
+                     fragment_offsets = fragment_byte_offsets.offsets.data()] __device__(int row) {
+                      return fragment_offsets[row_fragment_offsets[row]];
+                    });
+
+  rmm::device_uvector<uint8_t> merged_data(std::max<int32_t>(total_bytes, 1), stream, scratch_mr);
+  if (total_bytes > 0) {
+    auto const* invalid          = invalid_rows.data();
+    auto const* fragments        = buffers.fragments.data();
+    auto const* fragment_offsets = fragment_byte_offsets.offsets.data();
+    auto* output                 = merged_data.data();
+
+    auto src_iter = cudf::detail::make_counting_transform_iterator(
+      0,
+      cuda::proclaim_return_type<void const*>(
+        [message_data = input.message_data, fragment_locations, fragments, invalid] __device__(
+          int idx) -> void const* {
+          if (invalid[fragments[idx].row_idx]) { return nullptr; }
+          int32_t data_offset = 0;
+          auto const location = fragment_locations.get(idx, data_offset);
+          return location.offset < 0 ? nullptr
+                                     : static_cast<void const*>(message_data + data_offset);
+        }));
+    auto dst_iter = cudf::detail::make_counting_transform_iterator(
+      0, cuda::proclaim_return_type<void*>([output, fragment_offsets] __device__(int idx) -> void* {
+        return static_cast<void*>(output + fragment_offsets[idx]);
+      }));
+    auto size_iter = cudf::detail::make_counting_transform_iterator(
+      0, cuda::proclaim_return_type<size_t>([fragments, invalid] __device__(int idx) -> size_t {
+        auto const fragment = fragments[idx];
+        return invalid[fragment.row_idx] ? 0 : static_cast<size_t>(fragment.length);
+      }));
+
+    size_t temp_storage_bytes = 0;
+    CUDF_CUDA_TRY(cub::DeviceMemcpy::Batched(nullptr,
+                                             temp_storage_bytes,
+                                             src_iter,
+                                             dst_iter,
+                                             size_iter,
+                                             buffers.total_fragments,
+                                             stream.get()));
+    rmm::device_buffer temp_storage(temp_storage_bytes, stream, scratch_mr);
+    CUDF_CUDA_TRY(cub::DeviceMemcpy::Batched(temp_storage.data(),
+                                             temp_storage_bytes,
+                                             src_iter,
+                                             dst_iter,
+                                             size_iter,
+                                             buffers.total_fragments,
+                                             stream.get()));
+  }
+
+  rmm::device_uvector<field_location> merged_parent_locations(input.num_rows, stream, scratch_mr);
+  thrust::transform(
+    rmm::exec_policy_nosync(stream, scratch_mr),
+    thrust::make_counting_iterator<int>(0),
+    thrust::make_counting_iterator<int>(input.num_rows),
+    merged_parent_locations.begin(),
+    [row_fragment_offsets = buffers.row_offsets.data(),
+     row_byte_offsets     = merged_row_offsets.data(),
+     invalid              = invalid_rows.data()] __device__(int row) {
+      if (invalid[row] || row_fragment_offsets[row] == row_fragment_offsets[row + 1]) {
+        return field_location{-1, 0};
+      }
+      return field_location{0, row_byte_offsets[row + 1] - row_byte_offsets[row]};
+    });
+
+  return build_nested_struct_column(
+    {merged_data.data(),
+     static_cast<cudf::size_type>(total_bytes),
+     merged_row_offsets.data(),
+     0,
+     input.num_rows},
+    {merged_parent_locations.data(), merged_parent_locations.size(), source.top_row_indices},
+    child_field_indices,
+    context,
+    depth,
+    stream,
+    mr);
+}
+
 /**
  * Build a STRUCT column for a nested protobuf message.
  *
@@ -498,10 +636,16 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
 
   int num_child_fields = static_cast<int>(child_field_indices.size());
   std::vector<int> repeated_child_positions;
+  std::vector<int> singular_message_positions;
   repeated_child_positions.reserve(num_child_fields);
+  singular_message_positions.reserve(num_child_fields);
   for (int i = 0; i < num_child_fields; i++) {
     auto const child_idx = child_field_indices[i];
-    if (schema[child_idx].is_repeated) { repeated_child_positions.push_back(i); }
+    if (schema[child_idx].is_repeated) {
+      repeated_child_positions.push_back(i);
+    } else if (schema[child_idx].output_type == cudf::type_id::STRUCT) {
+      singular_message_positions.push_back(i);
+    }
   }
 
   auto const scratch_mr  = cudf::get_current_device_resource_ref();
@@ -510,19 +654,29 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
   auto const child_location_count = static_cast<size_t>(input.num_rows) * num_child_fields;
   rmm::device_uvector<field_location> d_child_locations(
     std::max(child_location_count, size_t{1}), stream, scratch_mr);
-  rmm::device_uvector<field_occurrence_count> d_repeated_info(
-    repeated_child_positions.empty() ? 0 : child_location_count, stream, scratch_mr);
-  CUDF_EXPECTS(repeated_child_positions.empty() || d_repeated_info.size() == child_location_count,
-               "Protobuf decode internal error: nested repeated count buffer size mismatch");
-  // Repeated counts are collected in the same pass as singleton locations so each nested
-  // message is parsed only once before LIST offsets are built.
+  rmm::device_uvector<field_occurrence_count> d_occurrence_info(
+    repeated_child_positions.empty() && singular_message_positions.empty() ? 0
+                                                                           : child_location_count,
+    stream,
+    scratch_mr);
+  CUDF_EXPECTS((repeated_child_positions.empty() && singular_message_positions.empty()) ||
+                 d_occurrence_info.size() == child_location_count,
+               "Protobuf decode internal error: nested occurrence count buffer size mismatch");
+  auto d_multiple_message_fields = cudf::detail::make_zeroed_device_uvector_async<int>(
+    singular_message_positions.empty() ? 0 : num_child_fields, stream, scratch_mr);
+  auto const occurrence_stride = d_occurrence_info.is_empty() ? 0 : num_child_fields;
+  // Occurrence counts are collected with singleton locations so duplicate-message and LIST
+  // offsets do not require another count pass.
   launch_scan_nested_message_fields(
     input,
     parent,
     {d_child_locations.data(),
      num_child_fields,
-     d_repeated_info.data(),
-     repeated_child_positions.empty() ? 0 : num_child_fields,
+     d_occurrence_info.data(),
+     occurrence_stride,
+     d_occurrence_info.data(),
+     occurrence_stride,
+     d_multiple_message_fields.data(),
      {child_field_descs.device.data(), num_child_fields}},
     decode_ctx.error->data(),
     !decode_ctx.row_force_null->is_empty() ? decode_ctx.row_force_null->data() : nullptr,
@@ -538,9 +692,44 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
                               decode_ctx,
                               stream);
 
+  std::vector<std::optional<singular_message_merge_buffers>> message_merge_buffers(
+    num_child_fields);
+  if (!singular_message_positions.empty()) {
+    auto h_multiple_message_fields =
+      cudf::detail::make_pinned_vector_async<int>(num_child_fields, stream);
+    CUDF_CUDA_TRY(cudf::detail::memcpy_async(h_multiple_message_fields.data(),
+                                             d_multiple_message_fields.data(),
+                                             num_child_fields * sizeof(int),
+                                             stream));
+    stream.sync();
+
+    std::vector<int> merge_positions;
+    for (auto const ci : singular_message_positions) {
+      if (h_multiple_message_fields[ci] != 0) { merge_positions.push_back(ci); }
+    }
+    auto merge_bundle = make_repeated_field_work_bundle(merge_positions,
+                                                        child_field_indices,
+                                                        d_occurrence_info.data(),
+                                                        input.num_rows,
+                                                        schema,
+                                                        "Nested singular message",
+                                                        stream,
+                                                        scratch_mr,
+                                                        scratch_mr);
+    for (auto const ci : merge_positions) {
+      message_merge_buffers[ci].emplace(std::move(*merge_bundle.fields[ci]));
+    }
+    if (!merge_bundle.scan_descriptors.empty()) {
+      auto scan_bundle =
+        make_field_occurrence_scan_bundle(merge_bundle.scan_descriptors, stream, scratch_mr);
+      launch_scan_all_field_occurrences_in_nested(
+        input, parent, scan_bundle.view(), decode_ctx.error->data(), stream);
+    }
+  }
+
   auto repeated_work = make_repeated_field_work_bundle(repeated_child_positions,
                                                        child_field_indices,
-                                                       d_repeated_info.data(),
+                                                       d_occurrence_info.data(),
                                                        input.num_rows,
                                                        schema,
                                                        "Repeated nested-field",
@@ -579,6 +768,18 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
 
     if (dt.id() == cudf::type_id::STRUCT) {
       auto const& gc_indices = schema.children(child_schema_idx);
+      if (message_merge_buffers[ci].has_value()) {
+        struct_children.push_back(
+          build_merged_singular_struct_column(input,
+                                              {parent.locations, parent.top_row_indices},
+                                              gc_indices,
+                                              context,
+                                              std::move(*message_merge_buffers[ci]),
+                                              depth + 1,
+                                              stream,
+                                              mr));
+        continue;
+      }
       rmm::device_uvector<field_location> d_gc_parent_locs(input.num_rows, stream, scratch_mr);
       launch_compute_grandchild_parent_locations(
         loc_provider, d_gc_parent_locs.data(), input.num_rows, decode_ctx.error->data(), stream);

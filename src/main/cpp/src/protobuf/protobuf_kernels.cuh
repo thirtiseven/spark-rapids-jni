@@ -148,6 +148,27 @@ struct nested_repeated_location_provider {
   }
 };
 
+struct message_fragment_location_provider {
+  protobuf_input_view input;
+  message_fragment_source_view source;
+  field_occurrence const* fragments;
+
+  __device__ inline field_location get(int thread_idx, int32_t& data_offset) const
+  {
+    auto const fragment      = fragments[thread_idx];
+    auto const parent_offset = source.parent_locations == nullptr
+                                 ? int32_t{0}
+                                 : source.parent_locations[fragment.row_idx].offset;
+    if (parent_offset < 0) {
+      data_offset = 0;
+      return {-1, 0};
+    }
+    data_offset =
+      input.row_offsets[fragment.row_idx] - input.base_offset + parent_offset + fragment.offset;
+    return {fragment.offset, fragment.length};
+  }
+};
+
 __device__ inline scalar_value_input resolve_scalar_value(uint8_t const* message_data,
                                                           field_location location,
                                                           int32_t data_offset)
@@ -398,6 +419,11 @@ void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
                                        protobuf_error* error_flag,
                                        cuda::stream_ref stream);
 
+void launch_scan_singular_message_occurrences(cudf::column_device_view const& d_in,
+                                              field_occurrence_scan_view fields,
+                                              protobuf_error* error_flag,
+                                              cuda::stream_ref stream);
+
 void launch_extract_strided_locations(field_location const* nested_locations,
                                       int field_idx,
                                       int num_fields,
@@ -417,6 +443,14 @@ void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
                                                  field_occurrence_scan_view fields,
                                                  protobuf_error* error_flag,
                                                  cuda::stream_ref stream);
+
+void launch_validate_message_fragments(message_fragment_location_provider locations,
+                                       message_validation_view fields,
+                                       int num_fragments,
+                                       bool* invalid_rows,
+                                       bool* row_has_invalid_data,
+                                       protobuf_error* error_flag,
+                                       cuda::stream_ref stream);
 
 void launch_compute_grandchild_parent_locations(nested_location_provider loc_provider,
                                                 field_location* gc_parent_locs,

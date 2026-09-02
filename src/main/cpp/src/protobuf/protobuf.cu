@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <string>
@@ -388,6 +389,10 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     std::max<size_t>(static_cast<size_t>(num_rows) * num_repeated, 1), stream, scratch_mr);
   rmm::device_uvector<field_location> d_nested_locations(
     std::max<size_t>(static_cast<size_t>(num_rows) * num_nested, 1), stream, scratch_mr);
+  rmm::device_uvector<field_occurrence_count> d_nested_occurrence_info(
+    std::max<size_t>(static_cast<size_t>(num_rows) * num_nested, 1), stream, scratch_mr);
+  auto d_multiple_nested_fields =
+    cudf::detail::make_zeroed_device_uvector_async<int>(num_nested, stream, scratch_mr);
 
   if (run_count_scan) {
     std::vector<int> count_field_indices = repeated_field_indices;
@@ -418,12 +423,47 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                         num_nested,
                                         d_repeated_info.data(),
                                         num_repeated,
+                                        d_nested_occurrence_info.data(),
+                                        num_nested,
+                                        d_multiple_nested_fields.data(),
                                         descriptor_lookup};
     launch_count_repeated_fields(*d_in,
                                  fields,
                                  d_error.data(),
                                  track_permissive_null_rows ? d_row_force_null.data() : nullptr,
                                  stream);
+  }
+
+  std::vector<std::optional<singular_message_merge_buffers>> nested_merge_buffers(num_nested);
+  if (num_nested > 0) {
+    auto h_multiple_nested_fields = cudf::detail::make_pinned_vector_async<int>(num_nested, stream);
+    CUDF_CUDA_TRY(cudf::detail::memcpy_async(h_multiple_nested_fields.data(),
+                                             d_multiple_nested_fields.data(),
+                                             num_nested * sizeof(int),
+                                             stream));
+    stream.sync();
+
+    std::vector<int> merge_positions;
+    for (int ni = 0; ni < num_nested; ++ni) {
+      if (h_multiple_nested_fields[ni] != 0) { merge_positions.push_back(ni); }
+    }
+    auto merge_bundle = make_repeated_field_work_bundle(merge_positions,
+                                                        nested_field_indices,
+                                                        d_nested_occurrence_info.data(),
+                                                        num_rows,
+                                                        schema_context,
+                                                        "Top-level singular message",
+                                                        stream,
+                                                        scratch_mr,
+                                                        scratch_mr);
+    for (auto const ni : merge_positions) {
+      nested_merge_buffers[ni].emplace(std::move(*merge_bundle.fields[ni]));
+    }
+    if (!merge_bundle.scan_descriptors.empty()) {
+      auto scan_bundle =
+        make_field_occurrence_scan_bundle(merge_bundle.scan_descriptors, stream, scratch_mr);
+      launch_scan_singular_message_occurrences(*d_in, scan_bundle.view(), d_error.data(), stream);
+    }
   }
 
   // Store decoded columns by schema index for ordered assembly at the end.
@@ -446,8 +486,8 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                     num_scalar,
                                     h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
                                     static_cast<int>(h_field_lookup.size())};
-    auto const fields =
-      field_scan_view{d_locations.data(), num_scalar, nullptr, 0, descriptor_lookup};
+    auto const fields = field_scan_view{
+      d_locations.data(), num_scalar, nullptr, 0, nullptr, 0, nullptr, descriptor_lookup};
     launch_scan_all_fields(*d_in,
                            fields,
                            d_error.data(),
@@ -693,20 +733,30 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     int parent_schema_idx           = nested_field_indices[ni];
     auto const& child_field_indices = schema_context.children(parent_schema_idx);
 
-    rmm::device_uvector<field_location> d_parent_locs(num_rows, stream, scratch_mr);
-    launch_extract_strided_locations(
-      d_nested_locations.data(), ni, num_nested, d_parent_locs.data(), num_rows, stream);
-
     // Keep row-force-null tracking for nested required-field failures, but do not let invalid
     // nested enum values null the top-level row.
-    auto nested_col =
-      build_nested_struct_column(input,
-                                 {d_parent_locs.data(), d_parent_locs.size(), nullptr},
-                                 child_field_indices,
-                                 {schema_context, nested_decode_ctx},
-                                 0,
-                                 stream,
-                                 mr);
+    std::unique_ptr<cudf::column> nested_col;
+    if (nested_merge_buffers[ni].has_value()) {
+      nested_col = build_merged_singular_struct_column(input,
+                                                       {nullptr, nullptr},
+                                                       child_field_indices,
+                                                       {schema_context, nested_decode_ctx},
+                                                       std::move(*nested_merge_buffers[ni]),
+                                                       0,
+                                                       stream,
+                                                       mr);
+    } else {
+      rmm::device_uvector<field_location> d_parent_locs(num_rows, stream, scratch_mr);
+      launch_extract_strided_locations(
+        d_nested_locations.data(), ni, num_nested, d_parent_locs.data(), num_rows, stream);
+      nested_col = build_nested_struct_column(input,
+                                              {d_parent_locs.data(), d_parent_locs.size(), nullptr},
+                                              child_field_indices,
+                                              {schema_context, nested_decode_ctx},
+                                              0,
+                                              stream,
+                                              mr);
+    }
     column_map[parent_schema_idx] = std::move(nested_col);
   }
 
