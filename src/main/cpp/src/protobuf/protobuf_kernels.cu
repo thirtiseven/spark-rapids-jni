@@ -22,6 +22,8 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/stream>
+
 #include <type_traits>
 
 namespace spark_rapids_jni::protobuf::detail {
@@ -947,12 +949,10 @@ CUDF_KERNEL void copy_enum_string_chars_kernel(enum_value_device_view input,
 // Host wrapper functions — callable from other translation units
 // ============================================================================
 
-void set_error_once_async(protobuf_error* error_flag,
-                          protobuf_error error,
-                          rmm::cuda_stream_view stream)
+void set_error_once_async(protobuf_error* error_flag, protobuf_error error, cuda::stream_ref stream)
 {
-  set_error_if_unset_kernel<<<1, 1, 0, stream.value()>>>(error_flag, error);
-  CUDF_CHECK_CUDA(stream.value());
+  set_error_if_unset_kernel<<<1, 1, 0, stream.get()>>>(error_flag, error);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_scan_all_fields(cudf::column_device_view const& d_in,
@@ -960,14 +960,14 @@ void launch_scan_all_fields(cudf::column_device_view const& d_in,
                             protobuf_error* error_flag,
                             protobuf_error* deferred_enum_error,
                             bool* row_has_invalid_data,
-                            rmm::cuda_stream_view stream)
+                            cuda::stream_ref stream)
 {
   auto const num_rows = d_in.size();
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  scan_all_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  scan_all_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     d_in, fields, error_flag, deferred_enum_error, row_has_invalid_data);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_count_repeated_fields(cudf::column_device_view const& d_in,
@@ -975,40 +975,40 @@ void launch_count_repeated_fields(cudf::column_device_view const& d_in,
                                   protobuf_error* error_flag,
                                   protobuf_error* deferred_enum_error,
                                   bool* row_has_invalid_data,
-                                  rmm::cuda_stream_view stream)
+                                  cuda::stream_ref stream)
 {
   auto const num_rows = d_in.size();
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  count_repeated_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  count_repeated_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     d_in, fields, error_flag, deferred_enum_error, row_has_invalid_data);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
                                        field_occurrence_scan_view fields,
                                        protobuf_error* error_flag,
-                                       rmm::cuda_stream_view stream)
+                                       cuda::stream_ref stream)
 {
   auto const num_rows = d_in.size();
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     d_in, fields, error_flag);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_scan_singular_message_occurrences(cudf::column_device_view const& d_in,
                                               field_occurrence_scan_view fields,
                                               protobuf_error* error_flag,
-                                              rmm::cuda_stream_view stream)
+                                              cuda::stream_ref stream)
 {
   auto const num_rows = d_in.size();
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     d_in, fields, error_flag);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_extract_strided_locations(field_location const* nested_locations,
@@ -1016,13 +1016,13 @@ void launch_extract_strided_locations(field_location const* nested_locations,
                                       int num_fields,
                                       field_location* parent_locs,
                                       int num_rows,
-                                      rmm::cuda_stream_view stream)
+                                      cuda::stream_ref stream)
 {
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  extract_strided_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  extract_strided_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     nested_locations, field_idx, num_fields, parent_locs, num_rows);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_scan_nested_message_fields(protobuf_input_view input,
@@ -1031,15 +1031,15 @@ void launch_scan_nested_message_fields(protobuf_input_view input,
                                        protobuf_error* error_flag,
                                        bool* row_has_invalid_data,
                                        int recursion_depth,
-                                       rmm::cuda_stream_view stream)
+                                       cuda::stream_ref stream)
 {
   if (input.num_rows == 0) return;
   auto const max_group_depth = PROTOBUF_JAVA_RECURSION_LIMIT - recursion_depth;
   auto const blocks =
     static_cast<int>((input.num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  scan_nested_message_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  scan_nested_message_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     input, parent, fields, error_flag, row_has_invalid_data, max_group_depth);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
@@ -1047,15 +1047,15 @@ void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
                                                  field_occurrence_scan_view fields,
                                                  protobuf_error* error_flag,
                                                  int recursion_depth,
-                                                 rmm::cuda_stream_view stream)
+                                                 cuda::stream_ref stream)
 {
   if (input.num_rows == 0) return;
   auto const max_group_depth = PROTOBUF_JAVA_RECURSION_LIMIT - recursion_depth;
   auto const blocks =
     static_cast<int>((input.num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  scan_all_field_occurrences_in_nested_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  scan_all_field_occurrences_in_nested_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     input, parent, fields, error_flag, max_group_depth);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_validate_message_fragments(message_fragment_location_provider locations,
@@ -1065,13 +1065,13 @@ void launch_validate_message_fragments(message_fragment_location_provider locati
                                        bool* row_has_invalid_data,
                                        protobuf_error* error_flag,
                                        int recursion_depth,
-                                       rmm::cuda_stream_view stream)
+                                       cuda::stream_ref stream)
 {
   if (num_fragments == 0) return;
   auto const max_group_depth = PROTOBUF_JAVA_RECURSION_LIMIT - recursion_depth;
   auto const blocks =
     static_cast<int>((num_fragments + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  validate_message_fragments_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  validate_message_fragments_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     locations,
     fields,
     num_fragments,
@@ -1079,20 +1079,20 @@ void launch_validate_message_fragments(message_fragment_location_provider locati
     row_has_invalid_data,
     error_flag,
     max_group_depth);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_compute_grandchild_parent_locations(nested_location_provider loc_provider,
                                                 field_location* gc_parent_locs,
                                                 int num_rows,
                                                 protobuf_error* error_flag,
-                                                rmm::cuda_stream_view stream)
+                                                cuda::stream_ref stream)
 {
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  compute_grandchild_parent_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  compute_grandchild_parent_locations_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     loc_provider, gc_parent_locs, num_rows, error_flag);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_compute_virtual_parents_for_nested_repeated(protobuf_input_view input,
@@ -1101,7 +1101,7 @@ void launch_compute_virtual_parents_for_nested_repeated(protobuf_input_view inpu
                                                         cudf::size_type* virtual_row_offsets,
                                                         field_location* virtual_parent_locs,
                                                         protobuf_decode_runtime_context decode_ctx,
-                                                        rmm::cuda_stream_view stream)
+                                                        cuda::stream_ref stream)
 {
   if (work.total_count == 0) return;
   auto const blocks =
@@ -1109,14 +1109,14 @@ void launch_compute_virtual_parents_for_nested_repeated(protobuf_input_view inpu
   compute_virtual_parents_for_nested_repeated_kernel<<<blocks,
                                                        THREADS_PER_BLOCK,
                                                        0,
-                                                       stream.value()>>>(work.occurrences->data(),
-                                                                         input.row_offsets,
-                                                                         parent.locations,
-                                                                         virtual_row_offsets,
-                                                                         virtual_parent_locs,
-                                                                         work.total_count,
-                                                                         decode_ctx.error->data());
-  CUDF_CHECK_CUDA(stream.value());
+                                                       stream.get()>>>(work.occurrences->data(),
+                                                                       input.row_offsets,
+                                                                       parent.locations,
+                                                                       virtual_row_offsets,
+                                                                       virtual_parent_locs,
+                                                                       work.total_count,
+                                                                       decode_ctx.error->data());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_compute_msg_locations_from_occurrences(protobuf_input_view input,
@@ -1124,12 +1124,12 @@ void launch_compute_msg_locations_from_occurrences(protobuf_input_view input,
                                                    field_location* msg_locs,
                                                    cudf::size_type* msg_row_offsets,
                                                    protobuf_decode_runtime_context decode_ctx,
-                                                   rmm::cuda_stream_view stream)
+                                                   cuda::stream_ref stream)
 {
   if (work.total_count == 0) return;
   auto const blocks =
     static_cast<int>((work.total_count + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  compute_msg_locations_from_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  compute_msg_locations_from_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     work.occurrences->data(),
     input.row_offsets,
     input.base_offset,
@@ -1137,49 +1137,49 @@ void launch_compute_msg_locations_from_occurrences(protobuf_input_view input,
     msg_row_offsets,
     work.total_count,
     decode_ctx.error->data());
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_validate_enum_values(enum_value_device_view input,
                                  enum_domain_device_view domain,
-                                 rmm::cuda_stream_view stream)
+                                 cuda::stream_ref stream)
 {
   if (input.size == 0) return;
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  validate_enum_values_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(input, domain);
-  CUDF_CHECK_CUDA(stream.value());
+  validate_enum_values_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(input, domain);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_compute_enum_string_lengths(enum_value_device_view input,
                                         enum_string_lookup_device_view lookup,
                                         int32_t* lengths,
-                                        rmm::cuda_stream_view stream)
+                                        cuda::stream_ref stream)
 {
   if (input.size == 0) return;
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  compute_enum_string_lengths_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  compute_enum_string_lengths_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     input, lookup, lengths);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void launch_copy_enum_string_chars(enum_value_device_view input,
                                    enum_string_lookup_device_view lookup,
                                    int32_t const* output_offsets,
                                    char* out_chars,
-                                   rmm::cuda_stream_view stream)
+                                   cuda::stream_ref stream)
 {
   if (input.size == 0) return;
   auto const blocks = static_cast<int>((input.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  copy_enum_string_chars_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  copy_enum_string_chars_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     input, lookup, output_offsets, out_chars);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void maybe_check_required_fields(required_field_input_view input,
                                  std::vector<int> const& field_indices,
                                  std::vector<nested_field_descriptor> const& schema,
                                  protobuf_decode_runtime_context decode_ctx,
-                                 rmm::cuda_stream_view stream)
+                                 cuda::stream_ref stream)
 {
   if (input.values.size == 0 || field_indices.empty()) { return; }
 
@@ -1202,19 +1202,19 @@ void maybe_check_required_fields(required_field_input_view input,
     decode_ctx.row_force_null != nullptr && !decode_ctx.row_force_null->is_empty()
       ? decode_ctx.row_force_null->data()
       : nullptr;
-  check_required_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.value()>>>(
+  check_required_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     input,
     d_is_required.data(),
     static_cast<int>(field_indices.size()),
     row_force_null,
     decode_ctx.error->data());
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void validate_enum_values(rmm::device_uvector<int32_t> const& values,
                           rmm::device_uvector<bool>& valid,
                           enum_domain_device_view enum_domain,
-                          rmm::cuda_stream_view stream)
+                          cuda::stream_ref stream)
 {
   CUDF_EXPECTS(values.size() == valid.size(), "enum values and validity sizes must match");
   if (values.is_empty() || enum_domain.size == 0) return;
@@ -1228,7 +1228,7 @@ void validate_enum_values(rmm::device_uvector<int32_t> const& values,
 void validate_enum_values(rmm::device_uvector<int32_t> const& values,
                           rmm::device_uvector<bool>& valid,
                           cudf::detail::host_vector<int32_t> const& valid_enums,
-                          rmm::cuda_stream_view stream)
+                          cuda::stream_ref stream)
 {
   CUDF_EXPECTS(values.size() == valid.size(), "enum values and validity sizes must match");
   if (values.is_empty() || valid_enums.empty()) return;

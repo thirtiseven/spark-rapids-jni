@@ -27,6 +27,7 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/stream>
 #include <thrust/fill.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
@@ -141,8 +142,8 @@ void encode_packed_repeated_int32(std::vector<uint8_t>& buf,
 
 std::unique_ptr<cudf::column> make_binary_column(std::vector<std::vector<uint8_t>> const& messages)
 {
-  auto stream = cudf::get_default_stream();
-  auto mr     = cudf::get_current_device_resource_ref();
+  cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                 = cudf::get_current_device_resource_ref();
 
   std::vector<int32_t> h_offsets(messages.size() + 1);
   h_offsets[0] = 0;
@@ -159,7 +160,7 @@ std::unique_ptr<cudf::column> make_binary_column(std::vector<std::vector<uint8_t
 
   rmm::device_buffer d_data(h_data.data(), h_data.size(), stream, mr);
   rmm::device_buffer d_offsets(h_offsets.data(), h_offsets.size() * sizeof(int32_t), stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   auto child_col = std::make_unique<cudf::column>(
     cudf::data_type{cudf::type_id::UINT8}, total_bytes, std::move(d_data), rmm::device_buffer{}, 0);
@@ -204,7 +205,7 @@ void initialize_context_metadata(protobuf::protobuf_decode_context& context)
   context.default_bools.resize(size, false);
   context.default_strings.reserve(size);
   context.enum_valid_values.reserve(size);
-  auto const stream = cudf::get_default_stream();
+  cuda::stream_ref const stream = cudf::get_default_stream();
   for (size_t i = 0; i < size; ++i) {
     context.default_strings.emplace_back(
       cudf::detail::make_pinned_vector_async<uint8_t>(0, stream));
@@ -856,7 +857,7 @@ struct RepeatedChildStringOnlyCase {
 template <typename T>
 void copy_to_device(rmm::device_uvector<T>& destination,
                     std::vector<T> const& source,
-                    rmm::cuda_stream_view stream)
+                    cuda::stream_ref stream)
 {
   CUDF_EXPECTS(destination.size() == source.size(), "benchmark H2D size mismatch");
   if (!source.empty()) {
@@ -872,7 +873,7 @@ struct repeated_child_count_scan_work {
 
   repeated_child_count_scan_work(int num_rows,
                                  int32_t count,
-                                 rmm::cuda_stream_view stream,
+                                 cuda::stream_ref stream,
                                  rmm::device_async_resource_ref mr)
     : total_count(count), offsets(num_rows + 1, stream, mr), occurrences(count, stream, mr)
   {
@@ -886,7 +887,7 @@ struct repeated_child_build_work {
 
   repeated_child_build_work(int num_rows,
                             int32_t count,
-                            rmm::cuda_stream_view stream,
+                            cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)
     : total_count(count), counts(num_rows, stream, mr), occurrences(count, stream, mr)
   {
@@ -996,8 +997,8 @@ static void BM_protobuf_flat_scalars(nvbench::state& state)
   for (auto const& m : messages)
     total_bytes += m.size();
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
@@ -1031,8 +1032,8 @@ static void BM_protobuf_nested(nvbench::state& state)
   for (auto const& m : messages)
     total_bytes += m.size();
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
@@ -1066,8 +1067,8 @@ static void BM_protobuf_repeated(nvbench::state& state)
   for (auto const& m : messages)
     total_bytes += m.size();
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
@@ -1102,8 +1103,8 @@ static void BM_protobuf_wide_repeated_message(nvbench::state& state)
   for (auto const& m : messages)
     total_bytes += m.size();
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
@@ -1142,8 +1143,8 @@ static void BM_protobuf_repeated_child_lists(nvbench::state& state)
   for (auto const& m : messages)
     total_bytes += m.size();
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
@@ -1181,8 +1182,8 @@ static void BM_protobuf_repeated_message_nesting(nvbench::state& state)
     total_bytes += message.size();
   }
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       input->view(), context, stream, cudf::get_current_device_resource_ref());
@@ -1217,8 +1218,8 @@ static void BM_protobuf_singular_message_merge(nvbench::state& state)
     total_bytes += message.size();
   }
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       input->view(), ctx, stream, cudf::get_current_device_resource_ref());
@@ -1249,8 +1250,8 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
   auto binary_col = make_binary_column(data.messages);
   auto context    = string_case.build_context();
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = cudf::get_current_device_resource_ref();
+  cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                 = cudf::get_current_device_resource_ref();
 
   cudf::lists_column_view input_list(binary_col->view());
   auto const* row_offsets      = input_list.offsets().data<cudf::size_type>();
@@ -1293,7 +1294,7 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
   }
   auto occurrence_scan =
     protobuf_detail::make_field_occurrence_scan_bundle(host_scan_descriptors, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   protobuf_detail::protobuf_input_view input{
     message_data, message_data_size, row_offsets, 0, num_rows};
@@ -1314,7 +1315,7 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
     total_bytes += message.size();
   }
 
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     protobuf_detail::launch_scan_nested_message_fields(
       input, parent, field_scan, error.data(), nullptr, 1, stream);
@@ -1367,8 +1368,8 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
   auto binary_col = make_binary_column(data.messages);
   auto context    = string_case.build_context();
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = cudf::get_current_device_resource_ref();
+  cuda::stream_ref stream = cudf::get_default_stream();
+  auto mr                 = cudf::get_current_device_resource_ref();
 
   cudf::lists_column_view input_list(binary_col->view());
   auto const* row_offsets  = input_list.offsets().data<cudf::size_type>();
@@ -1389,14 +1390,14 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
   }
 
   protobuf_detail::protobuf_schema schema{context};
-  stream.synchronize();
+  stream.sync();
 
   size_t total_bytes = 0;
   for (auto const& message : data.messages) {
     total_bytes += message.size();
   }
 
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     std::vector<std::unique_ptr<cudf::column>> results;
     results.reserve(num_repeated_children);
@@ -1465,8 +1466,8 @@ static void BM_protobuf_many_repeated(nvbench::state& state)
   for (auto const& m : messages)
     total_bytes += m.size();
 
-  auto stream = cudf::get_default_stream();
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  cuda::stream_ref stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
       binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());

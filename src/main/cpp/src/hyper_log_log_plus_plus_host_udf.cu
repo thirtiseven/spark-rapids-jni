@@ -22,6 +22,8 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cuda/stream>
+
 namespace spark_rapids_jni {
 
 namespace {

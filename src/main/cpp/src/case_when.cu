@@ -22,6 +22,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <cuda/stream>
 #include <thrust/transform.h>
 
 namespace spark_rapids_jni {
@@ -67,7 +68,7 @@ struct select_first_true_fn {
 }  // anonymous namespace
 
 std::unique_ptr<cudf::column> select_first_true_index(cudf::table_view const& when_bool_columns,
-                                                      rmm::cuda_stream_view stream,
+                                                      cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr)
 {
   // checks
@@ -95,7 +96,7 @@ std::unique_ptr<cudf::column> select_first_true_index(cudf::table_view const& wh
 }  // namespace detail
 
 std::unique_ptr<cudf::column> select_first_true_index(cudf::table_view const& when_bool_columns,
-                                                      rmm::cuda_stream_view stream,
+                                                      cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr)
 {
   return detail::select_first_true_index(when_bool_columns, stream, mr);

@@ -21,7 +21,7 @@
 
 #include <rmm/resource_ref.hpp>
 
-#include <cuda/stream_ref>
+#include <cuda/stream>
 
 #include <hash/hash.hpp>
 
