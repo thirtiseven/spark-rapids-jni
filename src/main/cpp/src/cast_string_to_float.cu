@@ -34,6 +34,7 @@
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
 #include <cuda/std/utility>
+#include <cuda/stream>
 
 using namespace cudf;
 
@@ -192,7 +193,7 @@ __device__ __inline__ double assemble_ieee754_double(uint64_t mantissa, int unbi
  * @brief Correctly-rounded conversion of `digits * 10^q` to a double for the
  *        case where `digits` exceeds the safe-cast range of double (2^53) and
  *        the existing `static_cast<double>(digits) * exp10(q)` path therefore
- *        loses up to 1 ULP. See NVIDIA/spark-rapids#10773.
+ *        loses up to 1 ULP. See NVIDIA/cudf-spark#10773.
  *
  *        Caller precondition: `digits > 2^53 AND |q| <= 19`. The caller (the
  *        high-precision-path gate inside `string_to_float::operator()`) guards
@@ -393,7 +394,7 @@ class string_to_float {
       // Two output paths:
       //  - High-precision helper for the `digits > 2^53 AND |q| <= 19` window
       //    (T == double only), where the default `static_cast<double>(digits)
-      //    * exp10(exp_ten)` path loses up to 1 ULP (NVIDIA/spark-rapids#10773).
+      //    * exp10(exp_ten)` path loses up to 1 ULP (NVIDIA/cudf-spark#10773).
       //  - Default path for everything else: float outputs, or doubles outside
       //    the helper window (small digits or large |q|).
       bool const helper_eligible = cuda::std::is_same_v<T, double> && (digits > (1ULL << 53)) &&
@@ -886,7 +887,7 @@ CUDF_KERNEL void string_to_float_kernel(T* out,
 std::unique_ptr<column> string_to_float(data_type dtype,
                                         strings_column_view const& string_col,
                                         bool ansi_mode,
-                                        rmm::cuda_stream_view stream,
+                                        cuda::stream_ref stream,
                                         rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(dtype == data_type{type_id::FLOAT32} || dtype == data_type{type_id::FLOAT64},
@@ -941,8 +942,8 @@ std::unique_ptr<column> string_to_float(data_type dtype,
                       &string_col.offsets().data<size_type>()[error_row],
                       sizeof(size_type) * 2,
                       cudaMemcpyDefault,
-                      stream.value());
-      stream.synchronize();
+                      stream.get());
+      stream.sync();
 
       std::string dest;
       dest.resize(string_bounds[1] - string_bounds[0]);
@@ -951,8 +952,8 @@ std::unique_ptr<column> string_to_float(data_type dtype,
                       &string_col.chars_begin(stream)[string_bounds[0]],
                       string_bounds[1] - string_bounds[0],
                       cudaMemcpyDefault,
-                      stream.value());
-      stream.synchronize();
+                      stream.get());
+      stream.sync();
 
       throw cast_error(error_row, dest);
     }

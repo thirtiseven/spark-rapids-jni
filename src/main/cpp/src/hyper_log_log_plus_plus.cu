@@ -39,6 +39,7 @@
 #include <cuda/atomic>
 #include <cuda/std/__algorithm/min.h>  // TODO #include <cuda/std/algorithm> once available
 #include <cuda/std/bit>
+#include <cuda/stream>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 

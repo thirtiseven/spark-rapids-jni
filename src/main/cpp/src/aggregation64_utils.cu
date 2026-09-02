@@ -24,6 +24,7 @@
 #include <rmm/exec_policy.hpp>
 
 #include <cuda/functional>
+#include <cuda/stream>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
 
@@ -75,7 +76,7 @@ namespace spark_rapids_jni {
 std::unique_ptr<cudf::column> extract_chunk32_from_64bit(cudf::column_view const& in_col,
                                                          cudf::data_type type,
                                                          int chunk_idx,
-                                                         rmm::cuda_stream_view stream,
+                                                         cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(
@@ -112,7 +113,7 @@ std::unique_ptr<cudf::column> extract_chunk32_from_64bit(cudf::column_view const
 // Reassemble a column of 64-bit values from two 64-bit integer columns with overflow detection.
 std::unique_ptr<cudf::table> assemble64_from_sum(cudf::table_view const& chunks_table,
                                                  cudf::data_type output_type,
-                                                 rmm::cuda_stream_view stream,
+                                                 cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(

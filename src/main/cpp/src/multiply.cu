@@ -29,6 +29,7 @@
 
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
+#include <cuda/stream>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -181,7 +182,7 @@ std::unique_ptr<cudf::column> multiply_impl(cudf::data_type type,
                                             RIGHT_ACCESSOR right_accessor,
                                             bool check_overflow,
                                             bool both_inputs_valid,
-                                            rmm::cuda_stream_view stream,
+                                            cuda::stream_ref stream,
                                             rmm::device_async_resource_ref mr)
 {
   auto result =
@@ -239,7 +240,7 @@ struct dispatch_multiply {
   std::unique_ptr<cudf::column> operator()(cudf::data_type type,
                                            cudf::size_type num_rows,
                                            bool check_overflow,
-                                           rmm::cuda_stream_view stream,
+                                           cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const
   {
     if (left_cv != nullptr && right_cv != nullptr) {
@@ -307,7 +308,7 @@ struct dispatch_multiply {
   std::unique_ptr<cudf::column> operator()(cudf::data_type type,
                                            cudf::size_type num_rows,
                                            bool check_overflow,
-                                           rmm::cuda_stream_view stream,
+                                           cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const
   {
     CUDF_FAIL("Unsupported type when multiply.");
@@ -320,7 +321,7 @@ std::unique_ptr<cudf::column> multiply(cudf::column_view const& left_cv,
                                        cudf::column_view const& right_cv,
                                        bool is_ansi_mode,
                                        bool is_try_mode,
-                                       rmm::cuda_stream_view stream,
+                                       cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
 {
   check_multiply_inputs(
@@ -344,7 +345,7 @@ std::unique_ptr<cudf::column> multiply(cudf::column_view const& left_cv,
                                        cudf::scalar const& right_scalar,
                                        bool is_ansi_mode,
                                        bool is_try_mode,
-                                       rmm::cuda_stream_view stream,
+                                       cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
 {
   check_multiply_inputs(
@@ -368,7 +369,7 @@ std::unique_ptr<cudf::column> multiply(cudf::scalar const& left_scalar,
                                        cudf::column_view const& right_cv,
                                        bool is_ansi_mode,
                                        bool is_try_mode,
-                                       rmm::cuda_stream_view stream,
+                                       cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
 {
   check_multiply_inputs(left_scalar.type(),

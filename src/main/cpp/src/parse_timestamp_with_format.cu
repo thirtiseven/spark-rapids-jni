@@ -31,12 +31,12 @@
 #include <cudf/utilities/span.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
 #include <cuda/atomic>
+#include <cuda/stream>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -161,7 +161,7 @@ struct format_token {
 //   - "Packed" runs (a digit field abutting another digit field without a literal between them,
 //     e.g. yyyyMMdd) get exact width — otherwise the boundary is ambiguous.
 //   - Otherwise CORRECTED uses exact width and LEGACY uses [1, 2].
-//   - CORRECTED `yyyy/MM/dd` keeps the existing spark-rapids compatibility contract and accepts
+//   - CORRECTED `yyyy/MM/dd` keeps the existing cudf-spark compatibility contract and accepts
 //     1-2 digit month/day fields. This intentionally DEVIATES from Spark CPU, whose STRICT
 //     DateTimeFormatter rejects single-digit fields ("2024/5/6" is null on CPU); the GPU
 //     over-accepts. Pinned by parseTimestampWithFormat_correctedSlashDateDeviation.
@@ -361,7 +361,7 @@ std::unique_ptr<cudf::column> parse_timestamp_strings_with_format(
   std::string const& format,
   bool legacy,
   bool exception_policy,
-  rmm::cuda_stream_view stream,
+  cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   SRJ_FUNC_RANGE();
