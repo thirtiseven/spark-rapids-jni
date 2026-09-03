@@ -223,6 +223,8 @@ CUDF_KERNEL void scan_all_fields_kernel(cudf::column_device_view const d_in,
     auto const& descriptor = fields.lookup.data[f];
     bool recognized;
     auto const* value_start = msg_base + location.offset;
+    // protobuf-java retains unknown closed-enum values in UnknownFieldSet, and Spark rejects them
+    // at the root even if a later recognized occurrence becomes the field's last value.
     if (!is_recognized_enum_value(
           descriptor, value_start, value_start + location.length, error_flag, recognized)) {
       return false;
@@ -496,6 +498,8 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
     auto count_action = [&](int32_t offset, int32_t length) {
       bool recognized;
       auto const* value_start = msg_base + offset;
+      // Spark applies the same root UnknownFieldSet check to repeated enums; nested unknown values
+      // are instead pruned by the builders.
       if (!is_recognized_enum_value(
             field, value_start, value_start + length, error_flag, recognized)) {
         return false;
