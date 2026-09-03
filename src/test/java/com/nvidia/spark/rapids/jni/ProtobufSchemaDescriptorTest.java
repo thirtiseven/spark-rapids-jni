@@ -271,7 +271,7 @@ public class ProtobufSchemaDescriptorTest {
         .addField(1, DType.STRING)
             .enumMetadata("A", "B")
             .defaultValue(1)
-        .addField(2, DType.STRING).defaultValue("def".getBytes())
+        .addField(2, DType.STRING).defaultValue("def")
         .addField(3, DType.INT32).defaultValue(7)
         .build();
 

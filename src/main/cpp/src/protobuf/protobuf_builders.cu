@@ -490,9 +490,9 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
       auto src_iter = cudf::detail::make_counting_transform_iterator(
         0,
         cuda::proclaim_return_type<void const*>(
-          [message_data, copy_provider] __device__(int idx) -> void const* {
+          [message_data, loc_provider] __device__(int idx) -> void const* {
             int32_t data_offset = 0;
-            auto loc            = copy_provider.get(idx, data_offset);
+            auto loc            = loc_provider.get(idx, data_offset);
             if (loc.offset < 0) return nullptr;
             return static_cast<void const*>(message_data + data_offset);
           }));
@@ -502,9 +502,9 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
           return static_cast<void*>(chars_ptr + offsets_data[idx]);
         }));
       auto size_iter = cudf::detail::make_counting_transform_iterator(
-        0, cuda::proclaim_return_type<size_t>([copy_provider] __device__(int idx) -> size_t {
+        0, cuda::proclaim_return_type<size_t>([loc_provider] __device__(int idx) -> size_t {
           int32_t data_offset = 0;
-          auto loc            = copy_provider.get(idx, data_offset);
+          auto loc            = loc_provider.get(idx, data_offset);
           if (loc.offset < 0) return 0;
           return static_cast<size_t>(loc.length);
         }));
@@ -748,14 +748,15 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
   launch_scan_nested_message_fields(
     input,
     parent,
-    {d_child_locations.data(),
-     num_child_fields,
-     d_occurrence_info.data(),
-     occurrence_stride,
-     d_occurrence_info.data(),
-     occurrence_stride,
-     d_multiple_message_fields.data(),
-     {d_child_field_descs.data(), num_child_fields, nullptr, 0}},
+    field_scan_view{
+      .locations               = {.data = d_child_locations.data(), .stride = num_child_fields},
+      .repeated_info           = {.data = d_occurrence_info.data(), .stride = occurrence_stride},
+      .singular_message_info   = {.data = d_occurrence_info.data(), .stride = occurrence_stride},
+      .multiple_message_fields = d_multiple_message_fields.data(),
+      .lookup                  = {.data        = d_child_field_descs.data(),
+                                  .size        = num_child_fields,
+                                  .direct      = nullptr,
+                                  .direct_size = 0}},
     decode_ctx.error->data(),
     !decode_ctx.row_force_null->is_empty() ? decode_ctx.row_force_null->data() : nullptr,
     depth + 1,
