@@ -77,14 +77,16 @@ field_descriptor_bundle make_field_descriptors(std::vector<int> const& field_ind
   }
 
   auto h_enum_values = cudf::detail::make_pinned_vector_async<int32_t>(enum_offsets.back(), stream);
+  rmm::device_uvector<int32_t> d_enum_values(enum_offsets.back(), stream, mr);
   for (size_t i = 0; i < field_indices.size(); ++i) {
     auto const& values = schema.field(field_indices[i]).enum_valid_values;
     std::copy(values.begin(), values.end(), h_enum_values.begin() + enum_offsets[i]);
-  }
-  auto d_enum_values = cudf::detail::make_device_uvector_async(h_enum_values, stream, mr);
-  for (size_t i = 0; i < h_descriptors.size(); ++i) {
     h_descriptors[i].valid_enum_values =
       h_descriptors[i].num_valid_enum_values > 0 ? d_enum_values.data() + enum_offsets[i] : nullptr;
+  }
+  if (!h_enum_values.empty()) {
+    CUDF_CUDA_TRY(cudf::detail::memcpy_async(
+      d_enum_values.data(), h_enum_values.data(), h_enum_values.size() * sizeof(int32_t), stream));
   }
 
   auto d_descriptors = cudf::detail::make_device_uvector_async(h_descriptors, stream, mr);

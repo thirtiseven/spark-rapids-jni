@@ -523,18 +523,16 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   if (run_field_scan) {
     auto field_descs =
       make_field_descriptors(scalar_field_indices, schema_context, stream, scratch_mr);
-    auto const& h_field_descs = field_descs.host;
-    auto const& d_field_descs = field_descs.device;
 
     rmm::device_uvector<field_location> d_locations(
       static_cast<size_t>(num_rows) * num_scalar, stream, scratch_mr);
 
-    auto h_field_lookup = build_field_lookup_table(h_field_descs.data(), num_scalar, stream);
+    auto h_field_lookup = build_field_lookup_table(field_descs.host.data(), num_scalar, stream);
     auto d_field_lookup =
       cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
 
     auto const descriptor_lookup =
-      lookup_view<field_descriptor>{d_field_descs.data(),
+      lookup_view<field_descriptor>{field_descs.device.data(),
                                     num_scalar,
                                     h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
                                     static_cast<int>(h_field_lookup.size())};

@@ -365,7 +365,7 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
   auto const row      = fragment.row_idx;
   auto const top_row =
     locations.parent.top_row_indices == nullptr ? row : locations.parent.top_row_indices[row];
-  // Each top-level row is owned by exactly one thread in this kernel.
+  // Multiple fragments may map back to the same parent or top-level row.
   auto mark_row_error = [&]() {
     set_true_atomically(invalid_rows, row);
     set_true_atomically(row_has_invalid_data, top_row);
@@ -440,6 +440,7 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
   cudf::lists_column_device_view in{d_in};
   if (row >= in.size()) return;
+  // Each top-level row is owned by exactly one thread in this kernel.
   auto mark_row_error = [&]() {
     if (row_has_invalid_data != nullptr) { row_has_invalid_data[row] = true; }
   };
@@ -831,6 +832,7 @@ CUDF_KERNEL void check_required_fields_kernel(
         auto const top_row = input.values.top_row_indices != nullptr
                                ? input.values.top_row_indices[row]
                                : static_cast<int32_t>(row);
+        // Nested value rows may converge on the same top-level row.
         set_true_atomically(row_force_null, top_row);
       }
       // Required field is missing - set error flag
