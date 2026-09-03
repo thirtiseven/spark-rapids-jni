@@ -24,7 +24,7 @@
 
 namespace spark_rapids_jni::protobuf::detail {
 
-// Protobuf varint encoding uses at most 10 bytes to represent a 64-bit value.
+// Protobuf varints store 7 value bits per byte, so ceil(64 / 7) = 10 bytes.
 constexpr int MAX_VARINT_BYTES = 10;
 
 // Match protobuf-java's shared embedded-message/group recursion limit.
@@ -162,11 +162,6 @@ struct nested_parent_view {
   int32_t const* top_row_indices;
 };
 
-struct message_fragment_source_view {
-  field_location const* parent_locations;
-  int32_t const* top_row_indices;
-};
-
 struct protobuf_value_domain_view {
   int size;
   int32_t const* top_row_indices;
@@ -234,13 +229,21 @@ struct enum_string_lookup_device_view {
   uint8_t const* name_chars;
 };
 
+template <typename T>
+struct row_strided_view {
+  T* data;
+  int stride;
+
+  __device__ T* row_start(cudf::size_type row) const
+  {
+    return stride > 0 ? data + static_cast<std::size_t>(row) * stride : nullptr;
+  }
+};
+
 struct field_scan_view {
-  field_location* locations;
-  int location_stride;
-  field_occurrence_count* repeated_info;
-  int repeated_stride;
-  field_occurrence_count* singular_message_info;
-  int singular_message_stride;
+  row_strided_view<field_location> locations;
+  row_strided_view<field_occurrence_count> repeated_info;
+  row_strided_view<field_occurrence_count> singular_message_info;
   int* multiple_message_fields;
   lookup_view<field_descriptor> lookup;
 };
@@ -258,11 +261,11 @@ static_assert(device_layout_compatible<field_occurrence_scan_desc>);
 static_assert(device_layout_compatible<field_occurrence_scan_view>);
 static_assert(device_layout_compatible<lookup_view<field_descriptor>>);
 static_assert(device_layout_compatible<nested_parent_view>);
-static_assert(device_layout_compatible<message_fragment_source_view>);
 static_assert(device_layout_compatible<protobuf_value_domain_view>);
 static_assert(device_layout_compatible<required_field_input_view>);
 static_assert(device_layout_compatible<scalar_value_input>);
 static_assert(device_layout_compatible<enum_value_device_view>);
+static_assert(device_layout_compatible<row_strided_view<field_location>>);
 static_assert(device_layout_compatible<scalar_value_output<int32_t>>);
 static_assert(device_layout_compatible<scalar_decode_options<int64_t>>);
 static_assert(device_layout_compatible<batched_scalar_desc<int32_t>>);

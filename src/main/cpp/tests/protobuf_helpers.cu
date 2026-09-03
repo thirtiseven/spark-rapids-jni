@@ -80,12 +80,8 @@ protobuf::protobuf_decode_context make_numeric_enum_context(int64_t default_valu
 
 TEST_F(ProtobufHelpersTest, NumericEnumDefaultMustFitInt32)
 {
-  auto valid_context = make_numeric_enum_context(2);
-  EXPECT_NO_THROW(protobuf::detail::validate_decode_context(valid_context));
-
-  auto out_of_range_context = make_numeric_enum_context(int64_t{1} << 42);
-  EXPECT_THROW(protobuf::detail::validate_decode_context(out_of_range_context),
-               std::invalid_argument);
+  EXPECT_NO_THROW(make_numeric_enum_context(2));
+  EXPECT_THROW(make_numeric_enum_context(int64_t{1} << 42), std::invalid_argument);
 }
 
 TEST_F(ProtobufHelpersTest, NullMaskFromPaddedValidUsesZeroLogicalRows)

@@ -197,24 +197,6 @@ nested_field_descriptor make_field_descriptor(int field_number,
     field_number, parent_idx, depth, wire_type, output_type, encoding, is_repeated, false, false};
 }
 
-void initialize_context_metadata(protobuf::protobuf_decode_context& context)
-{
-  auto const size = context.schema.size();
-  context.default_ints.resize(size, 0);
-  context.default_floats.resize(size, 0.0);
-  context.default_bools.resize(size, false);
-  context.default_strings.reserve(size);
-  context.enum_valid_values.reserve(size);
-  cuda::stream_ref const stream = cudf::get_default_stream();
-  for (size_t i = 0; i < size; ++i) {
-    context.default_strings.emplace_back(
-      cudf::detail::make_pinned_vector_async<uint8_t>(0, stream));
-    context.enum_valid_values.emplace_back(
-      cudf::detail::make_pinned_vector_async<int32_t>(0, stream));
-  }
-  context.enum_names.resize(size);
-}
-
 // Case 1: Flat scalars only — many top-level scalar fields.
 //   message FlatMessage {
 //     int32  f1 = 1;
@@ -229,8 +211,7 @@ struct FlatScalarCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
+    std::vector<nested_field_descriptor> schema;
 
     cudf::type_id non_string_types[] = {cudf::type_id::INT32,
                                         cudf::type_id::INT64,
@@ -251,15 +232,14 @@ struct FlatScalarCase {
       auto enc = proto_encoding::DEFAULT;
       if (ty == cudf::type_id::FLOAT32) { enc = proto_encoding::FIXED; }
       if (ty == cudf::type_id::FLOAT64) { enc = proto_encoding::FIXED; }
-      ctx.schema.push_back(make_field_descriptor(fn, -1, 0, wt, ty, false, enc));
+      schema.push_back(make_field_descriptor(fn, -1, 0, wt, ty, false, enc));
     }
     for (int i = 0; i < num_string_fields; i++, fn++) {
-      ctx.schema.push_back(
+      schema.push_back(
         make_field_descriptor(fn, -1, 0, proto_wire_type::LEN, cudf::type_id::STRING));
     }
 
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows, std::mt19937& rng) const
@@ -312,18 +292,15 @@ struct NestedMessageCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
+    std::vector<nested_field_descriptor> schema;
 
     // idx 0: id (int32, top-level)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(1, -1, 0, proto_wire_type::VARINT, cudf::type_id::INT32));
     // idx 1: name (string, top-level)
-    ctx.schema.push_back(
-      make_field_descriptor(2, -1, 0, proto_wire_type::LEN, cudf::type_id::STRING));
+    schema.push_back(make_field_descriptor(2, -1, 0, proto_wire_type::LEN, cudf::type_id::STRING));
     // idx 2: inner (STRUCT, top-level)
-    ctx.schema.push_back(
-      make_field_descriptor(3, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT));
+    schema.push_back(make_field_descriptor(3, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT));
 
     // Inner message children (parent_idx=2, depth=1)
     cudf::type_id inner_types[] = {
@@ -333,11 +310,10 @@ struct NestedMessageCase {
 
     for (int i = 0; i < num_inner_fields; i++) {
       int ti = i % 3;
-      ctx.schema.push_back(make_field_descriptor(i + 1, 2, 1, inner_wt[ti], inner_types[ti]));
+      schema.push_back(make_field_descriptor(i + 1, 2, 1, inner_wt[ti], inner_types[ti]));
     }
 
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows, std::mt19937& rng) const
@@ -393,33 +369,28 @@ struct RepeatedFieldCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
+    std::vector<nested_field_descriptor> schema;
 
     // idx 0: id (int32, scalar)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(1, -1, 0, proto_wire_type::VARINT, cudf::type_id::INT32));
     // idx 1: tags (repeated int32, packed)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(2, -1, 0, proto_wire_type::VARINT, cudf::type_id::INT32, true));
     // idx 2: labels (repeated string)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(3, -1, 0, proto_wire_type::LEN, cudf::type_id::STRING, true));
     // idx 3: items (repeated STRUCT)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(4, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT, true));
     // idx 4: Item.item_id (int32, child of idx 3)
-    ctx.schema.push_back(
-      make_field_descriptor(1, 3, 1, proto_wire_type::VARINT, cudf::type_id::INT32));
+    schema.push_back(make_field_descriptor(1, 3, 1, proto_wire_type::VARINT, cudf::type_id::INT32));
     // idx 5: Item.item_name (string, child of idx 3)
-    ctx.schema.push_back(
-      make_field_descriptor(2, 3, 1, proto_wire_type::LEN, cudf::type_id::STRING));
+    schema.push_back(make_field_descriptor(2, 3, 1, proto_wire_type::LEN, cudf::type_id::STRING));
     // idx 6: Item.value (int64, child of idx 3)
-    ctx.schema.push_back(
-      make_field_descriptor(3, 3, 1, proto_wire_type::VARINT, cudf::type_id::INT64));
+    schema.push_back(make_field_descriptor(3, 3, 1, proto_wire_type::VARINT, cudf::type_id::INT64));
 
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows, std::mt19937& rng) const
@@ -493,14 +464,13 @@ struct WideRepeatedMessageCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
+    std::vector<nested_field_descriptor> schema;
 
     // idx 0: id (scalar)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(1, -1, 0, proto_wire_type::VARINT, cudf::type_id::INT32));
     // idx 1: items (repeated STRUCT)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(2, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT, true));
 
     cudf::type_id child_types[] = {cudf::type_id::INT32,
@@ -526,12 +496,11 @@ struct WideRepeatedMessageCase {
     // rather than varlen copy traffic.
     for (int i = 0; i < num_child_fields; i++) {
       int ti = (i % 10 == 9) ? 5 : (i % 5);
-      ctx.schema.push_back(
+      schema.push_back(
         make_field_descriptor(i + 1, 1, 1, child_wt[ti], child_types[ti], false, child_enc[ti]));
     }
 
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows, std::mt19937& rng) const
@@ -601,19 +570,18 @@ struct RepeatedChildListCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
+    std::vector<nested_field_descriptor> schema;
 
     // idx 0: id (scalar)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(1, -1, 0, proto_wire_type::VARINT, cudf::type_id::INT32));
     // idx 1: items (repeated STRUCT)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(2, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT, true));
 
     for (int i = 0; i < num_repeated_children; i++) {
       bool as_string = child_is_string(i);
-      ctx.schema.push_back(
+      schema.push_back(
         make_field_descriptor(i + 1,
                               1,
                               1,
@@ -622,8 +590,7 @@ struct RepeatedChildListCase {
                               true));
     }
 
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows, std::mt19937& rng) const
@@ -681,18 +648,14 @@ struct RepeatedMessageNestingCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
-    ctx.schema.push_back(
+    std::vector<nested_field_descriptor> schema;
+    schema.push_back(
       make_field_descriptor(1, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT, true));
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(1, 0, 1, proto_wire_type::LEN, cudf::type_id::STRUCT, true));
-    ctx.schema.push_back(
-      make_field_descriptor(1, 1, 2, proto_wire_type::VARINT, cudf::type_id::INT32));
-    ctx.schema.push_back(
-      make_field_descriptor(2, 1, 2, proto_wire_type::LEN, cudf::type_id::STRING));
-    initialize_context_metadata(ctx);
-    return ctx;
+    schema.push_back(make_field_descriptor(1, 1, 2, proto_wire_type::VARINT, cudf::type_id::INT32));
+    schema.push_back(make_field_descriptor(2, 1, 2, proto_wire_type::LEN, cudf::type_id::STRING));
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows, std::mt19937& rng) const
@@ -739,21 +702,19 @@ struct SingularMessageMergeCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
+    std::vector<nested_field_descriptor> schema;
 
     for (int message_idx = 0; message_idx < num_message_fields; ++message_idx) {
-      auto const parent_idx = static_cast<int>(ctx.schema.size());
-      ctx.schema.push_back(
+      auto const parent_idx = static_cast<int>(schema.size());
+      schema.push_back(
         make_field_descriptor(message_idx + 1, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT));
       for (int child_idx = 0; child_idx < NUM_CHILD_FIELDS; ++child_idx) {
-        ctx.schema.push_back(make_field_descriptor(
+        schema.push_back(make_field_descriptor(
           child_idx + 1, parent_idx, 1, proto_wire_type::VARINT, cudf::type_id::INT32));
       }
     }
 
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows) const
@@ -806,16 +767,13 @@ struct RepeatedChildStringOnlyCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
-    ctx.schema.push_back(
-      make_field_descriptor(1, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT));
+    std::vector<nested_field_descriptor> schema;
+    schema.push_back(make_field_descriptor(1, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT));
     for (int child_idx = 0; child_idx < num_repeated_children; ++child_idx) {
-      ctx.schema.push_back(make_field_descriptor(
+      schema.push_back(make_field_descriptor(
         child_idx + 1, 0, 1, proto_wire_type::LEN, cudf::type_id::STRING, true));
     }
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   RepeatedChildStringBenchData generate_data(int num_rows, std::mt19937& rng) const
@@ -910,25 +868,23 @@ struct ManyRepeatedFieldsCase {
 
   protobuf::protobuf_decode_context build_context() const
   {
-    protobuf::protobuf_decode_context ctx;
-    ctx.fail_on_errors = true;
+    std::vector<nested_field_descriptor> schema;
 
     int fn = 1;
     // idx 0: id (scalar)
-    ctx.schema.push_back(
+    schema.push_back(
       make_field_descriptor(fn++, -1, 0, proto_wire_type::VARINT, cudf::type_id::INT32));
 
     for (int i = 0; i < num_repeated_int; i++) {
-      ctx.schema.push_back(
+      schema.push_back(
         make_field_descriptor(fn++, -1, 0, proto_wire_type::VARINT, cudf::type_id::INT32, true));
     }
     for (int i = 0; i < num_repeated_str; i++) {
-      ctx.schema.push_back(
+      schema.push_back(
         make_field_descriptor(fn++, -1, 0, proto_wire_type::LEN, cudf::type_id::STRING, true));
     }
 
-    initialize_context_metadata(ctx);
-    return ctx;
+    return {std::move(schema), true, cudf::get_default_stream()};
   }
 
   std::vector<std::vector<uint8_t>> generate_messages(int num_rows,
@@ -1301,12 +1257,9 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
   protobuf_detail::nested_parent_view parent{
     parent_locations.data(), parent_locations.size(), nullptr};
   protobuf_detail::field_scan_view field_scan{
-    field_locations.data(),
-    num_repeated_children,
-    occurrence_counts.data(),
-    num_repeated_children,
-    nullptr,
-    0,
+    {field_locations.data(), num_repeated_children},
+    {occurrence_counts.data(), num_repeated_children},
+    {nullptr, 0},
     nullptr,
     {field_descriptors.device.data(), num_repeated_children, nullptr, 0}};
 
@@ -1413,8 +1366,10 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
       thrust::fill_n(
         rmm::exec_policy_nosync(stream, mr), list_offsets.data() + num_rows, 1, work.total_count);
 
-      protobuf_detail::nested_repeated_location_provider location_provider{
-        row_offsets, 0, parent_locations.data(), work.occurrences.data()};
+      protobuf_detail::field_occurrence_location_provider location_provider{
+        {message_data, static_cast<cudf::size_type>(child.size()), row_offsets, 0, num_rows},
+        {parent_locations.data(), parent_locations.size(), nullptr},
+        work.occurrences.data()};
       auto valid = [] __device__(cudf::size_type) { return true; };
       auto child_values =
         protobuf_detail::extract_and_build_string_or_bytes_column(schema.field(child_idx + 1),

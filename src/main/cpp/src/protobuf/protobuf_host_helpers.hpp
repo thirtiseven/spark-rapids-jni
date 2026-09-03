@@ -79,15 +79,15 @@ class protobuf_schema {
 
   [[nodiscard]] std::vector<nested_field_descriptor> const& fields() const
   {
-    return context_.schema;
+    return context_.schema();
   }
 
   [[nodiscard]] nested_field_descriptor const& operator[](int schema_idx) const
   {
-    return context_.schema.at(static_cast<size_t>(schema_idx));
+    return context_.schema().at(static_cast<size_t>(schema_idx));
   }
 
-  [[nodiscard]] size_t size() const { return context_.schema.size(); }
+  [[nodiscard]] size_t size() const { return context_.schema().size(); }
 
   [[nodiscard]] protobuf_field_meta_view field(int schema_idx) const;
   [[nodiscard]] std::vector<int> const& children(int parent_schema_idx) const;
@@ -146,15 +146,18 @@ struct repeated_field_work {
   int depth;
   int32_t total_count;
   rmm::device_uvector<int32_t> offsets;
-  std::unique_ptr<rmm::device_uvector<field_occurrence>> occurrences;
+  rmm::device_uvector<field_occurrence> occurrences;
 
   repeated_field_work(int schema_index,
                       list_offsets_from_counts_result offsets_result,
-                      int nested_depth = 0)
+                      int nested_depth,
+                      cuda::stream_ref stream,
+                      rmm::device_async_resource_ref mr)
     : schema_idx(schema_index),
       depth(nested_depth),
       total_count(offsets_result.total_count),
-      offsets(std::move(offsets_result.offsets))
+      offsets(std::move(offsets_result.offsets)),
+      occurrences(total_count, stream, mr)
   {
   }
 };
@@ -172,33 +175,6 @@ struct extract_strided_count {
   __device__ int32_t operator()(int row) const
   {
     return info[flat_index(row, num_fields, field_position)].count;
-  }
-};
-
-// Buffers that gather duplicate singular-message fragments by row before recursive decoding.
-struct singular_message_merge_buffers {
-  int schema_idx;
-  int32_t total_fragments;
-  rmm::device_uvector<int32_t> row_offsets;
-  rmm::device_uvector<field_occurrence> fragments;
-
-  singular_message_merge_buffers(int schema_index,
-                                 list_offsets_from_counts_result offsets_result,
-                                 cuda::stream_ref stream,
-                                 rmm::device_async_resource_ref mr)
-    : schema_idx(schema_index),
-      total_fragments(offsets_result.total_count),
-      row_offsets(std::move(offsets_result.offsets)),
-      fragments(total_fragments, stream, mr)
-  {
-  }
-
-  explicit singular_message_merge_buffers(repeated_field_work&& work)
-    : schema_idx(work.schema_idx),
-      total_fragments(work.total_count),
-      row_offsets(std::move(work.offsets)),
-      fragments(std::move(*work.occurrences))
-  {
   }
 };
 
@@ -243,8 +219,7 @@ inline void validate_nonempty_repeated_field_work(
   CUDF_EXPECTS(work.total_count > 0, message("total count must be positive"));
   CUDF_EXPECTS(work.offsets.size() == static_cast<size_t>(num_rows) + 1,
                message("offsets size must match row count"));
-  CUDF_EXPECTS(work.occurrences != nullptr, message("repeated occurrences must be present"));
-  CUDF_EXPECTS(work.occurrences->size() == static_cast<size_t>(work.total_count),
+  CUDF_EXPECTS(work.occurrences.size() == static_cast<size_t>(work.total_count),
                message("occurrence count mismatch"));
 }
 
@@ -356,19 +331,13 @@ inline repeated_field_work_bundle make_repeated_field_work_bundle(
     auto& work = result.fields[field_position].emplace(
       schema_idx,
       list_offsets_from_counts_result{total_count, std::move(offsets)},
-      schema[schema_idx].depth);
-
-    if (work.total_count > 0) {
-      work.occurrences = std::make_unique<rmm::device_uvector<field_occurrence>>(
-        work.total_count, stream, scratch_mr);
-    }
+      schema[schema_idx].depth,
+      stream,
+      scratch_mr);
     // Zero-count descriptors keep malformed rows aligned with the count pass.
     auto const& field = schema[schema_idx];
-    result.scan_descriptors.push_back(
-      field_occurrence_scan_desc{field.field_number,
-                                 field.wire_type,
-                                 work.offsets.data(),
-                                 work.occurrences == nullptr ? nullptr : work.occurrences->data()});
+    result.scan_descriptors.push_back(field_occurrence_scan_desc{
+      field.field_number, field.wire_type, work.offsets.data(), work.occurrences.data()});
   }
   return result;
 }
@@ -600,8 +569,7 @@ std::unique_ptr<cudf::column> make_list_column_with_input_nulls(
 std::unique_ptr<cudf::column> build_repeated_enum_string_column(
   cudf::column_view const& binary_input,
   protobuf_input_view input,
-  protobuf_schema const& schema,
-  protobuf_decode_runtime_context decode_ctx,
+  recursive_decode_context context,
   repeated_field_work work,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
@@ -627,10 +595,10 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
 
 std::unique_ptr<cudf::column> build_merged_singular_struct_column(
   protobuf_input_view input,
-  message_fragment_source_view source,
+  nested_parent_view parent,
   std::vector<int> const& child_field_indices,
   recursive_decode_context context,
-  singular_message_merge_buffers buffers,
+  repeated_field_work work,
   int depth,
   bool materialize_output,
   cuda::stream_ref stream,

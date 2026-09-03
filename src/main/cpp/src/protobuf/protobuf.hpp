@@ -63,19 +63,60 @@ struct nested_field_descriptor {
   bool has_default_value;     // Whether this field has a default value
 };
 
-struct protobuf_decode_context {
-  std::vector<nested_field_descriptor> schema;
-  std::vector<int64_t> default_ints;
-  std::vector<double> default_floats;
-  std::vector<bool> default_bools;
-  std::vector<cudf::detail::host_vector<uint8_t>> default_strings;
-  std::vector<cudf::detail::host_vector<int32_t>> enum_valid_values;
-  std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> enum_names;
-  bool fail_on_errors;
-  // Per-field flag (parallel to `schema`) controlling whether a field appears in the
-  // returned struct. Hidden fields are still decoded so required/enum/wire validation
-  // runs, but they are dropped from the final output. An empty vector means "all output".
-  std::vector<bool> output_fields;
+class protobuf_decode_context {
+ public:
+  protobuf_decode_context(std::vector<nested_field_descriptor> schema,
+                          std::vector<int64_t> default_ints,
+                          std::vector<double> default_floats,
+                          std::vector<bool> default_bools,
+                          std::vector<cudf::detail::host_vector<uint8_t>> default_strings,
+                          std::vector<cudf::detail::host_vector<int32_t>> enum_valid_values,
+                          std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> enum_names,
+                          bool fail_on_errors,
+                          std::vector<bool> output_fields = {});
+
+  protobuf_decode_context(std::vector<nested_field_descriptor> schema,
+                          bool fail_on_errors,
+                          cuda::stream_ref stream,
+                          std::vector<bool> output_fields = {});
+
+  protobuf_decode_context(protobuf_decode_context const&)            = delete;
+  protobuf_decode_context& operator=(protobuf_decode_context const&) = delete;
+  protobuf_decode_context(protobuf_decode_context&&)                 = default;
+  protobuf_decode_context& operator=(protobuf_decode_context&&)      = default;
+
+  [[nodiscard]] std::vector<nested_field_descriptor> const& schema() const { return schema_; }
+  [[nodiscard]] std::vector<int64_t> const& default_ints() const { return default_ints_; }
+  [[nodiscard]] std::vector<double> const& default_floats() const { return default_floats_; }
+  [[nodiscard]] std::vector<bool> const& default_bools() const { return default_bools_; }
+  [[nodiscard]] std::vector<cudf::detail::host_vector<uint8_t>> const& default_strings() const
+  {
+    return default_strings_;
+  }
+  [[nodiscard]] std::vector<cudf::detail::host_vector<int32_t>> const& enum_valid_values() const
+  {
+    return enum_valid_values_;
+  }
+  [[nodiscard]] std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> const& enum_names()
+    const
+  {
+    return enum_names_;
+  }
+  [[nodiscard]] bool fail_on_errors() const { return fail_on_errors_; }
+  [[nodiscard]] std::vector<bool> const& output_fields() const { return output_fields_; }
+
+ private:
+  std::vector<nested_field_descriptor> schema_;
+  std::vector<int64_t> default_ints_;
+  std::vector<double> default_floats_;
+  std::vector<bool> default_bools_;
+  std::vector<cudf::detail::host_vector<uint8_t>> default_strings_;
+  std::vector<cudf::detail::host_vector<int32_t>> enum_valid_values_;
+  std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> enum_names_;
+  bool fail_on_errors_;
+  // Hidden fields are still decoded so required/enum/wire validation runs. An empty vector means
+  // all fields are included in the returned struct.
+  std::vector<bool> output_fields_;
 };
 
 struct protobuf_field_meta_view {

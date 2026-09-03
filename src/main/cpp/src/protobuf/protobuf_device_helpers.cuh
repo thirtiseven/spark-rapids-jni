@@ -40,30 +40,34 @@ struct proto_tag {
   proto_wire_type wire_type;
 };
 
+template <typename T>
+  requires(cuda::std::is_same_v<T, uint32_t> || cuda::std::is_same_v<T, uint64_t>)
+__device__ inline bool read_varint(uint8_t const* cur, uint8_t const* end, T& out, int& bytes)
+{
+  out   = 0;
+  bytes = 0;
+  // Protobuf varint uses 7 bits per byte with MSB as continuation flag.
+  for (int shift = 0; cur < end && bytes < MAX_VARINT_BYTES; shift += 7) {
+    uint8_t const b = *cur++;
+    ++bytes;
+    // Spark calls DynamicMessage.parseFrom(byte[]), whose protobuf-java array fast path
+    // sign-extends after the ninth continuation byte and uses the tenth only for termination.
+    if (shift == sizeof(T) * 8 - 1) {
+      out |= T{1} << shift;
+    } else if (shift < sizeof(T) * 8) {
+      out |= static_cast<T>(b & 0x7Fu) << shift;
+    }
+    if ((b & 0x80u) == 0) { return true; }
+  }
+  return false;
+}
+
 __device__ inline bool read_varint64(uint8_t const* cur,
                                      uint8_t const* end,
                                      uint64_t& out,
                                      int& bytes)
 {
-  out       = 0;
-  bytes     = 0;
-  int shift = 0;
-  // Protobuf varint uses 7 bits per byte with MSB as continuation flag.
-  // A 64-bit value requires at most ceil(64/7) = 10 bytes.
-  while (cur < end && bytes < MAX_VARINT_BYTES) {
-    uint8_t b = *cur++;
-    // Spark calls DynamicMessage.parseFrom(byte[]), whose protobuf-java array fast path
-    // sign-extends after the ninth continuation byte and uses the tenth only for termination.
-    if (bytes == 9) {
-      out |= uint64_t{1} << 63;
-    } else {
-      out |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-    }
-    bytes++;
-    if ((b & 0x80u) == 0) { return true; }
-    shift += 7;
-  }
-  return false;
+  return read_varint(cur, end, out, bytes);
 }
 
 __device__ inline bool read_varint32(uint8_t const* cur,
@@ -71,16 +75,7 @@ __device__ inline bool read_varint32(uint8_t const* cur,
                                      uint32_t& out,
                                      int& bytes)
 {
-  // protobuf-java's raw-varint32 path consumes up to ten bytes and keeps the low 32 bits.
-  out   = 0;
-  bytes = 0;
-  while (cur < end && bytes < MAX_VARINT_BYTES) {
-    uint8_t const b = *cur++;
-    if (bytes < 5) { out |= static_cast<uint32_t>(b & 0x7Fu) << (bytes * 7); }
-    bytes++;
-    if ((b & 0x80u) == 0) { return true; }
-  }
-  return false;
+  return read_varint(cur, end, out, bytes);
 }
 
 __device__ inline void set_error_once(protobuf_error* error_flag, protobuf_error error)
@@ -110,9 +105,9 @@ __device__ inline int get_wire_type_size(proto_wire_type wt, uint8_t const* cur,
 {
   switch (wt) {
     case proto_wire_type::VARINT: {
-      uint64_t value;
+      uint64_t dummy_value;
       int bytes;
-      return read_varint64(cur, end, value, bytes) ? bytes : -1;
+      return read_varint64(cur, end, dummy_value, bytes) ? bytes : -1;
     }
     case proto_wire_type::I64BIT:
       // Check if there's enough data for 8 bytes
@@ -132,8 +127,6 @@ __device__ inline int get_wire_type_size(proto_wire_type wt, uint8_t const* cur,
       }
       return n + static_cast<int>(len);
     }
-    case proto_wire_type::SGROUP:
-    case proto_wire_type::EGROUP: return -1;
     default: return -1;
   }
 }
@@ -156,22 +149,19 @@ static __device__ __noinline__ bool skip_group(uint8_t const* cur,
     if (!read_varint32(cur, end, key, key_bytes)) return false;
     cur += key_bytes;
 
-    auto const inner_field_number = key >> 3;
-    if (inner_field_number == 0 || inner_field_number > static_cast<uint32_t>(MAX_FIELD_NUMBER)) {
-      return false;
-    }
+    int const inner_field_number = static_cast<int>(key >> 3);
+    if (inner_field_number == 0 || inner_field_number > MAX_FIELD_NUMBER) { return false; }
     auto const inner_wire_type = static_cast<proto_wire_type>(key & 0x7);
     if (inner_wire_type == proto_wire_type::EGROUP) {
-      if (static_cast<int>(inner_field_number) != group_fields[depth - 1]) return false;
+      if (inner_field_number != group_fields[depth - 1]) return false;
       if (--depth == 0) {
         out_cur = cur;
         return true;
       }
       continue;
-    }
-    if (inner_wire_type == proto_wire_type::SGROUP) {
+    } else if (inner_wire_type == proto_wire_type::SGROUP) {
       if (depth == max_group_depth) return false;
-      group_fields[depth++] = static_cast<int>(inner_field_number);
+      group_fields[depth++] = inner_field_number;
       continue;
     }
 

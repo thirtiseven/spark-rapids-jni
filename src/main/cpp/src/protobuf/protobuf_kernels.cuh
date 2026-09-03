@@ -77,16 +77,23 @@ struct top_level_location_provider {
   }
 };
 
-struct repeated_location_provider {
-  cudf::size_type const* row_offsets;
-  cudf::size_type base_offset;
+struct field_occurrence_location_provider {
+  protobuf_input_view input;
+  nested_parent_view parent;
   field_occurrence const* occurrences;
 
   __device__ inline field_location get(int thread_idx, int32_t& data_offset) const
   {
-    auto occ    = occurrences[thread_idx];
-    data_offset = row_offsets[occ.row_idx] - base_offset + occ.offset;
-    return {occ.offset, occ.length};
+    auto const occurrence = occurrences[thread_idx];
+    auto const parent_offset =
+      parent.locations == nullptr ? int32_t{0} : parent.locations[occurrence.row_idx].offset;
+    if (parent_offset < 0) {
+      data_offset = 0;
+      return {-1, 0};
+    }
+    data_offset =
+      input.row_offsets[occurrence.row_idx] - input.base_offset + parent_offset + occurrence.offset;
+    return {occurrence.offset, occurrence.length};
   }
 };
 
@@ -126,46 +133,6 @@ struct nested_location_provider {
   __device__ inline bool valid(int thread_idx) const
   {
     return get_rebased_child_location(thread_idx, nullptr).offset >= 0;
-  }
-};
-
-struct nested_repeated_location_provider {
-  cudf::size_type const* row_offsets;
-  cudf::size_type base_offset;
-  field_location const* parent_locations;
-  field_occurrence const* occurrences;
-
-  __device__ inline field_location get(int thread_idx, int32_t& data_offset) const
-  {
-    auto occ  = occurrences[thread_idx];
-    auto ploc = parent_locations[occ.row_idx];
-    if (ploc.offset >= 0) {
-      data_offset = row_offsets[occ.row_idx] - base_offset + ploc.offset + occ.offset;
-      return {occ.offset, occ.length};
-    }
-    data_offset = 0;
-    return {-1, 0};
-  }
-};
-
-struct message_fragment_location_provider {
-  protobuf_input_view input;
-  message_fragment_source_view source;
-  field_occurrence const* fragments;
-
-  __device__ inline field_location get(int thread_idx, int32_t& data_offset) const
-  {
-    auto const fragment      = fragments[thread_idx];
-    auto const parent_offset = source.parent_locations == nullptr
-                                 ? int32_t{0}
-                                 : source.parent_locations[fragment.row_idx].offset;
-    if (parent_offset < 0) {
-      data_offset = 0;
-      return {-1, 0};
-    }
-    data_offset =
-      input.row_offsets[fragment.row_idx] - input.base_offset + parent_offset + fragment.offset;
-    return {fragment.offset, fragment.length};
   }
 };
 
@@ -504,7 +471,7 @@ void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
                                                  int recursion_depth,
                                                  cuda::stream_ref stream);
 
-void launch_validate_message_fragments(message_fragment_location_provider locations,
+void launch_validate_message_fragments(field_occurrence_location_provider locations,
                                        message_validation_view fields,
                                        int num_fragments,
                                        bool* invalid_rows,
@@ -650,10 +617,7 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
   auto const threads = THREADS_PER_BLOCK;
   auto const blocks  = static_cast<int>((num_rows + threads - 1u) / threads);
   if (num_rows > 0) {
-    if (as_bytes) {
-      extract_lengths_kernel<LocationProvider><<<blocks, threads, 0, stream.get()>>>(
-        loc_provider, num_rows, lengths.data(), has_default, def_len);
-    } else {
+    if (!as_bytes) {
       extract_utf8_lengths_kernel<LocationProvider>
         <<<blocks, threads, 0, stream.get()>>>(message_data,
                                                loc_provider,
@@ -662,6 +626,9 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
                                                nullptr,
                                                has_default ? d_default.data() : nullptr,
                                                def_len);
+    } else {
+      extract_lengths_kernel<LocationProvider><<<blocks, threads, 0, stream.get()>>>(
+        loc_provider, num_rows, lengths.data(), has_default, def_len);
     }
     CUDF_CHECK_CUDA(stream.get());
   }
@@ -773,25 +740,25 @@ inline std::unique_ptr<cudf::column> extract_typed_column(protobuf_field_decode_
   switch (dt.id()) {
     case cudf::type_id::BOOL8:
       return extract_and_build_scalar_field_column<uint8_t>(
-        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, num_items, decode_ctx, stream, mr);
     case cudf::type_id::INT32:
       return extract_and_build_scalar_field_column<int32_t>(
-        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, num_items, decode_ctx, stream, mr);
     case cudf::type_id::UINT32:
       return extract_and_build_scalar_field_column<uint32_t>(
-        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, num_items, decode_ctx, stream, mr);
     case cudf::type_id::INT64:
       return extract_and_build_scalar_field_column<int64_t>(
-        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, num_items, decode_ctx, stream, mr);
     case cudf::type_id::UINT64:
       return extract_and_build_scalar_field_column<uint64_t>(
-        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, num_items, decode_ctx, stream, mr);
     case cudf::type_id::FLOAT32:
       return extract_and_build_scalar_field_column<float>(
-        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, num_items, decode_ctx, stream, mr);
     case cudf::type_id::FLOAT64:
       return extract_and_build_scalar_field_column<double>(
-        field, message_data, loc_provider, request.num_values, decode_ctx, stream, mr);
+        field, message_data, loc_provider, num_items, decode_ctx, stream, mr);
     default:
       // Preserve protobuf-java-compatible null output when invalid input reaches this fallback.
       return make_null_column(dt, num_items, stream, mr);
@@ -865,8 +832,8 @@ inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
 
   auto const field       = schema.field(work.schema_idx);
   auto const total_count = work.total_count;
-  auto& occurrences      = *work.occurrences;
-  repeated_location_provider loc_provider{input.row_offsets, input.base_offset, occurrences.data()};
+  auto& occurrences      = work.occurrences;
+  field_occurrence_location_provider loc_provider{input, {nullptr, 0, nullptr}, occurrences.data()};
 
   std::unique_ptr<cudf::column> child_col;
   if constexpr (std::is_same_v<T, int32_t>) {
@@ -880,7 +847,7 @@ inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
 
   if (child_col == nullptr) {
     rmm::device_uvector<T> values(total_count, stream, mr);
-    extract_scalar_into_buffers<T, repeated_location_provider>(
+    extract_scalar_into_buffers<T, field_occurrence_location_provider>(
       input.message_data,
       loc_provider,
       total_count,
