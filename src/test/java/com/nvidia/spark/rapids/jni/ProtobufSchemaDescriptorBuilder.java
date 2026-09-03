@@ -196,6 +196,10 @@ public final class ProtobufSchemaDescriptorBuilder {
     return this;
   }
 
+  public ProtobufSchemaDescriptorBuilder defaultValue(String value) {
+    return defaultValue(value.getBytes(StandardCharsets.UTF_8));
+  }
+
   /**
    * Set the has-default flag without a value. Used by negative tests that pair a default with an
    * incompatible field (e.g. a repeated or STRUCT field) to exercise validation.

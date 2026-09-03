@@ -37,9 +37,13 @@
 #include <nvbench/nvbench.cuh>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <utility>
@@ -148,9 +152,12 @@ std::unique_ptr<cudf::column> make_binary_column(std::vector<std::vector<uint8_t
   std::vector<int32_t> h_offsets(messages.size() + 1);
   h_offsets[0] = 0;
   for (size_t i = 0; i < messages.size(); i++) {
-    h_offsets[i + 1] = h_offsets[i] + static_cast<int32_t>(messages[i].size());
+    auto const next_offset = static_cast<size_t>(h_offsets[i]) + messages[i].size();
+    CUDF_EXPECTS(next_offset <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                 "benchmark input exceeds the LIST offset range");
+    h_offsets[i + 1] = static_cast<int32_t>(next_offset);
   }
-  int32_t total_bytes = h_offsets.back();
+  int32_t const total_bytes = h_offsets.back();
 
   std::vector<uint8_t> h_data;
   h_data.reserve(total_bytes);
@@ -197,6 +204,12 @@ nested_field_descriptor make_field_descriptor(int field_number,
     field_number, parent_idx, depth, wire_type, output_type, encoding, is_repeated, false, false};
 }
 
+struct generated_field_type {
+  cudf::type_id output_type;
+  proto_wire_type wire_type;
+  proto_encoding encoding;
+};
+
 // Case 1: Flat scalars only — many top-level scalar fields.
 //   message FlatMessage {
 //     int32  f1 = 1;
@@ -206,35 +219,31 @@ nested_field_descriptor make_field_descriptor(int field_number,
 //     string s_k+1 = k+1;   (a few string fields)
 //   }
 struct FlatScalarCase {
-  int num_non_string_fields;
-  int num_string_fields;
+  static constexpr int FIELDS_PER_STRING = 10;
+  static constexpr auto NON_STRING_TYPES = std::to_array<generated_field_type>({
+    {cudf::type_id::INT32, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+    {cudf::type_id::INT64, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+    {cudf::type_id::FLOAT32, proto_wire_type::I32BIT, proto_encoding::FIXED},
+    {cudf::type_id::FLOAT64, proto_wire_type::I64BIT, proto_encoding::FIXED},
+    {cudf::type_id::BOOL8, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+  });
+
+  int num_fields;
+
+  int num_string_fields() const { return std::max(1, num_fields / FIELDS_PER_STRING); }
+  int num_non_string_fields() const { return num_fields - num_string_fields(); }
 
   protobuf::protobuf_decode_context build_context() const
   {
     std::vector<nested_field_descriptor> schema;
 
-    cudf::type_id non_string_types[] = {cudf::type_id::INT32,
-                                        cudf::type_id::INT64,
-                                        cudf::type_id::FLOAT32,
-                                        cudf::type_id::FLOAT64,
-                                        cudf::type_id::BOOL8};
-    proto_wire_type wt_for_type[]    = {proto_wire_type::VARINT,
-                                        proto_wire_type::VARINT,
-                                        proto_wire_type::I32BIT,
-                                        proto_wire_type::I64BIT,
-                                        proto_wire_type::VARINT};
-
     int fn = 1;
-    for (int i = 0; i < num_non_string_fields; i++, fn++) {
-      int ti   = i % 5;
-      auto ty  = non_string_types[ti];
-      auto wt  = wt_for_type[ti];
-      auto enc = proto_encoding::DEFAULT;
-      if (ty == cudf::type_id::FLOAT32) { enc = proto_encoding::FIXED; }
-      if (ty == cudf::type_id::FLOAT64) { enc = proto_encoding::FIXED; }
-      schema.push_back(make_field_descriptor(fn, -1, 0, wt, ty, false, enc));
+    for (int i = 0; i < num_non_string_fields(); i++, fn++) {
+      auto const field_type = NON_STRING_TYPES[i % NON_STRING_TYPES.size()];
+      schema.push_back(make_field_descriptor(
+        fn, -1, 0, field_type.wire_type, field_type.output_type, false, field_type.encoding));
     }
-    for (int i = 0; i < num_string_fields; i++, fn++) {
+    for (int i = 0; i < num_string_fields(); i++, fn++) {
       schema.push_back(
         make_field_descriptor(fn, -1, 0, proto_wire_type::LEN, cudf::type_id::STRING));
     }
@@ -252,17 +261,21 @@ struct FlatScalarCase {
     for (int r = 0; r < num_rows; r++) {
       auto& buf = messages[r];
       int fn    = 1;
-      for (int i = 0; i < num_non_string_fields; i++, fn++) {
-        int ti = i % 5;
-        switch (ti) {
-          case 0: encode_varint_field(buf, fn, int_dist(rng)); break;
-          case 1: encode_varint_field(buf, fn, int_dist(rng)); break;
-          case 2: encode_fixed32_field(buf, fn, static_cast<float>(int_dist(rng))); break;
-          case 3: encode_fixed64_field(buf, fn, static_cast<double>(int_dist(rng))); break;
-          case 4: encode_varint_field(buf, fn, rng() % 2); break;
+      for (int i = 0; i < num_non_string_fields(); i++, fn++) {
+        switch (NON_STRING_TYPES[i % NON_STRING_TYPES.size()].output_type) {
+          case cudf::type_id::INT32: encode_varint_field(buf, fn, int_dist(rng)); break;
+          case cudf::type_id::INT64: encode_varint_field(buf, fn, int_dist(rng)); break;
+          case cudf::type_id::FLOAT32:
+            encode_fixed32_field(buf, fn, static_cast<float>(int_dist(rng)));
+            break;
+          case cudf::type_id::FLOAT64:
+            encode_fixed64_field(buf, fn, static_cast<double>(int_dist(rng)));
+            break;
+          case cudf::type_id::BOOL8: encode_varint_field(buf, fn, rng() % 2); break;
+          default: CUDF_FAIL("unsupported generated scalar type");
         }
       }
-      for (int i = 0; i < num_string_fields; i++, fn++) {
+      for (int i = 0; i < num_string_fields(); i++, fn++) {
         int len = str_len_dist(rng);
         std::string s(len, ' ');
         for (int c = 0; c < len; c++) {
@@ -288,6 +301,12 @@ struct FlatScalarCase {
 //     ... (num_inner_fields fields)
 //   }
 struct NestedMessageCase {
+  static constexpr auto INNER_TYPES = std::to_array<generated_field_type>({
+    {cudf::type_id::INT32, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+    {cudf::type_id::INT64, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+    {cudf::type_id::STRING, proto_wire_type::LEN, proto_encoding::DEFAULT},
+  });
+
   int num_inner_fields;  // scalar fields inside InnerMessage
 
   protobuf::protobuf_decode_context build_context() const
@@ -303,14 +322,10 @@ struct NestedMessageCase {
     schema.push_back(make_field_descriptor(3, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT));
 
     // Inner message children (parent_idx=2, depth=1)
-    cudf::type_id inner_types[] = {
-      cudf::type_id::INT32, cudf::type_id::INT64, cudf::type_id::STRING};
-    proto_wire_type inner_wt[] = {
-      proto_wire_type::VARINT, proto_wire_type::VARINT, proto_wire_type::LEN};
-
     for (int i = 0; i < num_inner_fields; i++) {
-      int ti = i % 3;
-      schema.push_back(make_field_descriptor(i + 1, 2, 1, inner_wt[ti], inner_types[ti]));
+      auto const field_type = INNER_TYPES[i % INNER_TYPES.size()];
+      schema.push_back(make_field_descriptor(
+        i + 1, 2, 1, field_type.wire_type, field_type.output_type, false, field_type.encoding));
     }
 
     return {std::move(schema), true, cudf::get_default_stream()};
@@ -337,11 +352,13 @@ struct NestedMessageCase {
 
       encode_nested_message(buf, 3, [&](std::vector<uint8_t>& inner) {
         for (int i = 0; i < num_inner_fields; i++) {
-          int ti = i % 3;
-          switch (ti) {
-            case 0: encode_varint_field(inner, i + 1, int_dist(rng)); break;
-            case 1: encode_varint_field(inner, i + 1, int_dist(rng)); break;
-            case 2: encode_string_field(inner, i + 1, random_string(str_len_dist(rng))); break;
+          switch (INNER_TYPES[i % INNER_TYPES.size()].output_type) {
+            case cudf::type_id::INT32: encode_varint_field(inner, i + 1, int_dist(rng)); break;
+            case cudf::type_id::INT64: encode_varint_field(inner, i + 1, int_dist(rng)); break;
+            case cudf::type_id::STRING:
+              encode_string_field(inner, i + 1, random_string(str_len_dist(rng)));
+              break;
+            default: CUDF_FAIL("unsupported generated nested type");
           }
         }
       });
@@ -459,8 +476,26 @@ struct RepeatedFieldCase {
 // This case is intentionally generic and contains no customer schema details.
 // Its wide repeated STRUCT payload approximates real-world schema-projection workloads.
 struct WideRepeatedMessageCase {
+  static constexpr int STRING_FIELD_PERIOD = 10;
+  static constexpr auto CHILD_TYPES        = std::to_array<generated_field_type>({
+    {cudf::type_id::INT32, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+    {cudf::type_id::INT64, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+    {cudf::type_id::FLOAT32, proto_wire_type::I32BIT, proto_encoding::FIXED},
+    {cudf::type_id::FLOAT64, proto_wire_type::I64BIT, proto_encoding::FIXED},
+    {cudf::type_id::BOOL8, proto_wire_type::VARINT, proto_encoding::DEFAULT},
+    {cudf::type_id::STRING, proto_wire_type::LEN, proto_encoding::DEFAULT},
+  });
+
   int num_child_fields;
   int avg_items_per_row;
+
+  static constexpr generated_field_type child_type(int index)
+  {
+    auto const type_index = index % STRING_FIELD_PERIOD == STRING_FIELD_PERIOD - 1
+                              ? CHILD_TYPES.size() - 1
+                              : index % (CHILD_TYPES.size() - 1);
+    return CHILD_TYPES[type_index];
+  }
 
   protobuf::protobuf_decode_context build_context() const
   {
@@ -473,31 +508,12 @@ struct WideRepeatedMessageCase {
     schema.push_back(
       make_field_descriptor(2, -1, 0, proto_wire_type::LEN, cudf::type_id::STRUCT, true));
 
-    cudf::type_id child_types[] = {cudf::type_id::INT32,
-                                   cudf::type_id::INT64,
-                                   cudf::type_id::FLOAT32,
-                                   cudf::type_id::FLOAT64,
-                                   cudf::type_id::BOOL8,
-                                   cudf::type_id::STRING};
-    proto_wire_type child_wt[]  = {proto_wire_type::VARINT,
-                                   proto_wire_type::VARINT,
-                                   proto_wire_type::I32BIT,
-                                   proto_wire_type::I64BIT,
-                                   proto_wire_type::VARINT,
-                                   proto_wire_type::LEN};
-    proto_encoding child_enc[]  = {proto_encoding::DEFAULT,
-                                   proto_encoding::DEFAULT,
-                                   proto_encoding::FIXED,
-                                   proto_encoding::FIXED,
-                                   proto_encoding::DEFAULT,
-                                   proto_encoding::DEFAULT};
-
     // Keep strings sparse so the case remains dominated by wide child scanning
     // rather than varlen copy traffic.
     for (int i = 0; i < num_child_fields; i++) {
-      int ti = (i % 10 == 9) ? 5 : (i % 5);
-      schema.push_back(
-        make_field_descriptor(i + 1, 1, 1, child_wt[ti], child_types[ti], false, child_enc[ti]));
+      auto const field_type = child_type(i);
+      schema.push_back(make_field_descriptor(
+        i + 1, 1, 1, field_type.wire_type, field_type.output_type, false, field_type.encoding));
     }
 
     return {std::move(schema), true, cudf::get_default_stream()};
@@ -525,15 +541,25 @@ struct WideRepeatedMessageCase {
       for (int item_idx = 0; item_idx < n; item_idx++) {
         encode_nested_message(buf, 2, [&](std::vector<uint8_t>& inner) {
           for (int i = 0; i < num_child_fields; i++) {
-            int ti = (i % 10 == 9) ? 5 : (i % 5);
-            int fn = i + 1;
-            switch (ti) {
-              case 0: encode_varint_field(inner, fn, int_dist(rng)); break;
-              case 1: encode_varint_field(inner, fn, int_dist(rng)); break;
-              case 2: encode_fixed32_field(inner, fn, static_cast<float>(int_dist(rng))); break;
-              case 3: encode_fixed64_field(inner, fn, static_cast<double>(int_dist(rng))); break;
-              case 4: encode_varint_field(inner, fn, rng() % 2); break;
-              case 5: encode_string_field(inner, fn, random_string(str_len_dist(rng))); break;
+            int const field_number = i + 1;
+            switch (child_type(i).output_type) {
+              case cudf::type_id::INT32:
+                encode_varint_field(inner, field_number, int_dist(rng));
+                break;
+              case cudf::type_id::INT64:
+                encode_varint_field(inner, field_number, int_dist(rng));
+                break;
+              case cudf::type_id::FLOAT32:
+                encode_fixed32_field(inner, field_number, static_cast<float>(int_dist(rng)));
+                break;
+              case cudf::type_id::FLOAT64:
+                encode_fixed64_field(inner, field_number, static_cast<double>(int_dist(rng)));
+                break;
+              case cudf::type_id::BOOL8: encode_varint_field(inner, field_number, rng() % 2); break;
+              case cudf::type_id::STRING:
+                encode_string_field(inner, field_number, random_string(str_len_dist(rng)));
+                break;
+              default: CUDF_FAIL("unsupported generated repeated child type");
             }
           }
         });
@@ -824,6 +850,17 @@ void copy_to_device(rmm::device_uvector<T>& destination,
   }
 }
 
+void expect_no_protobuf_error(rmm::device_uvector<protobuf_detail::protobuf_error> const& error,
+                              cuda::stream_ref stream)
+{
+  auto host_error = protobuf_detail::protobuf_error::NONE;
+  CUDF_CUDA_TRY(cudf::detail::memcpy_async(
+    &host_error, error.data(), sizeof(protobuf_detail::protobuf_error), stream));
+  stream.sync();
+  CUDF_EXPECTS(host_error == protobuf_detail::protobuf_error::NONE,
+               protobuf_detail::error_message(host_error));
+}
+
 struct repeated_child_count_scan_work {
   int32_t total_count;
   rmm::device_uvector<int32_t> offsets;
@@ -863,6 +900,8 @@ struct repeated_child_build_work {
 //     ...
 //   }
 struct ManyRepeatedFieldsCase {
+  static constexpr int FIELDS_PER_STRING = 5;
+
   int num_repeated_int;
   int num_repeated_str;
 
@@ -930,6 +969,49 @@ struct ManyRepeatedFieldsCase {
   }
 };
 
+template <typename T>
+struct constant_argument {
+  T value;
+
+  T get(nvbench::state const&) const { return value; }
+};
+
+struct int_axis_argument {
+  char const* name;
+
+  int get(nvbench::state const& state) const { return static_cast<int>(state.get_int64(name)); }
+};
+
+struct string_axis_argument {
+  char const* name;
+
+  std::string get(nvbench::state const& state) const { return std::string{state.get_string(name)}; }
+};
+
+struct decode_benchmark_data {
+  int num_rows;
+  size_t total_bytes;
+  protobuf::protobuf_decode_context context;
+  std::unique_ptr<cudf::column> binary_col;
+};
+
+template <typename Case, typename... Args>
+decode_benchmark_data prepare_decode_benchmark(nvbench::state const& state, Args const&... args)
+{
+  auto const num_rows = static_cast<int>(state.get_int64("num_rows"));
+  Case generator{args.get(state)...};
+  auto context = generator.build_context();
+
+  std::mt19937 rng(42);
+  auto messages          = generator.generate_messages(num_rows, rng);
+  auto const total_bytes = std::transform_reduce(
+    messages.begin(), messages.end(), size_t{0}, std::plus{}, [](auto const& message) {
+      return message.size();
+    });
+  auto binary_col = make_binary_column(messages);
+  return {num_rows, total_bytes, std::move(context), std::move(binary_col)};
+}
+
 }  // anonymous namespace
 
 // ===========================================================================
@@ -937,31 +1019,17 @@ struct ManyRepeatedFieldsCase {
 // ===========================================================================
 static void BM_protobuf_flat_scalars(nvbench::state& state)
 {
-  auto const num_rows      = static_cast<int>(state.get_int64("num_rows"));
-  auto const num_fields    = static_cast<int>(state.get_int64("num_fields"));
-  int const num_str        = std::max(1, num_fields / 10);
-  int const num_non_string = num_fields - num_str;
-
-  FlatScalarCase flat_case{num_non_string, num_str};
-  auto ctx = flat_case.build_context();
-
-  std::mt19937 rng(42);
-  auto messages   = flat_case.generate_messages(num_rows, rng);
-  auto binary_col = make_binary_column(messages);
-
-  size_t total_bytes = 0;
-  for (auto const& m : messages)
-    total_bytes += m.size();
+  auto data = prepare_decode_benchmark<FlatScalarCase>(state, int_axis_argument{"num_fields"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
+      data.binary_col->view(), data.context, stream, cudf::get_current_device_resource_ref());
   });
 
-  state.add_element_count(num_rows, "Rows");
-  state.add_global_memory_reads<nvbench::int8_t>(total_bytes);
+  state.add_element_count(data.num_rows, "Rows");
+  state.add_global_memory_reads<nvbench::int8_t>(data.total_bytes);
 }
 
 NVBENCH_BENCH(BM_protobuf_flat_scalars)
@@ -974,29 +1042,17 @@ NVBENCH_BENCH(BM_protobuf_flat_scalars)
 // ===========================================================================
 static void BM_protobuf_nested(nvbench::state& state)
 {
-  auto const num_rows     = static_cast<int>(state.get_int64("num_rows"));
-  auto const inner_fields = static_cast<int>(state.get_int64("inner_fields"));
-
-  NestedMessageCase nested_case{inner_fields};
-  auto ctx = nested_case.build_context();
-
-  std::mt19937 rng(42);
-  auto messages   = nested_case.generate_messages(num_rows, rng);
-  auto binary_col = make_binary_column(messages);
-
-  size_t total_bytes = 0;
-  for (auto const& m : messages)
-    total_bytes += m.size();
+  auto data = prepare_decode_benchmark<NestedMessageCase>(state, int_axis_argument{"inner_fields"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
+      data.binary_col->view(), data.context, stream, cudf::get_current_device_resource_ref());
   });
 
-  state.add_element_count(num_rows, "Rows");
-  state.add_global_memory_reads<nvbench::int8_t>(total_bytes);
+  state.add_element_count(data.num_rows, "Rows");
+  state.add_global_memory_reads<nvbench::int8_t>(data.total_bytes);
 }
 
 NVBENCH_BENCH(BM_protobuf_nested)
@@ -1009,29 +1065,18 @@ NVBENCH_BENCH(BM_protobuf_nested)
 // ===========================================================================
 static void BM_protobuf_repeated(nvbench::state& state)
 {
-  auto const num_rows  = static_cast<int>(state.get_int64("num_rows"));
-  auto const avg_items = static_cast<int>(state.get_int64("avg_items"));
-
-  RepeatedFieldCase rep_case{/*avg_tags=*/5, /*avg_labels=*/3, /*avg_items=*/avg_items};
-  auto ctx = rep_case.build_context();
-
-  std::mt19937 rng(42);
-  auto messages   = rep_case.generate_messages(num_rows, rng);
-  auto binary_col = make_binary_column(messages);
-
-  size_t total_bytes = 0;
-  for (auto const& m : messages)
-    total_bytes += m.size();
+  auto data = prepare_decode_benchmark<RepeatedFieldCase>(
+    state, constant_argument<int>{5}, constant_argument<int>{3}, int_axis_argument{"avg_items"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
+      data.binary_col->view(), data.context, stream, cudf::get_current_device_resource_ref());
   });
 
-  state.add_element_count(num_rows, "Rows");
-  state.add_global_memory_reads<nvbench::int8_t>(total_bytes);
+  state.add_element_count(data.num_rows, "Rows");
+  state.add_global_memory_reads<nvbench::int8_t>(data.total_bytes);
 }
 
 NVBENCH_BENCH(BM_protobuf_repeated)
@@ -1044,30 +1089,18 @@ NVBENCH_BENCH(BM_protobuf_repeated)
 // ===========================================================================
 static void BM_protobuf_wide_repeated_message(nvbench::state& state)
 {
-  auto const num_rows         = static_cast<int>(state.get_int64("num_rows"));
-  auto const num_child_fields = static_cast<int>(state.get_int64("num_child_fields"));
-  auto const avg_items        = static_cast<int>(state.get_int64("avg_items"));
-
-  WideRepeatedMessageCase wide_case{num_child_fields, avg_items};
-  auto ctx = wide_case.build_context();
-
-  std::mt19937 rng(42);
-  auto messages   = wide_case.generate_messages(num_rows, rng);
-  auto binary_col = make_binary_column(messages);
-
-  size_t total_bytes = 0;
-  for (auto const& m : messages)
-    total_bytes += m.size();
+  auto data = prepare_decode_benchmark<WideRepeatedMessageCase>(
+    state, int_axis_argument{"num_child_fields"}, int_axis_argument{"avg_items"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
+      data.binary_col->view(), data.context, stream, cudf::get_current_device_resource_ref());
   });
 
-  state.add_element_count(num_rows, "Rows");
-  state.add_global_memory_reads<nvbench::int8_t>(total_bytes);
+  state.add_element_count(data.num_rows, "Rows");
+  state.add_global_memory_reads<nvbench::int8_t>(data.total_bytes);
 }
 
 NVBENCH_BENCH(BM_protobuf_wide_repeated_message)
@@ -1081,33 +1114,22 @@ NVBENCH_BENCH(BM_protobuf_wide_repeated_message)
 // ===========================================================================
 static void BM_protobuf_repeated_child_lists(nvbench::state& state)
 {
-  auto const num_rows              = static_cast<int>(state.get_int64("num_rows"));
-  auto const num_repeated_children = static_cast<int>(state.get_int64("num_repeated_children"));
-  auto const avg_items             = static_cast<int>(state.get_int64("avg_items"));
-  auto const avg_child_elems       = static_cast<int>(state.get_int64("avg_child_elems"));
-  auto const child_mix             = state.get_string("child_mix");
-
-  RepeatedChildListCase list_case{
-    num_repeated_children, avg_items, avg_child_elems, std::string(child_mix)};
-  auto ctx = list_case.build_context();
-
-  std::mt19937 rng(42);
-  auto messages   = list_case.generate_messages(num_rows, rng);
-  auto binary_col = make_binary_column(messages);
-
-  size_t total_bytes = 0;
-  for (auto const& m : messages)
-    total_bytes += m.size();
+  auto data =
+    prepare_decode_benchmark<RepeatedChildListCase>(state,
+                                                    int_axis_argument{"num_repeated_children"},
+                                                    int_axis_argument{"avg_items"},
+                                                    int_axis_argument{"avg_child_elems"},
+                                                    string_axis_argument{"child_mix"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
+      data.binary_col->view(), data.context, stream, cudf::get_current_device_resource_ref());
   });
 
-  state.add_element_count(num_rows, "Rows");
-  state.add_global_memory_reads<nvbench::int8_t>(total_bytes);
+  state.add_element_count(data.num_rows, "Rows");
+  state.add_global_memory_reads<nvbench::int8_t>(data.total_bytes);
 }
 
 NVBENCH_BENCH(BM_protobuf_repeated_child_lists)
@@ -1123,30 +1145,18 @@ NVBENCH_BENCH(BM_protobuf_repeated_child_lists)
 // ===========================================================================
 static void BM_protobuf_repeated_message_nesting(nvbench::state& state)
 {
-  auto const num_rows        = static_cast<int>(state.get_int64("num_rows"));
-  auto const avg_outer_items = static_cast<int>(state.get_int64("avg_outer_items"));
-  auto const avg_inner_items = static_cast<int>(state.get_int64("avg_inner_items"));
-
-  RepeatedMessageNestingCase nesting_case{avg_outer_items, avg_inner_items};
-  auto context = nesting_case.build_context();
-  std::mt19937 rng(42);
-  auto messages = nesting_case.generate_messages(num_rows, rng);
-  auto input    = make_binary_column(messages);
-
-  size_t total_bytes = 0;
-  for (auto const& message : messages) {
-    total_bytes += message.size();
-  }
+  auto data = prepare_decode_benchmark<RepeatedMessageNestingCase>(
+    state, int_axis_argument{"avg_outer_items"}, int_axis_argument{"avg_inner_items"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      input->view(), context, stream, cudf::get_current_device_resource_ref());
+      data.binary_col->view(), data.context, stream, cudf::get_current_device_resource_ref());
   });
 
-  state.add_element_count(num_rows, "Rows");
-  state.add_global_memory_reads<nvbench::int8_t>(total_bytes);
+  state.add_element_count(data.num_rows, "Rows");
+  state.add_global_memory_reads<nvbench::int8_t>(data.total_bytes);
 }
 
 NVBENCH_BENCH(BM_protobuf_repeated_message_nesting)
@@ -1165,20 +1175,20 @@ static void BM_protobuf_singular_message_merge(nvbench::state& state)
   auto const occurrences_per_field = static_cast<int>(state.get_int64("occurrences_per_field"));
 
   SingularMessageMergeCase merge_case{num_message_fields, occurrences_per_field};
-  auto ctx      = merge_case.build_context();
-  auto messages = merge_case.generate_messages(num_rows);
-  auto input    = make_binary_column(messages);
+  auto context    = merge_case.build_context();
+  auto messages   = merge_case.generate_messages(num_rows);
+  auto binary_col = make_binary_column(messages);
 
-  size_t total_bytes = 0;
-  for (auto const& message : messages) {
-    total_bytes += message.size();
-  }
+  auto const total_bytes = std::transform_reduce(
+    messages.begin(), messages.end(), size_t{0}, std::plus{}, [](auto const& message) {
+      return message.size();
+    });
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      input->view(), ctx, stream, cudf::get_current_device_resource_ref());
+      binary_col->view(), context, stream, cudf::get_current_device_resource_ref());
   });
 
   state.add_element_count(num_rows, "Rows");
@@ -1212,7 +1222,7 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
   cudf::lists_column_view input_list(binary_col->view());
   auto const* row_offsets      = input_list.offsets().data<cudf::size_type>();
   auto const child             = input_list.child();
-  auto const* message_data     = reinterpret_cast<uint8_t const*>(child.data<int8_t>());
+  auto const* message_data     = child.data<uint8_t>();
   auto const message_data_size = static_cast<cudf::size_type>(child.size());
 
   rmm::device_uvector<protobuf_detail::field_location> parent_locations(num_rows, stream, mr);
@@ -1236,45 +1246,51 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
   auto error =
     cudf::detail::make_zeroed_device_uvector_async<protobuf_detail::protobuf_error>(1, stream, mr);
 
-  std::vector<std::unique_ptr<repeated_child_count_scan_work>> child_work;
+  std::vector<repeated_child_count_scan_work> child_work;
   child_work.reserve(num_repeated_children);
   auto host_scan_descriptors =
     cudf::detail::make_pinned_vector_async<protobuf_detail::field_occurrence_scan_desc>(
       num_repeated_children, stream);
   for (int child_idx = 0; child_idx < num_repeated_children; ++child_idx) {
     auto const total_count = static_cast<int32_t>(data.occurrences_by_child[child_idx].size());
-    auto& work             = *child_work.emplace_back(
-      std::make_unique<repeated_child_count_scan_work>(num_rows, total_count, stream, mr));
-    host_scan_descriptors[child_idx] = {
+    auto& work             = child_work.emplace_back(num_rows, total_count, stream, mr);
+    host_scan_descriptors[child_idx] = protobuf_detail::field_occurrence_scan_desc{
       child_idx + 1, proto_wire_type::LEN, work.offsets.data(), work.occurrences.data()};
   }
   auto occurrence_scan =
     protobuf_detail::make_field_occurrence_scan_bundle(host_scan_descriptors, stream, mr);
   stream.sync();
 
-  protobuf_detail::protobuf_input_view input{
-    message_data, message_data_size, row_offsets, 0, num_rows};
-  protobuf_detail::nested_parent_view parent{
-    parent_locations.data(), parent_locations.size(), nullptr};
+  protobuf_detail::protobuf_input_view input{.message_data      = message_data,
+                                             .message_data_size = message_data_size,
+                                             .row_offsets       = row_offsets,
+                                             .base_offset       = 0,
+                                             .num_rows          = num_rows};
+  protobuf_detail::nested_parent_view parent{.locations       = parent_locations.data(),
+                                             .location_count  = parent_locations.size(),
+                                             .top_row_indices = nullptr};
   protobuf_detail::field_scan_view field_scan{
-    {field_locations.data(), num_repeated_children},
-    {occurrence_counts.data(), num_repeated_children},
-    {nullptr, 0},
-    nullptr,
-    {field_descriptors.device.data(), num_repeated_children, nullptr, 0}};
+    .locations               = {.data = field_locations.data(), .stride = num_repeated_children},
+    .repeated_info           = {.data = occurrence_counts.data(), .stride = num_repeated_children},
+    .singular_message_info   = {.data = nullptr, .stride = 0},
+    .multiple_message_fields = nullptr,
+    .lookup                  = {.data        = field_descriptors.device.data(),
+                                .size        = num_repeated_children,
+                                .direct      = nullptr,
+                                .direct_size = 0}};
 
-  size_t total_bytes = 0;
-  for (auto const& message : data.messages) {
-    total_bytes += message.size();
-  }
+  auto const total_bytes = std::transform_reduce(
+    data.messages.begin(), data.messages.end(), size_t{0}, std::plus{}, [](auto const& message) {
+      return message.size();
+    });
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     protobuf_detail::launch_scan_nested_message_fields(
-      input, parent, field_scan, error.data(), nullptr, 1, stream);
+      input, parent, field_scan, error.data(), nullptr, /*recursion_depth=*/1, stream);
 
     for (int child_idx = 0; child_idx < num_repeated_children; ++child_idx) {
-      auto& work        = *child_work[child_idx];
+      auto& work        = child_work[child_idx];
       auto counts_begin = thrust::make_transform_iterator(
         thrust::make_counting_iterator<int>(0),
         protobuf_detail::extract_strided_count{
@@ -1293,8 +1309,9 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
     }
 
     protobuf_detail::launch_scan_all_field_occurrences_in_nested(
-      input, parent, occurrence_scan.view(), error.data(), 1, stream);
+      input, parent, occurrence_scan.view(), error.data(), /*recursion_depth=*/1, stream);
   });
+  expect_no_protobuf_error(error, stream);
 
   state.add_element_count(num_rows, "Rows");
   state.add_global_memory_reads<nvbench::int8_t>(total_bytes);
@@ -1327,17 +1344,16 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
   cudf::lists_column_view input_list(binary_col->view());
   auto const* row_offsets  = input_list.offsets().data<cudf::size_type>();
   auto const child         = input_list.child();
-  auto const* message_data = reinterpret_cast<uint8_t const*>(child.data<int8_t>());
+  auto const* message_data = child.data<uint8_t>();
 
   rmm::device_uvector<protobuf_detail::field_location> parent_locations(num_rows, stream, mr);
   copy_to_device(parent_locations, data.parent_locations, stream);
 
-  std::vector<std::unique_ptr<repeated_child_build_work>> child_work;
+  std::vector<repeated_child_build_work> child_work;
   child_work.reserve(num_repeated_children);
   for (int child_idx = 0; child_idx < num_repeated_children; ++child_idx) {
     auto const total_count = static_cast<int32_t>(data.occurrences_by_child[child_idx].size());
-    auto& work             = *child_work.emplace_back(
-      std::make_unique<repeated_child_build_work>(num_rows, total_count, stream, mr));
+    auto& work             = child_work.emplace_back(num_rows, total_count, stream, mr);
     copy_to_device(work.counts, data.counts_by_child[child_idx], stream);
     copy_to_device(work.occurrences, data.occurrences_by_child[child_idx], stream);
   }
@@ -1345,10 +1361,10 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
   protobuf_detail::protobuf_schema schema{context};
   stream.sync();
 
-  size_t total_bytes = 0;
-  for (auto const& message : data.messages) {
-    total_bytes += message.size();
-  }
+  auto const total_bytes = std::transform_reduce(
+    data.messages.begin(), data.messages.end(), size_t{0}, std::plus{}, [](auto const& message) {
+      return message.size();
+    });
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
@@ -1356,7 +1372,7 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
     results.reserve(num_repeated_children);
 
     for (int child_idx = 0; child_idx < num_repeated_children; ++child_idx) {
-      auto const& work = *child_work[child_idx];
+      auto const& work = child_work[child_idx];
       rmm::device_uvector<int32_t> list_offsets(num_rows + 1, stream, mr);
       thrust::exclusive_scan(rmm::exec_policy_nosync(stream, mr),
                              work.counts.begin(),
@@ -1367,9 +1383,15 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
         rmm::exec_policy_nosync(stream, mr), list_offsets.data() + num_rows, 1, work.total_count);
 
       protobuf_detail::field_occurrence_location_provider location_provider{
-        {message_data, static_cast<cudf::size_type>(child.size()), row_offsets, 0, num_rows},
-        {parent_locations.data(), parent_locations.size(), nullptr},
-        work.occurrences.data()};
+        .input       = {.message_data      = message_data,
+                        .message_data_size = static_cast<cudf::size_type>(child.size()),
+                        .row_offsets       = row_offsets,
+                        .base_offset       = 0,
+                        .num_rows          = num_rows},
+        .parent      = {.locations       = parent_locations.data(),
+                        .location_count  = parent_locations.size(),
+                        .top_row_indices = nullptr},
+        .occurrences = work.occurrences.data()};
       auto valid = [] __device__(cudf::size_type) { return true; };
       auto child_values =
         protobuf_detail::extract_and_build_string_or_bytes_column(schema.field(child_idx + 1),
@@ -1407,25 +1429,26 @@ static void BM_protobuf_many_repeated(nvbench::state& state)
   auto const num_rows       = static_cast<int>(state.get_int64("num_rows"));
   auto const num_rep_fields = static_cast<int>(state.get_int64("num_rep_fields"));
 
-  int const num_rep_str = std::max(1, num_rep_fields / 5);
+  int const num_rep_str = std::max(1, num_rep_fields / ManyRepeatedFieldsCase::FIELDS_PER_STRING);
   int const num_rep_int = num_rep_fields - num_rep_str;
 
   ManyRepeatedFieldsCase many_case{num_rep_int, num_rep_str};
-  auto ctx = many_case.build_context();
+  auto context = many_case.build_context();
 
   std::mt19937 rng(42);
   auto messages   = many_case.generate_messages(num_rows, /*avg_elems=*/3, rng);
   auto binary_col = make_binary_column(messages);
 
-  size_t total_bytes = 0;
-  for (auto const& m : messages)
-    total_bytes += m.size();
+  auto const total_bytes = std::transform_reduce(
+    messages.begin(), messages.end(), size_t{0}, std::plus{}, [](auto const& message) {
+      return message.size();
+    });
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     auto result = protobuf::decode_protobuf_to_struct(
-      binary_col->view(), ctx, stream, cudf::get_current_device_resource_ref());
+      binary_col->view(), context, stream, cudf::get_current_device_resource_ref());
   });
 
   state.add_element_count(num_rows, "Rows");
