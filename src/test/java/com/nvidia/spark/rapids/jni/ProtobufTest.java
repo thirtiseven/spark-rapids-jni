@@ -797,7 +797,7 @@ public class ProtobufTest {
              ColumnVector.fromStrings("\uFFFD"),
              ColumnVector.fromLists(
                  new ListType(true, new BasicType(true, DType.UINT8)),
-                 Arrays.asList((byte) 0xED, (byte) 0xA0, (byte) 0x80)));
+                 Arrays.asList(box(invalidUtf8))));
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
@@ -812,11 +812,26 @@ public class ProtobufTest {
   @Test
   void testInvalidUtf8SubsequenceBoundariesMatchSparkCpu() {
     byte[][] invalidUtf8 = new byte[][]{
-        new byte[]{(byte) 0xE2, 0x28, (byte) 0xA1},
+        new byte[]{(byte) 0xE2, (byte) '(', (byte) 0xA1},
         new byte[]{(byte) 0xE2, (byte) 0x82},
         new byte[]{(byte) 0xF0, (byte) 0x9F, (byte) 0x92},
+        new byte[]{(byte) 0x80},
+        new byte[]{(byte) 0xBF},
+        new byte[]{(byte) 0xC0, (byte) 0x80},
+        new byte[]{(byte) 0xC1, (byte) 0xBF},
+        new byte[]{(byte) 0xC2},
+        new byte[]{(byte) 0xC2, 0x40},
+        new byte[]{(byte) 0xE0, (byte) 0x80, (byte) 0x80},
+        new byte[]{(byte) 0xE0, (byte) 0x9F, (byte) 0x80},
+        new byte[]{(byte) 0xE0, (byte) 0xA0},
+        new byte[]{(byte) 0xED, (byte) 0xA0, (byte) 0x80},
+        new byte[]{(byte) 0xED, (byte) 0xBF, (byte) 0xBF},
+        new byte[]{(byte) 0xF0, (byte) 0x80, (byte) 0x80, (byte) 0x80},
+        new byte[]{(byte) 0xF0, (byte) 0x8F, (byte) 0x80, (byte) 0x80},
+        new byte[]{(byte) 0xF0, (byte) 0x90, (byte) 0x80},
         new byte[]{(byte) 0xF4, (byte) 0x90, (byte) 0x80, (byte) 0x80},
-        new byte[]{(byte) 0xE0, (byte) 0x80, (byte) 0x80}
+        new byte[]{(byte) 0xF5, (byte) 0x80, (byte) 0x80, (byte) 0x80},
+        new byte[]{(byte) 0xFF},
     };
     Byte[][] rows = Arrays.stream(invalidUtf8)
         .map(bytes -> concat(box(tag(1, WT_LEN)), encodeBytes(bytes)))
@@ -824,8 +839,11 @@ public class ProtobufTest {
 
     try (Table input = new Table.TestBuilder().column(rows).build();
          ColumnVector expectedValue = ColumnVector.fromStrings(
-             "\uFFFD(\uFFFD", "\uFFFD", "\uFFFD", "\uFFFD\uFFFD\uFFFD\uFFFD",
-             "\uFFFD\uFFFD\uFFFD");
+             "\uFFFD(\uFFFD", "\uFFFD", "\uFFFD", "\uFFFD", "\uFFFD",
+             "\uFFFD\uFFFD", "\uFFFD\uFFFD", "\uFFFD", "\uFFFD@",
+             "\uFFFD\uFFFD\uFFFD", "\uFFFD\uFFFD\uFFFD", "\uFFFD", "\uFFFD", "\uFFFD",
+             "\uFFFD\uFFFD\uFFFD\uFFFD", "\uFFFD\uFFFD\uFFFD\uFFFD", "\uFFFD",
+             "\uFFFD\uFFFD\uFFFD\uFFFD", "\uFFFD\uFFFD\uFFFD\uFFFD", "\uFFFD");
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedValue);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),

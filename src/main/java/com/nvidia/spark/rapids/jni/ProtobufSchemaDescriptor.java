@@ -341,8 +341,22 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
                                             int[] validValues, byte[][] names,
                                             boolean hasDefault, long defaultValue) {
     validateEnumTypeAndEncoding(index, outputTypeId, encoding, validValues, names);
-    validateEnumAsStringMetadata(index, encoding, validValues, names);
-    validateEnumValuesAndNamesPairing(index, validValues, names);
+    if (encoding == Protobuf.ENC_ENUM_STRING &&
+        (isNullOrEmpty(validValues) || isNullOrEmpty(names))) {
+      throw new IllegalArgumentException(
+          "Enum-as-string field at index " + index +
+          " must provide non-empty enumValidValues and enumNames");
+    }
+    if (validValues == null) {
+      if (names != null) {
+        throw new IllegalArgumentException(
+            "enumNames[" + index + "] is non-null but enumValidValues[" + index + "] is null; " +
+            "both must be provided together for enum-as-string fields");
+      }
+      return;
+    }
+    validateEnumValuesStrictlySorted(index, validValues);
+    validateEnumNamesLength(index, validValues, names);
     validateEnumDefault(index, validValues, hasDefault, defaultValue);
   }
 
@@ -360,30 +374,6 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
           "Enum metadata at index " + index +
           " requires INT32/DEFAULT or STRING/ENUM_STRING");
     }
-  }
-
-  private static void validateEnumAsStringMetadata(int index, int encoding,
-                                                    int[] validValues, byte[][] names) {
-    if (encoding == Protobuf.ENC_ENUM_STRING &&
-        (isNullOrEmpty(validValues) || isNullOrEmpty(names))) {
-      throw new IllegalArgumentException(
-          "Enum-as-string field at index " + index +
-          " must provide non-empty enumValidValues and enumNames");
-    }
-  }
-
-  private static void validateEnumValuesAndNamesPairing(int index, int[] validValues,
-                                                         byte[][] names) {
-    if (validValues == null) {
-      if (names != null) {
-        throw new IllegalArgumentException(
-            "enumNames[" + index + "] is non-null but enumValidValues[" + index + "] is null; " +
-            "both must be provided together for enum-as-string fields");
-      }
-      return;
-    }
-    validateEnumValuesStrictlySorted(index, validValues);
-    validateEnumNamesLength(index, validValues, names);
   }
 
   private static void validateEnumValuesStrictlySorted(int index, int[] validValues) {
@@ -407,9 +397,11 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
 
   private static void validateEnumDefault(int index, int[] validValues,
                                           boolean hasDefault, long defaultValue) {
-    if (validValues != null && hasDefault && validValues.length > 0 &&
-        (defaultValue < Integer.MIN_VALUE || defaultValue > Integer.MAX_VALUE ||
-         Arrays.binarySearch(validValues, (int) defaultValue) < 0)) {
+    if (!hasDefault || isNullOrEmpty(validValues)) {
+      return;
+    }
+    int defaultInt = (int) defaultValue;
+    if (defaultInt != defaultValue || Arrays.binarySearch(validValues, defaultInt) < 0) {
       throw new IllegalArgumentException(
           "Enum default at index " + index + " must be present in enumValidValues");
     }

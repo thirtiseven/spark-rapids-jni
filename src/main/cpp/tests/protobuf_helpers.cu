@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "protobuf/protobuf.hpp"
 #include "protobuf/protobuf_kernels.cuh"
 
 #include <cudf_test/base_fixture.hpp>
@@ -30,9 +31,62 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <cstdint>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 class ProtobufHelpersTest : public cudf::test::BaseFixture {};
+
+namespace {
+
+namespace protobuf = spark_rapids_jni::protobuf;
+
+protobuf::protobuf_decode_context make_numeric_enum_context(int64_t default_value)
+{
+  auto const stream = cudf::get_default_stream();
+
+  std::vector<cudf::detail::host_vector<uint8_t>> default_strings;
+  default_strings.emplace_back(cudf::detail::make_pinned_vector_async<uint8_t>(0, stream));
+
+  std::vector<cudf::detail::host_vector<int32_t>> enum_valid_values;
+  auto values = cudf::detail::make_pinned_vector_async<int32_t>(3, stream);
+  values[0]   = 0;
+  values[1]   = 1;
+  values[2]   = 2;
+  enum_valid_values.emplace_back(std::move(values));
+
+  std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> enum_names(1);
+  return {{{1,
+            -1,
+            0,
+            protobuf::proto_wire_type::VARINT,
+            cudf::type_id::INT32,
+            protobuf::proto_encoding::DEFAULT,
+            false,
+            false,
+            true}},
+          {default_value},
+          {0.0},
+          {false},
+          std::move(default_strings),
+          std::move(enum_valid_values),
+          std::move(enum_names),
+          true,
+          {}};
+}
+
+}  // namespace
+
+TEST_F(ProtobufHelpersTest, NumericEnumDefaultMustFitInt32)
+{
+  auto valid_context = make_numeric_enum_context(2);
+  EXPECT_NO_THROW(protobuf::detail::validate_decode_context(valid_context));
+
+  auto out_of_range_context = make_numeric_enum_context(int64_t{1} << 42);
+  EXPECT_THROW(protobuf::detail::validate_decode_context(out_of_range_context),
+               std::invalid_argument);
+}
 
 TEST_F(ProtobufHelpersTest, NullMaskFromPaddedValidUsesZeroLogicalRows)
 {

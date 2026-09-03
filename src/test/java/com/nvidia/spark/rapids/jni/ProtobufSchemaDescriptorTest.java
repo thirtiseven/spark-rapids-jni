@@ -111,6 +111,11 @@ public class ProtobufSchemaDescriptorTest {
             .addField(1, DType.INT32).defaultValue(99)
                 .enumValidValues(new int[]{0, 1, 2})
             .build());
+    assertThrows(IllegalArgumentException.class, () ->
+        new ProtobufSchemaDescriptorBuilder()
+            .addField(1, DType.INT32).defaultValue(1L << 42)
+                .enumValidValues(new int[]{0, 1, 2})
+            .build());
     assertDoesNotThrow(() ->
         new ProtobufSchemaDescriptorBuilder()
             .addField(1, DType.INT32).defaultValue(2)

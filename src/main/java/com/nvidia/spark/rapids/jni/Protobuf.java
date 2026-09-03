@@ -45,9 +45,9 @@ import ai.rapids.cudf.NativeDepsLoader;
  *   <li>Nested messages and repeated fields</li>
  * </ul>
  *
- * <p>In permissive mode ({@code failOnErrors=false}), a malformed top-level message produces a null
- * STRUCT row. Valid protobuf fields that are absent still follow the normal missing-field semantics
- * (nulls or defaults, depending on the schema metadata).
+ * <p>In permissive mode ({@code failOnErrors=false}), malformed data in a top-level message or any
+ * nested message produces a null top-level STRUCT row. Valid protobuf fields that are absent still
+ * follow the normal missing-field semantics (nulls or defaults, depending on the schema metadata).
  */
 public class Protobuf {
   static {
