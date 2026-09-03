@@ -467,22 +467,21 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     auto d_field_lookup =
       cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
 
-    auto const descriptor_lookup =
-      lookup_view<field_descriptor>{field_descs.device.data(),
-                                    static_cast<int>(field_descs.host.size()),
-                                    h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
-                                    static_cast<int>(h_field_lookup.size())};
-    auto const fields = field_scan_view{{d_nested_locations.data(), num_nested},
-                                        {d_repeated_info.data(), num_repeated},
-                                        {d_nested_occurrence_info.data(), num_nested},
-                                        d_multiple_nested_fields.data(),
-                                        descriptor_lookup};
-    launch_count_repeated_fields(*d_in,
-                                 fields,
-                                 d_error.data(),
-                                 d_deferred_enum_error.data(),
-                                 track_permissive_null_rows ? d_row_force_null.data() : nullptr,
-                                 stream);
+    launch_count_repeated_fields(
+      *d_in,
+      field_scan_view{
+        .locations               = {.data = d_nested_locations.data(), .stride = num_nested},
+        .repeated_info           = {.data = d_repeated_info.data(), .stride = num_repeated},
+        .singular_message_info   = {.data = d_nested_occurrence_info.data(), .stride = num_nested},
+        .multiple_message_fields = d_multiple_nested_fields.data(),
+        .lookup                  = {.data        = field_descs.device.data(),
+                                    .size        = static_cast<int>(field_descs.host.size()),
+                                    .direct      = h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
+                                    .direct_size = static_cast<int>(h_field_lookup.size())}},
+      d_error.data(),
+      d_deferred_enum_error.data(),
+      track_permissive_null_rows ? d_row_force_null.data() : nullptr,
+      stream);
   }
 
   std::vector<std::optional<repeated_field_work>> nested_merge_work(num_nested);
@@ -531,19 +530,20 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     auto d_field_lookup =
       cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
 
-    auto const descriptor_lookup =
-      lookup_view<field_descriptor>{field_descs.device.data(),
-                                    num_scalar,
-                                    h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
-                                    static_cast<int>(h_field_lookup.size())};
-    auto const fields = field_scan_view{
-      {d_locations.data(), num_scalar}, {nullptr, 0}, {nullptr, 0}, nullptr, descriptor_lookup};
-    launch_scan_all_fields(*d_in,
-                           fields,
-                           d_error.data(),
-                           d_deferred_enum_error.data(),
-                           track_permissive_null_rows ? d_row_force_null.data() : nullptr,
-                           stream);
+    launch_scan_all_fields(
+      *d_in,
+      field_scan_view{.locations               = {.data = d_locations.data(), .stride = num_scalar},
+                      .repeated_info           = {.data = nullptr, .stride = 0},
+                      .singular_message_info   = {.data = nullptr, .stride = 0},
+                      .multiple_message_fields = nullptr,
+                      .lookup                  = {.data   = field_descs.device.data(),
+                                                  .size   = num_scalar,
+                                                  .direct = h_field_lookup.empty() ? nullptr : d_field_lookup.data(),
+                                                  .direct_size = static_cast<int>(h_field_lookup.size())}},
+      d_error.data(),
+      d_deferred_enum_error.data(),
+      track_permissive_null_rows ? d_row_force_null.data() : nullptr,
+      stream);
 
     // Required-field validation applies to all scalar leaves, not just top-level numerics.
     maybe_check_required_fields({d_locations.data(),
@@ -644,9 +644,11 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
         int schema_idx = scalar_field_indices[i];
         top_level_location_provider loc_provider{
           list_offsets, base_offset, d_locations.data(), i, num_scalar};
-        auto const request =
-          protobuf_field_decode_request{recursive_context, message_data, schema_idx, num_rows};
-        column_map[schema_idx] = extract_typed_column(request, loc_provider, stream, mr);
+        column_map[schema_idx] = extract_typed_column(
+          protobuf_field_decode_request{recursive_context, message_data, schema_idx, num_rows},
+          loc_provider,
+          stream,
+          mr);
       }
     }
 
@@ -663,10 +665,12 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
       auto valid_fn = [loc_provider, has_default] __device__(cudf::size_type row) {
         return loc_provider.valid(row) || has_default;
       };
-      auto const request =
-        protobuf_field_decode_request{recursive_context, message_data, schema_idx, num_rows};
-      column_map[schema_idx] =
-        build_protobuf_field_values_column_shared(request, loc_provider, valid_fn, stream, mr);
+      column_map[schema_idx] = build_protobuf_field_values_column_shared(
+        protobuf_field_decode_request{recursive_context, message_data, schema_idx, num_rows},
+        loc_provider,
+        valid_fn,
+        stream,
+        mr);
     }
   }
 

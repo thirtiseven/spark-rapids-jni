@@ -3973,8 +3973,7 @@ public class ProtobufTest {
     // message Outer { Inner inner = 1; }
     // enum Priority { UNKNOWN=0; FOO=1; BAR=2; }
     byte[] packedPriorities = concatBytes(encodeVarint(0), encodeVarint(2), encodeVarint(1));
-    Byte[] inner = concat(
-        box(tag(1, WT_LEN)), encodeBytes(packedPriorities));
+    Byte[] inner = concat(box(tag(1, WT_LEN)), encodeBytes(packedPriorities));
     Byte[] row = concat(box(tag(1, WT_LEN)), encodeMessage(inner));
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedPriorities = ColumnVector.fromLists(

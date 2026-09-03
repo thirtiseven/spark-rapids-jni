@@ -147,8 +147,7 @@ public final class ProtobufSchemaDescriptorBuilder {
   }
 
   public ProtobufSchemaDescriptorBuilder repeated() {
-    current().isRepeated = true;
-    return this;
+    return repeated(true);
   }
 
   /** Set whether the current field is repeated. */
@@ -205,8 +204,7 @@ public final class ProtobufSchemaDescriptorBuilder {
    * incompatible field (e.g. a repeated or STRUCT field) to exercise validation.
    */
   public ProtobufSchemaDescriptorBuilder hasDefault() {
-    current().hasDefaultValue = true;
-    return this;
+    return hasDefault(true);
   }
 
   /** Set whether the current field has a default value. */
