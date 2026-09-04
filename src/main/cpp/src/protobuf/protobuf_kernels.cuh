@@ -395,13 +395,13 @@ CUDF_KERNEL void extract_utf8_lengths_kernel(uint8_t const* message_data,
   auto const loc      = loc_provider.get(idx, data_offset);
   auto const* data    = loc.offset >= 0 ? message_data + data_offset : default_data;
   auto const size     = loc.offset >= 0 ? loc.length : default_length;
-  if (data == nullptr || size == 0) {
+  if (data == nullptr || size <= 0) {
     out_lengths[idx] = 0;
     return;
   }
 
-  auto const repaired_length = repaired_utf8_length(data, size);
-  if (repaired_length > cuda::std::numeric_limits<int32_t>::max()) {
+  auto const repaired_length = repaired_utf8_length(data, static_cast<uint32_t>(size));
+  if (repaired_length > static_cast<uint64_t>(cuda::std::numeric_limits<int32_t>::max())) {
     out_lengths[idx] = 0;
     if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
     return;
@@ -425,7 +425,9 @@ CUDF_KERNEL void copy_repaired_utf8_kernel(uint8_t const* message_data,
   auto const loc      = loc_provider.get(idx, data_offset);
   auto const* data    = loc.offset >= 0 ? message_data + data_offset : default_data;
   auto const size     = loc.offset >= 0 ? loc.length : default_length;
-  if (data != nullptr && size > 0) { copy_repaired_utf8(data, size, output + output_offsets[idx]); }
+  if (data != nullptr && size > 0) {
+    copy_repaired_utf8(data, static_cast<uint32_t>(size), output + output_offsets[idx]);
+  }
 }
 
 // ============================================================================

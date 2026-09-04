@@ -246,7 +246,7 @@ __device__ inline bool checked_add_int32(int32_t lhs, int32_t rhs, int32_t& out)
 }
 
 struct utf8_sequence {
-  int bytes;
+  uint8_t bytes;
   bool valid;
 };
 
@@ -267,8 +267,9 @@ __device__ inline utf8_sequence inspect_utf8_sequence(uint8_t const* cur, uint8_
   bool const second_is_continuation = cudf::strings::detail::is_utf8_continuation_char(b1);
   // Java consumes a UTF-8-encoded surrogate as one malformed subsequence.
   if (b0 == 0xEDu && second_is_continuation && b1 >= 0xA0u) {
-    auto const bytes =
-      cur + 2 < end && cudf::strings::detail::is_utf8_continuation_char(cur[2]) ? 3 : 2;
+    uint8_t const bytes = cur + 2 < end && cudf::strings::detail::is_utf8_continuation_char(cur[2])
+                            ? uint8_t{3}
+                            : uint8_t{2};
     return {bytes, false};
   }
   bool const valid_second = second_is_continuation && (b0 != 0xE0u || b1 >= 0xA0u) &&
@@ -286,9 +287,9 @@ __device__ inline utf8_sequence inspect_utf8_sequence(uint8_t const* cur, uint8_
   return {4, true};
 }
 
-__device__ inline int64_t repaired_utf8_length(uint8_t const* data, int32_t size)
+__device__ inline uint64_t repaired_utf8_length(uint8_t const* data, uint32_t size)
 {
-  int64_t result  = 0;
+  uint64_t result = 0;
   auto const* cur = data;
   auto const* end = data + size;
   while (cur < end) {
@@ -299,7 +300,7 @@ __device__ inline int64_t repaired_utf8_length(uint8_t const* data, int32_t size
   return result;
 }
 
-__device__ inline void copy_repaired_utf8(uint8_t const* data, int32_t size, char* output)
+__device__ inline void copy_repaired_utf8(uint8_t const* data, uint32_t size, char* output)
 {
   auto const* cur = data;
   auto const* end = data + size;

@@ -40,7 +40,7 @@ enum class proto_encoding : int {
 
 constexpr int MAX_FIELD_NUMBER = (1 << 29) - 1;
 
-enum class proto_wire_type : int {
+enum class proto_wire_type : uint32_t {
   VARINT = 0,
   I64BIT = 1,
   LEN    = 2,

@@ -272,21 +272,19 @@ void validate_decode_context(protobuf_decode_context const& context)
                  std::invalid_argument);
 
     auto const& enum_values_for_field = context.enum_valid_values()[i];
-    if (!enum_values_for_field.empty()) {
-      CUDF_EXPECTS(std::ranges::is_sorted(enum_values_for_field, std::less_equal{}),
-                   "protobuf decode context: enum_valid_values must be strictly sorted at field " +
-                     std::to_string(i),
-                   std::invalid_argument);
-      if (field.has_default_value) {
-        auto const default_value = context.default_ints()[i];
-        CUDF_EXPECTS(
-          std::in_range<int32_t>(default_value) &&
-            std::ranges::binary_search(enum_values_for_field, static_cast<int32_t>(default_value)),
-          "protobuf decode context: enum default must be present in enum_valid_values "
-          "at field " +
-            std::to_string(i),
-          std::invalid_argument);
-      }
+    CUDF_EXPECTS(std::ranges::is_sorted(enum_values_for_field, std::less_equal{}),
+                 "protobuf decode context: enum_valid_values must be strictly sorted at field " +
+                   std::to_string(i),
+                 std::invalid_argument);
+    if (!enum_values_for_field.empty() && field.has_default_value) {
+      auto const default_value = context.default_ints()[i];
+      CUDF_EXPECTS(
+        std::in_range<int32_t>(default_value) &&
+          std::ranges::binary_search(enum_values_for_field, static_cast<int32_t>(default_value)),
+        "protobuf decode context: enum default must be present in enum_valid_values "
+        "at field " +
+          std::to_string(i),
+        std::invalid_argument);
     }
 
     if (field.encoding == proto_encoding::ENUM_STRING) {
