@@ -663,7 +663,8 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
       top_level_location_provider loc_provider{
         list_offsets, base_offset, d_locations.data(), i, num_scalar};
       auto valid_fn = [loc_provider, has_default] __device__(cudf::size_type row) {
-        return loc_provider.valid(row) || has_default;
+        int32_t data_offset = 0;
+        return loc_provider.get(row, data_offset).offset >= 0 || has_default;
       };
       column_map[schema_idx] = build_protobuf_field_values_column_shared(
         protobuf_field_decode_request{recursive_context, message_data, schema_idx, num_rows},
