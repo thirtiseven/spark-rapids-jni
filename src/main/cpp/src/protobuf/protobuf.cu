@@ -741,31 +741,31 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
       switch (element_type) {
         case cudf::type_id::INT32:
           column_map[schema_idx] = build_repeated_scalar_column<int32_t>(
-            binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
+            binary_input, input, recursive_context, std::move(w), stream, mr);
           break;
         case cudf::type_id::INT64:
           column_map[schema_idx] = build_repeated_scalar_column<int64_t>(
-            binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
+            binary_input, input, recursive_context, std::move(w), stream, mr);
           break;
         case cudf::type_id::UINT32:
           column_map[schema_idx] = build_repeated_scalar_column<uint32_t>(
-            binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
+            binary_input, input, recursive_context, std::move(w), stream, mr);
           break;
         case cudf::type_id::UINT64:
           column_map[schema_idx] = build_repeated_scalar_column<uint64_t>(
-            binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
+            binary_input, input, recursive_context, std::move(w), stream, mr);
           break;
         case cudf::type_id::FLOAT32:
           column_map[schema_idx] = build_repeated_scalar_column<float>(
-            binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
+            binary_input, input, recursive_context, std::move(w), stream, mr);
           break;
         case cudf::type_id::FLOAT64:
           column_map[schema_idx] = build_repeated_scalar_column<double>(
-            binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
+            binary_input, input, recursive_context, std::move(w), stream, mr);
           break;
         case cudf::type_id::BOOL8:
           column_map[schema_idx] = build_repeated_scalar_column<uint8_t>(
-            binary_input, input, schema_context, decode_ctx, std::move(w), stream, mr);
+            binary_input, input, recursive_context, std::move(w), stream, mr);
           break;
         case cudf::type_id::STRING: {
           auto const encoding = field_meta.schema.encoding;

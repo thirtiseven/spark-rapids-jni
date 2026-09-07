@@ -824,15 +824,14 @@ template <typename T>
 inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
   cudf::column_view const& binary_input,
   protobuf_input_view input,
-  protobuf_schema const& schema,
-  protobuf_decode_runtime_context decode_ctx,
+  recursive_decode_context context,
   repeated_field_work work,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   validate_nonempty_repeated_field_work(work, input.num_rows);
 
-  auto const field       = schema.field(work.schema_idx);
+  auto const field       = context.schema.field(work.schema_idx);
   auto const total_count = work.total_count;
   auto& occurrences      = work.occurrences;
   field_occurrence_location_provider loc_provider{input, {nullptr, 0, nullptr}, occurrences.data()};
@@ -840,7 +839,6 @@ inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
   std::unique_ptr<cudf::column> child_col;
   if constexpr (std::is_same_v<T, int32_t>) {
     if (!field.enum_valid_values.empty()) {
-      auto const context = recursive_decode_context{schema, decode_ctx};
       auto const request =
         protobuf_field_decode_request{context, input.message_data, work.schema_idx, total_count};
       child_col = extract_typed_column(request, loc_provider, stream, mr);
@@ -855,7 +853,7 @@ inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
       total_count,
       field.schema.encoding,
       {false, T{}},
-      {values.data(), nullptr, decode_ctx.error->data()},
+      {values.data(), nullptr, context.runtime.error->data()},
       stream);
     child_col = std::make_unique<cudf::column>(
       field.output_type, total_count, values.release(), rmm::device_buffer{}, 0);
