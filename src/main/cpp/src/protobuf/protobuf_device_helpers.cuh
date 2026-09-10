@@ -52,6 +52,7 @@ __device__ inline bool read_varint(uint8_t const* cur, uint8_t const* end, T& ou
     ++bytes;
     // Spark calls DynamicMessage.parseFrom(byte[]), whose protobuf-java array fast path
     // sign-extends after the ninth continuation byte and uses the tenth only for termination.
+    // Only uint64_t reaches this branch: 63 is divisible by 7, but 31 is not.
     if (shift == sizeof(T) * 8 - 1) {
       out |= T{1} << shift;
     } else if (shift < sizeof(T) * 8) {

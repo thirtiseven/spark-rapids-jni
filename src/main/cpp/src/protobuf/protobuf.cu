@@ -63,15 +63,15 @@ protobuf_decode_context::protobuf_decode_context(
   std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> enum_names,
   bool fail_on_errors,
   std::vector<bool> output_fields)
-  : schema_(std::move(schema)),
-    default_ints_(std::move(default_ints)),
-    default_floats_(std::move(default_floats)),
-    default_bools_(std::move(default_bools)),
-    default_strings_(std::move(default_strings)),
-    enum_valid_values_(std::move(enum_valid_values)),
-    enum_names_(std::move(enum_names)),
-    fail_on_errors_(fail_on_errors),
-    output_fields_(std::move(output_fields))
+  : schema(std::move(schema)),
+    default_ints(std::move(default_ints)),
+    default_floats(std::move(default_floats)),
+    default_bools(std::move(default_bools)),
+    default_strings(std::move(default_strings)),
+    enum_valid_values(std::move(enum_valid_values)),
+    enum_names(std::move(enum_names)),
+    fail_on_errors(fail_on_errors),
+    output_fields(std::move(output_fields))
 {
   detail::validate_decode_context(*this);
 }
@@ -80,17 +80,28 @@ protobuf_decode_context::protobuf_decode_context(std::vector<nested_field_descri
                                                  bool fail_on_errors,
                                                  cuda::stream_ref stream,
                                                  std::vector<bool> output_fields)
-  : schema_(std::move(schema)),
-    default_ints_(schema_.size(), 0),
-    default_floats_(schema_.size(), 0.0),
-    default_bools_(schema_.size(), false),
-    default_strings_(make_empty_metadata<uint8_t>(schema_.size(), stream)),
-    enum_valid_values_(make_empty_metadata<int32_t>(schema_.size(), stream)),
-    enum_names_(schema_.size()),
-    fail_on_errors_(fail_on_errors),
-    output_fields_(std::move(output_fields))
+  // List-initialization captures the field count before moving schema.
+  : protobuf_decode_context{
+      schema.size(), std::move(schema), fail_on_errors, stream, std::move(output_fields)}
 {
-  detail::validate_decode_context(*this);
+}
+
+protobuf_decode_context::protobuf_decode_context(std::size_t num_fields,
+                                                 std::vector<nested_field_descriptor> schema,
+                                                 bool fail_on_errors,
+                                                 cuda::stream_ref stream,
+                                                 std::vector<bool> output_fields)
+  : protobuf_decode_context(
+      std::move(schema),
+      std::vector<int64_t>(num_fields, 0),
+      std::vector<double>(num_fields, 0.0),
+      std::vector<bool>(num_fields, false),
+      make_empty_metadata<uint8_t>(num_fields, stream),
+      make_empty_metadata<int32_t>(num_fields, stream),
+      std::vector<std::vector<cudf::detail::host_vector<uint8_t>>>(num_fields),
+      fail_on_errors,
+      std::move(output_fields))
+{
 }
 
 namespace detail {
@@ -166,27 +177,27 @@ bool is_encoding_compatible(nested_field_descriptor const& field, cudf::data_typ
 
 void validate_decode_context(protobuf_decode_context const& context)
 {
-  auto const& schema    = context.schema();
+  auto const& schema    = context.schema;
   auto const num_fields = schema.size();
-  CUDF_EXPECTS(context.default_ints().size() == num_fields,
+  CUDF_EXPECTS(context.default_ints.size() == num_fields,
                "protobuf decode context: default_ints size mismatch",
                std::invalid_argument);
-  CUDF_EXPECTS(context.default_floats().size() == num_fields,
+  CUDF_EXPECTS(context.default_floats.size() == num_fields,
                "protobuf decode context: default_floats size mismatch",
                std::invalid_argument);
-  CUDF_EXPECTS(context.default_bools().size() == num_fields,
+  CUDF_EXPECTS(context.default_bools.size() == num_fields,
                "protobuf decode context: default_bools size mismatch",
                std::invalid_argument);
-  CUDF_EXPECTS(context.default_strings().size() == num_fields,
+  CUDF_EXPECTS(context.default_strings.size() == num_fields,
                "protobuf decode context: default_strings size mismatch",
                std::invalid_argument);
-  CUDF_EXPECTS(context.enum_valid_values().size() == num_fields,
+  CUDF_EXPECTS(context.enum_valid_values.size() == num_fields,
                "protobuf decode context: enum_valid_values size mismatch",
                std::invalid_argument);
-  CUDF_EXPECTS(context.enum_names().size() == num_fields,
+  CUDF_EXPECTS(context.enum_names.size() == num_fields,
                "protobuf decode context: enum_names size mismatch",
                std::invalid_argument);
-  CUDF_EXPECTS(context.output_fields().empty() || context.output_fields().size() == num_fields,
+  CUDF_EXPECTS(context.output_fields.empty() || context.output_fields.size() == num_fields,
                "protobuf decode context: output_fields size mismatch",
                std::invalid_argument);
 
@@ -221,12 +232,12 @@ void validate_decode_context(protobuf_decode_context const& context)
       CUDF_EXPECTS(schema[field.parent_idx].output_type == cudf::type_id::STRUCT,
                    "protobuf decode context: parent must be STRUCT at field " + std::to_string(i),
                    std::invalid_argument);
-      if (!context.output_fields().empty()) {
+      if (!context.output_fields.empty()) {
         // A field and its parent must share the same output flag: a hidden STRUCT cannot have
         // visible descendants (the parent would have to be materialized anyway), and a visible
         // STRUCT cannot have hidden children. Forbid the mismatch up front.
         CUDF_EXPECTS(
-          context.output_fields()[i] == context.output_fields()[field.parent_idx],
+          context.output_fields[i] == context.output_fields[field.parent_idx],
           "protobuf decode context: child output flag mismatch at field " + std::to_string(i),
           std::invalid_argument);
       }
@@ -259,7 +270,7 @@ void validate_decode_context(protobuf_decode_context const& context)
                    std::to_string(i),
                  std::invalid_argument);
 
-    auto const has_enum_metadata = !context.enum_valid_values()[i].empty();
+    auto const has_enum_metadata = !context.enum_valid_values[i].empty();
     auto const is_numeric_enum =
       type.id() == cudf::type_id::INT32 && field.encoding == proto_encoding::DEFAULT;
     auto const is_string_enum =
@@ -271,13 +282,13 @@ void validate_decode_context(protobuf_decode_context const& context)
                    ", encoding=" + std::to_string(static_cast<int>(field.encoding)) + ")",
                  std::invalid_argument);
 
-    auto const& enum_values_for_field = context.enum_valid_values()[i];
+    auto const& enum_values_for_field = context.enum_valid_values[i];
     CUDF_EXPECTS(std::ranges::is_sorted(enum_values_for_field, std::less_equal{}),
                  "protobuf decode context: enum_valid_values must be strictly sorted at field " +
                    std::to_string(i),
                  std::invalid_argument);
     if (!enum_values_for_field.empty() && field.has_default_value) {
-      auto const default_value = context.default_ints()[i];
+      auto const default_value = context.default_ints[i];
       CUDF_EXPECTS(
         std::in_range<int32_t>(default_value) &&
           std::ranges::binary_search(enum_values_for_field, static_cast<int32_t>(default_value)),
@@ -289,12 +300,12 @@ void validate_decode_context(protobuf_decode_context const& context)
 
     if (field.encoding == proto_encoding::ENUM_STRING) {
       CUDF_EXPECTS(
-        !(enum_values_for_field.empty() || context.enum_names()[i].empty()),
+        !(enum_values_for_field.empty() || context.enum_names[i].empty()),
         "protobuf decode context: enum-as-string field requires non-empty metadata at field " +
           std::to_string(i),
         std::invalid_argument);
       CUDF_EXPECTS(
-        enum_values_for_field.size() == context.enum_names()[i].size(),
+        enum_values_for_field.size() == context.enum_names[i].size(),
         "protobuf decode context: enum-as-string metadata mismatch at field " + std::to_string(i),
         std::invalid_argument);
     }
@@ -303,30 +314,30 @@ void validate_decode_context(protobuf_decode_context const& context)
 
 protobuf_schema::protobuf_schema(protobuf_decode_context const& context) : context_(context)
 {
-  children_by_parent_.resize(context.schema().size() + 1);
+  children_by_parent_.resize(context.schema.size() + 1);
   std::vector<size_t> child_counts(children_by_parent_.size());
-  for (auto const& field : context.schema()) {
+  for (auto const& field : context.schema) {
     ++child_counts[field.parent_idx + 1];
   }
   for (size_t parent_idx = 0; parent_idx < children_by_parent_.size(); ++parent_idx) {
     children_by_parent_[parent_idx].reserve(child_counts[parent_idx]);
   }
-  for (int schema_idx = 0; schema_idx < static_cast<int>(context.schema().size()); ++schema_idx) {
-    children_by_parent_[context.schema()[schema_idx].parent_idx + 1].push_back(schema_idx);
+  for (int schema_idx = 0; schema_idx < static_cast<int>(context.schema.size()); ++schema_idx) {
+    children_by_parent_[context.schema[schema_idx].parent_idx + 1].push_back(schema_idx);
   }
 }
 
 protobuf_field_meta_view protobuf_schema::field(int schema_idx) const
 {
   auto const idx = static_cast<size_t>(schema_idx);
-  return {context_.schema().at(idx),
-          cudf::data_type{context_.schema().at(idx).output_type},
-          context_.default_ints().at(idx),
-          context_.default_floats().at(idx),
-          context_.default_bools().at(idx),
-          context_.default_strings().at(idx),
-          context_.enum_valid_values().at(idx),
-          context_.enum_names().at(idx)};
+  return {context_.schema.at(idx),
+          cudf::data_type{context_.schema.at(idx).output_type},
+          context_.default_ints.at(idx),
+          context_.default_floats.at(idx),
+          context_.default_bools.at(idx),
+          context_.default_strings.at(idx),
+          context_.enum_valid_values.at(idx),
+          context_.enum_names.at(idx)};
 }
 
 std::vector<int> const& protobuf_schema::children(int parent_schema_idx) const
@@ -339,7 +350,7 @@ std::vector<int> const& protobuf_schema::children(int parent_schema_idx) const
 bool protobuf_schema::is_output(int schema_idx) const
 {
   auto const idx = static_cast<size_t>(schema_idx);
-  return context_.output_fields().empty() || context_.output_fields().at(idx);
+  return context_.output_fields.empty() || context_.output_fields.at(idx);
 }
 
 std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const& binary_input,
@@ -349,7 +360,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
 {
   protobuf_schema schema_context{context};
   auto const& schema  = schema_context.fields();
-  bool fail_on_errors = context.fail_on_errors();
+  bool fail_on_errors = context.fail_on_errors;
   CUDF_EXPECTS(binary_input.type().id() == cudf::type_id::LIST,
                "binary_input must be a LIST<INT8/UINT8> column");
   cudf::lists_column_view const in_list(binary_input);

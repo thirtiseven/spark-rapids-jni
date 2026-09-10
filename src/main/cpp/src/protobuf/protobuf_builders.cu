@@ -29,8 +29,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <source_location>
 #include <string>
@@ -60,29 +62,27 @@ field_descriptor_bundle make_field_descriptors(std::vector<int> const& field_ind
                "protobuf field descriptor output index count must match field count");
   auto h_descriptors =
     cudf::detail::make_pinned_vector_async<field_descriptor>(field_indices.size(), stream);
-  std::vector<size_t> enum_offsets(field_indices.size() + 1);
-  for (size_t i = 0; i < field_indices.size(); ++i) {
+  auto const num_enum_values = std::transform_reduce(
+    field_indices.begin(), field_indices.end(), size_t{0}, std::plus{}, [&](int idx) {
+      return schema.field(idx).enum_valid_values.size();
+    });
+  auto h_enum_values = cudf::detail::make_pinned_vector_async<int32_t>(num_enum_values, stream);
+  rmm::device_uvector<int32_t> d_enum_values(num_enum_values, stream, mr);
+  for (size_t i = 0, enum_offset = 0; i < field_indices.size(); ++i) {
     auto const field     = schema.field(field_indices[i]);
     auto const enum_size = field.enum_valid_values.size();
-    CUDF_EXPECTS(enum_size <= static_cast<size_t>(std::numeric_limits<int>::max()),
+    CUDF_EXPECTS(std::in_range<int>(enum_size),
                  "protobuf enum metadata exceeds supported value count");
-    h_descriptors[i] = {field.schema.field_number,
-                        field.schema.wire_type,
-                        field.schema.is_repeated,
-                        field.schema.output_type == cudf::type_id::STRUCT,
-                        nullptr,
-                        static_cast<int>(enum_size)};
-    if (!output_indices.empty()) { h_descriptors[i].output_index = output_indices[i]; }
-    enum_offsets[i + 1] = enum_offsets[i] + enum_size;
-  }
-
-  auto h_enum_values = cudf::detail::make_pinned_vector_async<int32_t>(enum_offsets.back(), stream);
-  rmm::device_uvector<int32_t> d_enum_values(enum_offsets.back(), stream, mr);
-  for (size_t i = 0; i < field_indices.size(); ++i) {
-    auto const& values = schema.field(field_indices[i]).enum_valid_values;
-    std::copy(values.begin(), values.end(), h_enum_values.begin() + enum_offsets[i]);
-    h_descriptors[i].valid_enum_values =
-      h_descriptors[i].num_valid_enum_values > 0 ? d_enum_values.data() + enum_offsets[i] : nullptr;
+    h_descriptors[i] = {
+      .field_number          = field.schema.field_number,
+      .expected_wire_type    = field.schema.wire_type,
+      .is_repeated           = field.schema.is_repeated,
+      .is_message            = field.schema.output_type == cudf::type_id::STRUCT,
+      .valid_enum_values     = enum_size > 0 ? d_enum_values.data() + enum_offset : nullptr,
+      .num_valid_enum_values = static_cast<int>(enum_size),
+      .output_index          = output_indices.empty() ? -1 : output_indices[i]};
+    std::ranges::copy(field.enum_valid_values, h_enum_values.begin() + enum_offset);
+    enum_offset += enum_size;
   }
   if (!h_enum_values.empty()) {
     CUDF_CUDA_TRY(cudf::detail::memcpy_async(
@@ -419,7 +419,7 @@ std::unique_ptr<cudf::column> build_repeated_enum_string_column(
   // 1. Extract enum integer values from occurrences
   rmm::device_uvector<int32_t> enum_ints(total_count, stream, scratch_mr);
   rmm::device_uvector<bool> elem_valid(total_count, stream, scratch_mr);
-  field_occurrence_location_provider rep_loc{input, {nullptr, 0, nullptr}, occurrences.data()};
+  field_occurrence_location_provider rep_loc{input, {}, occurrences.data()};
   extract_scalar_into_buffers<int32_t>(
     input.message_data,
     rep_loc,
@@ -460,7 +460,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
   rmm::device_uvector<int32_t> str_lengths(total_count, stream, scratch_mr);
   auto const threads = THREADS_PER_BLOCK;
   auto const blocks  = static_cast<int>((total_count + threads - 1u) / threads);
-  field_occurrence_location_provider loc_provider{input, {nullptr, 0, nullptr}, occurrences.data()};
+  field_occurrence_location_provider loc_provider{input, {}, occurrences.data()};
   // STRING must size repaired UTF-8; BYTES can reuse the encoded payload length.
   if (is_bytes) {
     extract_lengths_kernel<field_occurrence_location_provider>

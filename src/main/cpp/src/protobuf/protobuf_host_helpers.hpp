@@ -79,15 +79,15 @@ class protobuf_schema {
 
   [[nodiscard]] std::vector<nested_field_descriptor> const& fields() const
   {
-    return context_.schema();
+    return context_.schema;
   }
 
   [[nodiscard]] nested_field_descriptor const& operator[](int schema_idx) const
   {
-    return context_.schema().at(static_cast<size_t>(schema_idx));
+    return context_.schema.at(static_cast<size_t>(schema_idx));
   }
 
-  [[nodiscard]] size_t size() const { return context_.schema().size(); }
+  [[nodiscard]] size_t size() const { return context_.schema.size(); }
 
   [[nodiscard]] protobuf_field_meta_view field(int schema_idx) const;
   [[nodiscard]] std::vector<int> const& children(int parent_schema_idx) const;

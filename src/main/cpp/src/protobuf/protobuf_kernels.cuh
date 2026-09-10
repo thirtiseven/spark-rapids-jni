@@ -394,14 +394,14 @@ CUDF_KERNEL void extract_utf8_lengths_kernel(uint8_t const* message_data,
   int32_t data_offset = 0;
   auto const loc      = loc_provider.get(idx, data_offset);
   auto const* data    = loc.offset >= 0 ? message_data + data_offset : default_data;
-  auto const size     = loc.offset >= 0 ? loc.length : default_length;
-  if (data == nullptr || size <= 0) {
+  auto const size     = static_cast<uint32_t>(loc.offset >= 0 ? loc.length : default_length);
+  if (data == nullptr || size == 0) {
     out_lengths[idx] = 0;
     return;
   }
 
-  auto const repaired_length = repaired_utf8_length(data, static_cast<uint32_t>(size));
-  if (repaired_length > static_cast<uint64_t>(cuda::std::numeric_limits<int32_t>::max())) {
+  auto const repaired_length = repaired_utf8_length(data, size);
+  if (!cuda::std::in_range<int32_t>(repaired_length)) {
     out_lengths[idx] = 0;
     if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
     return;
@@ -424,10 +424,8 @@ CUDF_KERNEL void copy_repaired_utf8_kernel(uint8_t const* message_data,
   int32_t data_offset = 0;
   auto const loc      = loc_provider.get(idx, data_offset);
   auto const* data    = loc.offset >= 0 ? message_data + data_offset : default_data;
-  auto const size     = loc.offset >= 0 ? loc.length : default_length;
-  if (data != nullptr && size > 0) {
-    copy_repaired_utf8(data, static_cast<uint32_t>(size), output + output_offsets[idx]);
-  }
+  auto const size     = static_cast<uint32_t>(loc.offset >= 0 ? loc.length : default_length);
+  if (data != nullptr && size > 0) { copy_repaired_utf8(data, size, output + output_offsets[idx]); }
 }
 
 // ============================================================================
@@ -608,8 +606,10 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
   auto const as_bytes       = field.output_type.id() == cudf::type_id::LIST;
   auto const has_default    = field.schema.has_default_value;
   auto const& default_bytes = field.default_string;
-  int32_t def_len           = has_default ? static_cast<int32_t>(default_bytes.size()) : 0;
-  auto const scratch_mr     = cudf::get_current_device_resource_ref();
+  CUDF_EXPECTS(!has_default || std::in_range<int32_t>(default_bytes.size()),
+               "protobuf string default exceeds supported length");
+  int32_t def_len       = has_default ? static_cast<int32_t>(default_bytes.size()) : 0;
+  auto const scratch_mr = cudf::get_current_device_resource_ref();
   rmm::device_uvector<uint8_t> d_default(0, stream, scratch_mr);
   if (has_default && def_len > 0) {
     d_default = cudf::detail::make_device_uvector_async(default_bytes, stream, scratch_mr);
@@ -834,7 +834,7 @@ inline std::unique_ptr<cudf::column> build_repeated_scalar_column(
   auto const field       = context.schema.field(work.schema_idx);
   auto const total_count = work.total_count;
   auto& occurrences      = work.occurrences;
-  field_occurrence_location_provider loc_provider{input, {nullptr, 0, nullptr}, occurrences.data()};
+  field_occurrence_location_provider loc_provider{input, {}, occurrences.data()};
 
   std::unique_ptr<cudf::column> child_col;
   if constexpr (std::is_same_v<T, int32_t>) {

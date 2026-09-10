@@ -46,7 +46,7 @@ CUDF_KERNEL void set_error_if_unset_kernel(protobuf_error* error_flag, protobuf_
   if (blockIdx.x == 0 && threadIdx.x == 0) { set_error_once(error_flag, error); }
 }
 
-__device__ inline void set_true_atomically(bool* values, int32_t index)
+__device__ inline void set_atomically(bool* values, int32_t index)
 {
   if (values == nullptr) { return; }
   cuda::atomic_ref<bool, cuda::thread_scope_device> ref(values[index]);
@@ -112,66 +112,71 @@ __device__ bool scan_message_field_locations(message_scan_context context,
   auto const* msg_base = context.begin;
   auto const* msg_end  = context.end;
   auto* error_flag     = context.error;
-  for (uint8_t const* cur = msg_base; cur < msg_end;) {
-    proto_tag tag;
-    if (!decode_tag(cur, msg_end, tag, error_flag)) return false;
-
-    int const f = lookup_field(tag.field_number, fields);
-    if (f >= 0) {
-      auto const& field = fields.data[f];
-      if (field.is_repeated) {
-        if (!on_repeated(f, cur, tag.wire_type)) { return false; }
-      } else if (tag.wire_type != field.expected_wire_type) {
-        if constexpr (MismatchPolicy == wire_type_mismatch_policy::report_error_and_abort) {
-          set_error_once(error_flag, protobuf_error::WIRE_TYPE);
-          return false;
-        } else if constexpr (MismatchPolicy ==
-                             wire_type_mismatch_policy::report_error_and_continue) {
-          set_error_once(error_flag, protobuf_error::WIRE_TYPE);
-          if (context.row_invalid != nullptr) { *context.row_invalid = true; }
-        }
-      } else {
-        int const data_offset = static_cast<int>(cur - msg_base);
-        field_location location;
-        if (tag.wire_type == proto_wire_type::LEN) {
-          // Length prefixes use raw-varint32 semantics and may consume up to ten bytes.
-          uint32_t len;
-          int len_bytes;
-          if (!read_varint32(cur, msg_end, len, len_bytes)) {
-            set_error_once(error_flag, protobuf_error::VARINT);
-            return false;
-          }
-          if (len > static_cast<uint32_t>(msg_end - cur - len_bytes) ||
-              len > static_cast<uint32_t>(cuda::std::numeric_limits<int>::max())) {
-            set_error_once(error_flag, protobuf_error::OVERFLOW);
-            return false;
-          }
-          int32_t data_location;
-          if (!checked_add_int32(data_offset, len_bytes, data_location)) {
-            set_error_once(error_flag, protobuf_error::OVERFLOW);
-            return false;
-          }
-          location = {data_location, static_cast<int32_t>(len)};
-        } else {
-          int field_size = get_wire_type_size(tag.wire_type, cur, msg_end);
-          if (field_size < 0) {
-            set_error_once(error_flag, protobuf_error::FIELD_SIZE);
-            return false;
-          }
-          location = {data_offset, field_size};
-        }
-        if (!on_singular(f, location)) { return false; }
-      }
-    }
-
+  bool scan_succeeded  = true;
+  proto_tag tag;
+  auto advance = [&](uint8_t const* cur) {
     uint8_t const* next;
     if (!skip_field(cur, msg_end, tag, context.max_group_depth, next)) {
       set_error_once(error_flag, protobuf_error::SKIP);
-      return false;
+      scan_succeeded = false;
+      return msg_end;
     }
-    cur = next;
+    return next;
+  };
+  for (uint8_t const* cur = msg_base; cur < msg_end; cur = advance(cur)) {
+    if (!decode_tag(cur, msg_end, tag, error_flag)) return false;
+
+    int const f = lookup_field(tag.field_number, fields);
+    if (f < 0) continue;
+
+    auto const& field = fields.data[f];
+    if (field.is_repeated) {
+      if (!on_repeated(f, cur, tag.wire_type)) { return false; }
+      continue;
+    }
+    if (tag.wire_type != field.expected_wire_type) {
+      if constexpr (MismatchPolicy == wire_type_mismatch_policy::report_error_and_abort) {
+        set_error_once(error_flag, protobuf_error::WIRE_TYPE);
+        return false;
+      } else if constexpr (MismatchPolicy == wire_type_mismatch_policy::report_error_and_continue) {
+        set_error_once(error_flag, protobuf_error::WIRE_TYPE);
+        if (context.row_invalid != nullptr) { *context.row_invalid = true; }
+      }
+      continue;
+    }
+
+    int const data_offset = static_cast<int>(cur - msg_base);
+    field_location location;
+    if (tag.wire_type == proto_wire_type::LEN) {
+      // Length prefixes use raw-varint32 semantics and may consume up to ten bytes.
+      uint32_t len;
+      int len_bytes;
+      if (!read_varint32(cur, msg_end, len, len_bytes)) {
+        set_error_once(error_flag, protobuf_error::VARINT);
+        return false;
+      }
+      if (len > static_cast<uint32_t>(msg_end - cur - len_bytes) ||
+          len > static_cast<uint32_t>(cuda::std::numeric_limits<int>::max())) {
+        set_error_once(error_flag, protobuf_error::OVERFLOW);
+        return false;
+      }
+      int32_t data_location;
+      if (!checked_add_int32(data_offset, len_bytes, data_location)) {
+        set_error_once(error_flag, protobuf_error::OVERFLOW);
+        return false;
+      }
+      location = {data_location, static_cast<int32_t>(len)};
+    } else {
+      int field_size = get_wire_type_size(tag.wire_type, cur, msg_end);
+      if (field_size < 0) {
+        set_error_once(error_flag, protobuf_error::FIELD_SIZE);
+        return false;
+      }
+      location = {data_offset, field_size};
+    }
+    if (!on_singular(f, location)) { return false; }
   }
-  return true;
+  return scan_succeeded;
 }
 
 /**
@@ -367,8 +372,8 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
     locations.parent.top_row_indices == nullptr ? row : locations.parent.top_row_indices[row];
   // Multiple fragments may map back to the same parent or top-level row.
   auto mark_row_error = [&]() {
-    set_true_atomically(invalid_rows, row);
-    set_true_atomically(row_has_invalid_data, top_row);
+    set_atomically(invalid_rows, row);
+    set_atomically(row_has_invalid_data, top_row);
   };
 
   auto const parent =
@@ -449,6 +454,7 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
   for (int f = 0; f < fields.locations.stride; f++) {
     field_locations[f] = {-1, 0};
   }
+
   auto* field_message_info = fields.singular_message_info.row_start(row);
   for (int f = 0; f < fields.singular_message_info.stride; f++) {
     field_message_info[f] = {0};
@@ -621,16 +627,18 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
   auto const top_row =
     parent.top_row_indices != nullptr ? parent.top_row_indices[row] : static_cast<int32_t>(row);
   // Multiple nested values may map back to the same top-level row.
-  auto mark_row_error = [&]() { set_true_atomically(row_has_invalid_data, top_row); };
+  auto mark_row_error = [&]() { set_atomically(row_has_invalid_data, top_row); };
 
   auto* field_locations = fields.locations.row_start(row);
   for (int f = 0; f < fields.locations.stride; f++) {
     field_locations[f] = {-1, 0};
   }
+
   auto* field_repeated_info = fields.repeated_info.row_start(row);
   for (int f = 0; f < fields.repeated_info.stride; f++) {
     field_repeated_info[f] = {0};
   }
+
   auto* field_message_info = fields.singular_message_info.row_start(row);
   if (field_message_info != field_repeated_info) {
     for (int f = 0; f < fields.singular_message_info.stride; f++) {
@@ -833,7 +841,7 @@ CUDF_KERNEL void check_required_fields_kernel(
                                ? input.values.top_row_indices[row]
                                : static_cast<int32_t>(row);
         // Nested value rows may converge on the same top-level row.
-        set_true_atomically(row_force_null, top_row);
+        set_atomically(row_force_null, top_row);
       }
       // Required field is missing - set error flag
       set_error_once(error_flag, protobuf_error::REQUIRED);

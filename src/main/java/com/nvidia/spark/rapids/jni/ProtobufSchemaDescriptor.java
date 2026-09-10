@@ -340,8 +340,8 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
   private static void validateEnumMetadata(int index, int encoding, int outputTypeId,
                                             int[] validValues, byte[][] names,
                                             boolean hasDefault, long defaultValue) {
-    validateEnumTypeAndEncoding(index, outputTypeId, encoding, validValues, names);
-    if (encoding == Protobuf.ENC_ENUM_STRING &&
+    boolean isStringEnum = encoding == Protobuf.ENC_ENUM_STRING;
+    if (isStringEnum &&
         (isNullOrEmpty(validValues) || isNullOrEmpty(names))) {
       throw new IllegalArgumentException(
           "Enum-as-string field at index " + index +
@@ -355,25 +355,16 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
       }
       return;
     }
-    validateEnumValuesStrictlySorted(index, validValues);
-    validateEnumNamesLength(index, validValues, names);
-    validateEnumDefault(index, validValues, hasDefault, defaultValue);
-  }
-
-  private static void validateEnumTypeAndEncoding(int index, int outputTypeId, int encoding,
-                                                   int[] validValues, byte[][] names) {
-    if (validValues == null && names == null) {
-      return;
-    }
     boolean isNumericEnum = outputTypeId == INT32_TYPE_ID &&
         encoding == Protobuf.ENC_DEFAULT;
-    boolean isStringEnum = outputTypeId == STRING_TYPE_ID &&
-        encoding == Protobuf.ENC_ENUM_STRING;
-    if (!isNumericEnum && !isStringEnum) {
+    if (!isNumericEnum && !(isStringEnum && outputTypeId == STRING_TYPE_ID)) {
       throw new IllegalArgumentException(
           "Enum metadata at index " + index +
           " requires INT32/DEFAULT or STRING/ENUM_STRING");
     }
+    validateEnumValuesStrictlySorted(index, validValues);
+    validateEnumNamesLength(index, validValues, names);
+    validateEnumDefault(index, validValues, hasDefault, defaultValue);
   }
 
   private static void validateEnumValuesStrictlySorted(int index, int[] validValues) {

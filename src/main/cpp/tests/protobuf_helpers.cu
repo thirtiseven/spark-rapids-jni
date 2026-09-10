@@ -32,6 +32,7 @@
 
 #include <array>
 #include <cstdint>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -49,31 +50,24 @@ protobuf::protobuf_decode_context make_numeric_enum_context(int64_t default_valu
   std::vector<cudf::detail::host_vector<uint8_t>> default_strings;
   default_strings.emplace_back(cudf::detail::make_pinned_vector_async<uint8_t>(0, stream));
 
-  std::vector<cudf::detail::host_vector<int32_t>> enum_valid_values;
-  auto values = cudf::detail::make_pinned_vector_async<int32_t>(3, stream);
-  values[0]   = 0;
-  values[1]   = 1;
-  values[2]   = 2;
-  enum_valid_values.emplace_back(std::move(values));
+  std::vector enum_valid_values{cudf::detail::make_pinned_vector_async<int32_t>(3, stream)};
+  auto& values = enum_valid_values.back();
+  std::iota(values.begin(), values.end(), 0);
 
   std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> enum_names(1);
-  return {{{1,
-            -1,
-            0,
-            protobuf::proto_wire_type::VARINT,
-            cudf::type_id::INT32,
-            protobuf::proto_encoding::DEFAULT,
-            false,
-            false,
-            true}},
+  return {{{.field_number      = 1,
+            .parent_idx        = -1,
+            .wire_type         = protobuf::proto_wire_type::VARINT,
+            .output_type       = cudf::type_id::INT32,
+            .encoding          = protobuf::proto_encoding::DEFAULT,
+            .has_default_value = true}},
           {default_value},
           {0.0},
           {false},
           std::move(default_strings),
           std::move(enum_valid_values),
           std::move(enum_names),
-          true,
-          {}};
+          true};
 }
 
 }  // namespace
