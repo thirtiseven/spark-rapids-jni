@@ -50,8 +50,9 @@ protobuf::protobuf_decode_context make_numeric_enum_context(int64_t default_valu
   std::vector<cudf::detail::host_vector<uint8_t>> default_strings;
   default_strings.emplace_back(cudf::detail::make_pinned_vector_async<uint8_t>(0, stream));
 
-  std::vector enum_valid_values{cudf::detail::make_pinned_vector_async<int32_t>(3, stream)};
-  auto& values = enum_valid_values.back();
+  std::vector<cudf::detail::host_vector<int32_t>> enum_valid_values;
+  auto& values =
+    enum_valid_values.emplace_back(cudf::detail::make_pinned_vector_async<int32_t>(3, stream));
   std::iota(values.begin(), values.end(), 0);
 
   std::vector<std::vector<cudf::detail::host_vector<uint8_t>>> enum_names(1);

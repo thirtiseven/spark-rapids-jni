@@ -98,6 +98,7 @@ struct protobuf_decode_context {
   std::vector<bool> output_fields;
 
  private:
+  // For delegation only.
   protobuf_decode_context(std::size_t num_fields,
                           std::vector<nested_field_descriptor> schema,
                           bool fail_on_errors,

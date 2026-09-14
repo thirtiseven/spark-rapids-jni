@@ -125,6 +125,7 @@ public class ProtobufTest {
   // Mirrors MAX_REPEATED_FIELDS_PER_KERNEL in protobuf_types.cuh.
   private static final int MAX_REPEATED_FIELDS_PER_KERNEL = 32;
   private static final String[] PRIORITY_ENUM = {"UNKNOWN", "FOO", "BAR"};
+  private static final int PRIORITY_UNKNOWN = 0;
   private static final int PRIORITY_FOO = 1;
   private static final int PRIORITY_BAR = 2;
   private static final int PRIORITY_INVALID = 999;
@@ -212,15 +213,12 @@ public class ProtobufTest {
     // message Msg { int64 id = 1; string name = 2; }
     // Row0: id=100, name="alice"
     Byte[] row0 = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(100)),
-        box(tag(2, WT_LEN)),
-        encodeString("alice"));
+        box(tag(1, WT_VARINT)), box(encodeVarint(100)),
+        box(tag(2, WT_LEN)), encodeString("alice"));
 
     // Row1: id=200, name missing
     Byte[] row1 = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(200)));
+        box(tag(1, WT_VARINT)), box(encodeVarint(200)));
 
     // Row2: null input message
     Byte[] row2 = null;
@@ -247,14 +245,10 @@ public class ProtobufTest {
   void decodeMoreTypes() {
     // message Msg { uint32 u32 = 1; sint64 s64 = 2; fixed32 f32 = 3; bytes b = 4; }
     Byte[] row0 = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(4000000000L)),
-        box(tag(2, WT_VARINT)),
-        box(encodeVarint(zigzagEncode64(-1234567890123L))),
-        box(tag(3, WT_32BIT)),
-        box(encodeFixed32(12345)),
-        box(tag(4, WT_LEN)),
-        box(encodeVarint(3)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(4000000000L)),
+        box(tag(2, WT_VARINT)), box(encodeVarint(zigzagEncode64(-1234567890123L))),
+        box(tag(3, WT_32BIT)), box(encodeFixed32(12345)),
+        box(tag(4, WT_LEN)), box(encodeVarint(3)),
         box(new byte[]{1, 2, 3}));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row0}).build();
@@ -285,12 +279,12 @@ public class ProtobufTest {
   void decodeFloatDoubleAndBool() {
     // message Msg { bool flag = 1; float f32 = 2; double f64 = 3; }
     Byte[] row0 = concat(
-        box(tag(1, WT_VARINT)), new Byte[]{(byte)0x01},  // bool=true
+        box(tag(1, WT_VARINT)), new Byte[]{(byte) 0x01},  // bool=true
         box(tag(2, WT_32BIT)), box(encodeFloat(3.14f)),
         box(tag(3, WT_64BIT)), box(encodeDouble(2.71828)));
 
     Byte[] row1 = concat(
-        box(tag(1, WT_VARINT)), new Byte[]{(byte)0x00},  // bool=false
+        box(tag(1, WT_VARINT)), new Byte[]{(byte) 0x00},  // bool=false
         box(tag(2, WT_32BIT)), box(encodeFloat(-1.5f)),
         box(tag(3, WT_64BIT)), box(encodeDouble(0.0)));
 
@@ -369,8 +363,9 @@ public class ProtobufTest {
     // Encoded as 10 bytes: FF FF FF FF FF FF FF FF FF 01
     Byte[] row = concat(
         box(tag(1, WT_VARINT)),
-        new Byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0x01});
+        new Byte[]{
+            (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+            (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0x01});
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector actualStruct = Protobuf.decodeToStruct(
@@ -467,8 +462,9 @@ public class ProtobufTest {
     // The tenth byte terminates the over-encoded zero; protobuf-java sign-extends it to MIN_VALUE.
     Byte[] row = concat(
         box(tag(1, WT_VARINT)),
-        new Byte[]{(byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80,
-                   (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x80, (byte)0x00});
+        new Byte[]{
+            (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80,
+            (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x00});
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedInt = ColumnVector.fromBoxedLongs(Long.MIN_VALUE);
@@ -488,8 +484,9 @@ public class ProtobufTest {
     // The tenth byte terminates the varint but contributes no payload bits, leaving -1.
     Byte[] row = concat(
         box(tag(1, WT_VARINT)),
-        new Byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0x02});
+        new Byte[]{
+            (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+            (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0x02});
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedValue = ColumnVector.fromBoxedLongs(-1L);
@@ -540,8 +537,7 @@ public class ProtobufTest {
     // zigzag encoded = 4294967295 = 0xFFFFFFFF
     int minInt32 = Integer.MIN_VALUE;
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(zigzagEncode32(minInt32))));
+        box(tag(1, WT_VARINT)), box(encodeVarint(zigzagEncode32(minInt32))));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedInt = ColumnVector.fromBoxedInts(minInt32);
@@ -562,8 +558,7 @@ public class ProtobufTest {
     // zigzag encoded = 4294967294 = 0xFFFFFFFE
     int maxInt32 = Integer.MAX_VALUE;
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(zigzagEncode32(maxInt32))));
+        box(tag(1, WT_VARINT)), box(encodeVarint(zigzagEncode32(maxInt32))));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedInt = ColumnVector.fromBoxedInts(maxInt32);
@@ -583,8 +578,7 @@ public class ProtobufTest {
     // int64 min = -9223372036854775808
     long minInt64 = Long.MIN_VALUE;
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(zigzagEncode64(minInt64))));
+        box(tag(1, WT_VARINT)), box(encodeVarint(zigzagEncode64(minInt64))));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedLong = ColumnVector.fromBoxedLongs(minInt64);
@@ -603,8 +597,7 @@ public class ProtobufTest {
   void testZigzagInt64Max() {
     long maxInt64 = Long.MAX_VALUE;
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(zigzagEncode64(maxInt64))));
+        box(tag(1, WT_VARINT)), box(encodeVarint(zigzagEncode64(maxInt64))));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedLong = ColumnVector.fromBoxedLongs(maxInt64);
@@ -623,8 +616,7 @@ public class ProtobufTest {
   void testZigzagNegativeOne() {
     // -1 zigzag encoded = 1
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(zigzagEncode64(-1L))));
+        box(tag(1, WT_VARINT)), box(encodeVarint(zigzagEncode64(-1L))));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedLong = ColumnVector.fromBoxedLongs(-1L);
@@ -646,9 +638,10 @@ public class ProtobufTest {
   @Test
   void testMalformedVarint() {
     // Varint that never terminates (all continuation bits set, 11 bytes)
-    Byte[] malformed = {(byte)0x08, (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                                   (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF};
+    Byte[] malformed = {
+        (byte) 0x08, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
     try (Table input = new Table.TestBuilder().column(new Byte[][]{malformed}).build();
          ColumnVector result = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -663,7 +656,7 @@ public class ProtobufTest {
   @Test
   void testTruncatedVarint() {
     // Single byte with continuation bit set but no following byte
-    Byte[] truncated = concat(box(tag(1, WT_VARINT)), new Byte[]{(byte)0x80});
+    Byte[] truncated = concat(box(tag(1, WT_VARINT)), new Byte[]{(byte) 0x80});
     try (Table input = new Table.TestBuilder().column(new Byte[][]{truncated}).build();
          ColumnVector result = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -726,8 +719,7 @@ public class ProtobufTest {
   void testPartialLengthDelimitedData() {
     // Length says 10 bytes but only 5 provided
     Byte[] partial = concat(
-        box(tag(1, WT_LEN)),
-        box(encodeVarint(10)),
+        box(tag(1, WT_LEN)), box(encodeVarint(10)),
         box("hello".getBytes(StandardCharsets.UTF_8)));  // only 5 bytes
     try (Table input = new Table.TestBuilder().column(new Byte[][]{partial}).build();
          ColumnVector result = Protobuf.decodeToStruct(
@@ -766,8 +758,7 @@ public class ProtobufTest {
   void testWrongWireTypeForStringNullsRow() {
     // Expect length-delimited (wire type 2) but provide varint (wire type 0)
     Byte[] wrongType = concat(
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(12345)));
+        box(tag(1, WT_VARINT)), box(encodeVarint(12345)));
     try (Table input = new Table.TestBuilder().column(new Byte[][]{wrongType}).build();
          ColumnVector result = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -883,10 +874,8 @@ public class ProtobufTest {
   void testSkipUnknownVarintField() {
     // Unknown field 99 with varint, followed by known field 1
     Byte[] row = concat(
-        box(tag(99, WT_VARINT)),
-        box(encodeVarint(12345)),  // unknown field to skip
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(42)));    // known field
+        box(tag(99, WT_VARINT)), box(encodeVarint(12345)),  // unknown field to skip
+        box(tag(1, WT_VARINT)), box(encodeVarint(42)));    // known field
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedInt = ColumnVector.fromBoxedLongs(42L);
@@ -905,10 +894,8 @@ public class ProtobufTest {
   void testSkipUnknownFixed64Field() {
     // Unknown field 99 with fixed64, followed by known field 1
     Byte[] row = concat(
-        box(tag(99, WT_64BIT)),
-        box(encodeFixed64(0x123456789ABCDEF0L)),  // unknown field to skip
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(42)));
+        box(tag(99, WT_64BIT)), box(encodeFixed64(0x123456789ABCDEF0L)),  // unknown field to skip
+        box(tag(1, WT_VARINT)), box(encodeVarint(42)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedInt = ColumnVector.fromBoxedLongs(42L);
@@ -927,10 +914,8 @@ public class ProtobufTest {
   void testSkipUnknownLengthDelimitedField() {
     // Unknown field 99 with length-delimited data, followed by known field 1
     Byte[] row = concat(
-        box(tag(99, WT_LEN)),
-        encodeString("hello"),  // unknown field to skip
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(42)));
+        box(tag(99, WT_LEN)), encodeString("hello"),  // unknown field to skip
+        box(tag(1, WT_VARINT)), box(encodeVarint(42)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedInt = ColumnVector.fromBoxedLongs(42L);
@@ -949,10 +934,8 @@ public class ProtobufTest {
   void testSkipUnknownFixed32Field() {
     // Unknown field 99 with fixed32, followed by known field 1
     Byte[] row = concat(
-        box(tag(99, WT_32BIT)),
-        box(encodeFixed32(12345)),  // unknown field to skip
-        box(tag(1, WT_VARINT)),
-        box(encodeVarint(42)));
+        box(tag(99, WT_32BIT)), box(encodeFixed32(12345)),  // unknown field to skip
+        box(tag(1, WT_VARINT)), box(encodeVarint(42)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedInt = ColumnVector.fromBoxedLongs(42L);
@@ -1037,8 +1020,8 @@ public class ProtobufTest {
     // Empty message should result in null/default values for all fields
     Byte[] empty = EMPTY_MESSAGE;
     try (Table input = new Table.TestBuilder().column(new Byte[][]{empty}).build();
-         ColumnVector expectedInt = ColumnVector.fromBoxedLongs((Long)null);
-         ColumnVector expectedStr = ColumnVector.fromStrings((String)null);
+         ColumnVector expectedInt = ColumnVector.fromBoxedLongs((Long) null);
+         ColumnVector expectedStr = ColumnVector.fromStrings((String) null);
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedInt, expectedStr);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -1108,11 +1091,10 @@ public class ProtobufTest {
   @Test
   void testEnumAsInt() {
     // message Msg { enum Color { RED=0; GREEN=1; BLUE=2; } Color c = 1; }
-    // c = GREEN (value 1) - encoded as varint
     Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector expectedInt = ColumnVector.fromBoxedInts(1);
+         ColumnVector expectedInt = ColumnVector.fromBoxedInts(COLOR_GREEN);
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedInt);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -1128,10 +1110,10 @@ public class ProtobufTest {
   void testEnumZeroValue() {
     // Enum with value 0 (first/default enum value)
     // c = RED (value 0)
-    Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(0)));
+    Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_RED)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector expectedInt = ColumnVector.fromBoxedInts(0);
+         ColumnVector expectedInt = ColumnVector.fromBoxedInts(COLOR_RED);
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedInt);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -1147,10 +1129,10 @@ public class ProtobufTest {
   void testEnumUnknownValue() {
     // Protobuf allows unknown enum values - they should still be decoded as integers
     // c = 999 (unknown value not in enum definition)
-    Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(999)));
+    Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector expectedInt = ColumnVector.fromBoxedInts(999);
+         ColumnVector expectedInt = ColumnVector.fromBoxedInts(COLOR_INVALID);
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedInt);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
@@ -1668,8 +1650,7 @@ public class ProtobufTest {
     // optional string name = 1 [default = "default"];
     // Message has actual value, should override default
     Byte[] row = concat(
-        box(tag(1, WT_LEN)),
-        encodeString("actual"));
+        box(tag(1, WT_LEN)), encodeString("actual"));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedStr = ColumnVector.fromStrings("actual");
@@ -1712,8 +1693,7 @@ public class ProtobufTest {
     // Multiple rows: empty, has value, empty
     Byte[] row1 = EMPTY_MESSAGE;  // will use default
     Byte[] row2 = concat(
-        box(tag(1, WT_LEN)),
-        encodeString("row2val"));
+        box(tag(1, WT_LEN)), encodeString("row2val"));
     Byte[] row3 = EMPTY_MESSAGE;  // will use default
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row1, row2, row3}).build();
@@ -1881,21 +1861,15 @@ public class ProtobufTest {
     // message Outer { repeated Item items = 1; }
     Byte[][] items = {
         concat(
-            box(tag(1, WT_LEN)),
-            encodeBytes(concatBytes(encodeVarint(10), encodeVarint(20))),
-            box(tag(2, WT_VARINT)),
-            box(encodeVarint(7))),
+            box(tag(1, WT_LEN)), encodeBytes(concatBytes(encodeVarint(10), encodeVarint(20))),
+            box(tag(2, WT_VARINT)), box(encodeVarint(7))),
         concat(
-            box(tag(1, WT_LEN)),
-            encodeBytes(concatBytes(encodeVarint(30))),
-            box(tag(2, WT_VARINT)),
-            box(encodeVarint(9))),
+            box(tag(1, WT_LEN)), encodeBytes(concatBytes(encodeVarint(30))),
+            box(tag(2, WT_VARINT)), box(encodeVarint(9))),
     };
     Byte[] row = concat(
-        box(tag(1, WT_LEN)),
-        encodeMessage(items[0]),
-        box(tag(1, WT_LEN)),
-        encodeMessage(items[1]));
+        box(tag(1, WT_LEN)), encodeMessage(items[0]),
+        box(tag(1, WT_LEN)), encodeMessage(items[1]));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedItems = ColumnVector.fromLists(
@@ -2145,9 +2119,10 @@ public class ProtobufTest {
   @Test
   void testMalformedVarint_Failfast() {
     // Varint that never terminates (all continuation bits set)
-    Byte[] malformed = {(byte)0x08, (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                                   (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF};
+    Byte[] malformed = {
+        (byte) 0x08, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
     try (Table input = new Table.TestBuilder().column(new Byte[][]{malformed}).build()) {
       assertThrows(ai.rapids.cudf.CudfException.class, () -> {
         try (ColumnVector result = Protobuf.decodeToStruct(
@@ -2164,7 +2139,7 @@ public class ProtobufTest {
   @Test
   void testTruncatedVarint_Failfast() {
     // Single byte with continuation bit set but no following byte
-    Byte[] truncated = concat(box(tag(1, WT_VARINT)), new Byte[]{(byte)0x80});
+    Byte[] truncated = concat(box(tag(1, WT_VARINT)), new Byte[]{(byte) 0x80});
     try (Table input = new Table.TestBuilder().column(new Byte[][]{truncated}).build()) {
       assertThrows(ai.rapids.cudf.CudfException.class, () -> {
         try (ColumnVector result = Protobuf.decodeToStruct(
@@ -2507,7 +2482,7 @@ public class ProtobufTest {
   @Test
   void testEnumAsStringValidValue() {
     // enum Color { RED=0; GREEN=1; BLUE=2; }
-    Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)));  // GREEN
+    Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedField = ColumnVector.fromStrings("GREEN");
@@ -2545,9 +2520,9 @@ public class ProtobufTest {
   @Test
   void testEnumAsStringMixedValidAndUnknown() {
     Byte[][] rows = {
-        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_RED))),    // RED
-        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID))),  // unknown
-        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE))),    // BLUE
+        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_RED))),
+        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID))),
+        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE))),
     };
 
     try (Table input = new Table.TestBuilder().column(rows).build();
@@ -2557,7 +2532,7 @@ public class ProtobufTest {
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.STRING).enumMetadata(COLOR_ENUM).defaultValue(0)
+                 .addField(1, DType.STRING).enumMetadata(COLOR_ENUM).defaultValue(COLOR_RED)
                  .build(),
              false)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actual);
@@ -2568,16 +2543,16 @@ public class ProtobufTest {
   void testEnumValidValue() {
     // enum Color { RED=0; GREEN=1; BLUE=2; }
     // message Msg { Color color = 1; }
-    // Test with valid enum value (GREEN = 1)
     Byte[] row = concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector expectedColor = ColumnVector.fromBoxedInts(1);  // GREEN
+         ColumnVector expectedColor = ColumnVector.fromBoxedInts(COLOR_GREEN);
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedColor);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
+                 .addField(1, DType.INT32)
+                     .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                  .build(),
              false)) {
       AssertUtils.assertStructColumnsAreEqual(expectedStruct, actualStruct);
@@ -2588,20 +2563,22 @@ public class ProtobufTest {
   void testEnumMixedValidAndUnknown() {
     // Unknown enum values null the whole struct row in Spark CPU PERMISSIVE mode.
     Byte[][] rows = {
-        concat(box(tag(1, WT_VARINT)), box(encodeVarint(0))),    // RED, valid
-        concat(box(tag(1, WT_VARINT)), box(encodeVarint(999))),  // invalid
-        concat(box(tag(1, WT_VARINT)), box(encodeVarint(2))),    // BLUE, valid
+        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_RED))),    // RED, valid
+        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID))),  // invalid
+        concat(box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE))),    // BLUE, valid
         concat(box(tag(1, WT_VARINT)), box(encodeVarint(-1))),   // invalid
     };
 
     try (Table input = new Table.TestBuilder().column(rows).build();
          ColumnVector expected = ColumnVector.fromStructs(
              new StructType(true, new BasicType(true, DType.INT32)),
-             struct(0), null, struct(2), null);
+             struct(COLOR_RED), null, struct(COLOR_BLUE), null);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).enumValidValues(new int[]{0, 1, 2}).defaultValue(0)
+                 .addField(1, DType.INT32)
+                     .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
+                     .defaultValue(COLOR_RED)
                  .build(),
              false)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actualStruct);
@@ -2611,10 +2588,10 @@ public class ProtobufTest {
   @Test
   void testMalformedWireAfterUnknownRootEnum_Failfast() {
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)),
         box(tag(2, WT_LEN)), new Byte[]{(byte) 0x80});
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
-        .addField(1, DType.INT32).enumValidValues(new int[]{0, 1, 2})
+        .addField(1, DType.INT32).enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
         .addField(2, DType.STRING)
         .build();
 
@@ -2633,17 +2610,19 @@ public class ProtobufTest {
   @Test
   void testRepeatedEnumValidValues() {
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(2)));
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedValues = ColumnVector.fromLists(
-             new ListType(true, new BasicType(true, DType.INT32)), Arrays.asList(1, 2));
+             new ListType(true, new BasicType(true, DType.INT32)),
+             Arrays.asList(COLOR_GREEN, COLOR_BLUE));
          ColumnVector expected = ColumnVector.makeStruct(expectedValues);
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).repeated().enumValidValues(new int[]{0, 1, 2})
+                 .addField(1, DType.INT32).repeated()
+                     .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                  .build(),
              true)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actual);
@@ -2675,7 +2654,8 @@ public class ProtobufTest {
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).repeated().down()
-                     .addField(1, DType.INT32).enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
+                     .addField(1, DType.INT32)
+                         .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                  .up()
                  .build(),
              false)) {
@@ -2692,7 +2672,7 @@ public class ProtobufTest {
         box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_RED)),
         box(tag(2, WT_VARINT)), box(encodeVarint(10)));
     Byte[] invalid = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)),  // invalid
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)),
         box(tag(2, WT_VARINT)), box(encodeVarint(20)));
     Byte[] validGreen = concat(
         box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)),
@@ -2717,7 +2697,8 @@ public class ProtobufTest {
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).repeated().down()
-                     .addField(1, DType.INT32).enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
+                     .addField(1, DType.INT32)
+                         .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                      .addField(2, DType.INT32)
                  .up()
                  .build(),
@@ -2737,7 +2718,8 @@ public class ProtobufTest {
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).enumValidValues(new int[]{0, 1, 2})
+                 .addField(1, DType.INT32)
+                     .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                  .build(),
              true)) {
       // Struct row should be valid (not null), only the field is null
@@ -2760,7 +2742,7 @@ public class ProtobufTest {
     // }
     // Invalid enum value inside a nested struct: only the enum field becomes null.
     Byte[] detail = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(STATUS_INVALID)),  // invalid
+        box(tag(1, WT_VARINT)), box(encodeVarint(STATUS_INVALID)),
         box(tag(2, WT_VARINT)), box(encodeVarint(20)));
     Byte[] row = concat(
         box(tag(1, WT_VARINT)), box(encodeVarint(2)),
@@ -2836,7 +2818,8 @@ public class ProtobufTest {
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.INT32)
                  .addField(2, DType.STRUCT).down()
-                     .addField(1, DType.INT32).enumValidValues(new int[]{STATUS_UNKNOWN, STATUS_OK, STATUS_BAD})
+                     .addField(1, DType.INT32)
+                         .enumValidValues(new int[]{STATUS_UNKNOWN, STATUS_OK, STATUS_BAD})
                      .addField(2, DType.INT32)
                  .up()
                  .addField(3, DType.STRING)
@@ -2851,17 +2834,18 @@ public class ProtobufTest {
     // message Msg { Color color = 1; int32 count = 2; }
     // Test that valid enum value works correctly with other fields
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),    // GREEN (valid)
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)),    // GREEN (valid)
         box(tag(2, WT_VARINT)), box(encodeVarint(42)));  // count = 42
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector expectedColor = ColumnVector.fromBoxedInts(1);
+         ColumnVector expectedColor = ColumnVector.fromBoxedInts(COLOR_GREEN);
          ColumnVector expectedCount = ColumnVector.fromBoxedInts(42);
          ColumnVector expectedStruct = ColumnVector.makeStruct(expectedColor, expectedCount);
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).enumValidValues(new int[]{0, 1, 2})
+                 .addField(1, DType.INT32)
+                     .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                  .addField(2, DType.INT32)
                  .build(),
              false)) {
@@ -2880,9 +2864,9 @@ public class ProtobufTest {
     // repeated Color colors = 1; with Color { RED=0; GREEN=1; BLUE=2; }
     // Row with three occurrences: RED, BLUE, GREEN
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_RED)),   // RED
-        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE)),   // BLUE
-        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)));  // GREEN
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_RED)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedColors = ColumnVector.fromLists(
@@ -2964,8 +2948,7 @@ public class ProtobufTest {
   void testPackedFixedMisaligned_Failfast() {
     byte[] packedData = {0x01, 0x02, 0x03, 0x04, 0x05};
     Byte[] row = concat(
-        box(tag(1, WT_LEN)),
-        encodeBytes(packedData));
+        box(tag(1, WT_LEN)), encodeBytes(packedData));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build()) {
       assertThrows(RuntimeException.class, () -> {
@@ -2984,8 +2967,7 @@ public class ProtobufTest {
   void testPackedFixedMisaligned64_Failfast() {
     byte[] packedData = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09};
     Byte[] row = concat(
-        box(tag(1, WT_LEN)),
-        encodeBytes(packedData));
+        box(tag(1, WT_LEN)), encodeBytes(packedData));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build()) {
       assertThrows(RuntimeException.class, () -> {
@@ -3211,8 +3193,7 @@ public class ProtobufTest {
   void testLargeFieldNumber() {
     int maxFieldNumber = (1 << 29) - 1;
     Byte[] row = concat(
-        box(tag(maxFieldNumber, WT_VARINT)),
-        box(encodeVarint(42)));
+        box(tag(maxFieldNumber, WT_VARINT)), box(encodeVarint(42)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedValue = ColumnVector.fromBoxedInts(42);
@@ -3316,8 +3297,7 @@ public class ProtobufTest {
   @Test
   void testEmptyPackedRepeated() {
     Byte[] row = concat(
-        box(tag(1, WT_LEN)),
-        box(encodeVarint(0)));
+        box(tag(1, WT_LEN)), box(encodeVarint(0)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector result = Protobuf.decodeToStruct(
@@ -3441,8 +3421,9 @@ public class ProtobufTest {
   void testDuplicateSingularMessageWithTenByteVarintMergesInBothModes() {
     Byte[] firstFragment = concat(
         box(tag(1, WT_VARINT)),
-        new Byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0x02});
+        new Byte[]{
+            (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+            (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0x02});
     Byte[] secondFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(2)));
     Byte[] row = concat(
         box(tag(1, WT_LEN)), encodeMessage(firstFragment),
@@ -3549,34 +3530,42 @@ public class ProtobufTest {
 
   @Test
   void testDuplicateSingularMessageOccurrencesInsideRepeatedParentMergeInBothModes() {
-    Byte[] firstLeft = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(10)));
-    Byte[] firstRight = concat(
-        box(tag(2, WT_VARINT)), box(encodeVarint(2)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(20)));
-    Byte[] secondLeft = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(30)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(300)));
-    Byte[] secondRight = concat(
-        box(tag(2, WT_VARINT)), box(encodeVarint(40)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(400)));
-    Byte[] thirdLeft = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(50)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(500)));
-    Byte[] thirdRight = concat(
-        box(tag(2, WT_VARINT)), box(encodeVarint(60)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(600)));
+    Byte[][][] childFragments = {
+        {
+            concat(
+                box(tag(1, WT_VARINT)), box(encodeVarint(1)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(10))),
+            concat(
+                box(tag(2, WT_VARINT)), box(encodeVarint(2)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(20))),
+        },
+        {
+            concat(
+                box(tag(1, WT_VARINT)), box(encodeVarint(30)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(300))),
+            concat(
+                box(tag(2, WT_VARINT)), box(encodeVarint(40)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(400))),
+        },
+        {
+            concat(
+                box(tag(1, WT_VARINT)), box(encodeVarint(50)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(500))),
+            concat(
+                box(tag(2, WT_VARINT)), box(encodeVarint(60)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(600))),
+        },
+    };
     Byte[][] items = {
         concat(
-            box(tag(1, WT_LEN)), encodeMessage(firstLeft),
-            box(tag(1, WT_LEN)), encodeMessage(firstRight)),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[0][0]),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[0][1])),
         concat(
-            box(tag(1, WT_LEN)), encodeMessage(secondLeft),
-            box(tag(1, WT_LEN)), encodeMessage(secondRight)),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[1][0]),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[1][1])),
         concat(
-            box(tag(1, WT_LEN)), encodeMessage(thirdLeft),
-            box(tag(1, WT_LEN)), encodeMessage(thirdRight)),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[2][0]),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[2][1])),
     };
     Byte[][] rows = {
         concat(
@@ -3617,30 +3606,38 @@ public class ProtobufTest {
 
   @Test
   void testSlicedInputPreservesDuplicateSingularMessageMergeInsideRepeatedParent() {
-    Byte[] firstLeft = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(10)));
-    Byte[] firstRight = concat(
-        box(tag(2, WT_VARINT)), box(encodeVarint(2)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(20)));
-    Byte[] secondLeft = concat(box(tag(1, WT_VARINT)), box(encodeVarint(3)));
-    Byte[] secondRight = concat(box(tag(2, WT_VARINT)), box(encodeVarint(4)));
-    Byte[] thirdLeft = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(5)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(50)));
-    Byte[] thirdRight = concat(
-        box(tag(2, WT_VARINT)), box(encodeVarint(6)),
-        box(tag(3, WT_VARINT)), box(encodeVarint(60)));
+    Byte[][][] childFragments = {
+        {
+            concat(
+                box(tag(1, WT_VARINT)), box(encodeVarint(1)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(10))),
+            concat(
+                box(tag(2, WT_VARINT)), box(encodeVarint(2)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(20))),
+        },
+        {
+            concat(box(tag(1, WT_VARINT)), box(encodeVarint(3))),
+            concat(box(tag(2, WT_VARINT)), box(encodeVarint(4))),
+        },
+        {
+            concat(
+                box(tag(1, WT_VARINT)), box(encodeVarint(5)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(50))),
+            concat(
+                box(tag(2, WT_VARINT)), box(encodeVarint(6)),
+                box(tag(3, WT_VARINT)), box(encodeVarint(60))),
+        },
+    };
     Byte[][] items = {
         concat(
-            box(tag(1, WT_LEN)), encodeMessage(firstLeft),
-            box(tag(1, WT_LEN)), encodeMessage(firstRight)),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[0][0]),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[0][1])),
         concat(
-            box(tag(1, WT_LEN)), encodeMessage(secondLeft),
-            box(tag(1, WT_LEN)), encodeMessage(secondRight)),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[1][0]),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[1][1])),
         concat(
-            box(tag(1, WT_LEN)), encodeMessage(thirdLeft),
-            box(tag(1, WT_LEN)), encodeMessage(thirdRight)),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[2][0]),
+            box(tag(1, WT_LEN)), encodeMessage(childFragments[2][1])),
     };
     Byte[] firstSlicedRow = concat(
         box(tag(1, WT_LEN)), encodeMessage(items[0]),
@@ -3707,8 +3704,7 @@ public class ProtobufTest {
   void testMalformedSingularMessageFragmentBoundary_Permissive() {
     Byte[] truncatedVarint = concat(box(tag(1, WT_VARINT)), new Byte[]{(byte) 0x80});
     Byte[] validUnknownFixed64 = concat(
-        box(tag(3, WT_64BIT)),
-        box(encodeFixed64(0x0108010801080108L)));
+        box(tag(3, WT_64BIT)), box(encodeFixed64(0x0108010801080108L)));
     Byte[] malformedFirst = concat(
         box(tag(1, WT_LEN)), encodeMessage(truncatedVarint),
         box(tag(1, WT_LEN)), encodeMessage(validUnknownFixed64));
@@ -3739,8 +3735,7 @@ public class ProtobufTest {
   void testMalformedSingularMessageFragmentBoundary_Failfast() {
     Byte[] truncatedVarint = concat(box(tag(1, WT_VARINT)), new Byte[]{(byte) 0x80});
     Byte[] validUnknownFixed64 = concat(
-        box(tag(3, WT_64BIT)),
-        box(encodeFixed64(0x0108010801080108L)));
+        box(tag(3, WT_64BIT)), box(encodeFixed64(0x0108010801080108L)));
     Byte[] row = concat(
         box(tag(1, WT_LEN)), encodeMessage(validUnknownFixed64),
         box(tag(1, WT_LEN)), encodeMessage(truncatedVarint));
@@ -3972,8 +3967,7 @@ public class ProtobufTest {
     // message Outer { Inner inner = 1; }
     Byte[][] inners = {
         concat(
-            box(tag(1, WT_LEN)),
-            encodeBytes(concatBytes(encodeDouble(1.5), encodeDouble(-2.25)))),
+            box(tag(1, WT_LEN)), encodeBytes(concatBytes(encodeDouble(1.5), encodeDouble(-2.25)))),
         concat(box(tag(1, WT_LEN)), encodeBytes(encodeDouble(3.75))),
     };
     Byte[][] rows = {
@@ -4005,7 +3999,8 @@ public class ProtobufTest {
     // message Inner { repeated Priority priority = 1 [packed=true]; }
     // message Outer { Inner inner = 1; }
     // enum Priority { UNKNOWN=0; FOO=1; BAR=2; }
-    byte[] packedPriorities = concatBytes(encodeVarint(0), encodeVarint(2), encodeVarint(1));
+    byte[] packedPriorities = concatBytes(
+        encodeVarint(PRIORITY_UNKNOWN), encodeVarint(PRIORITY_BAR), encodeVarint(PRIORITY_FOO));
     Byte[] inner = concat(box(tag(1, WT_LEN)), encodeBytes(packedPriorities));
     Byte[] row = concat(box(tag(1, WT_LEN)), encodeMessage(inner));
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
@@ -4098,8 +4093,9 @@ public class ProtobufTest {
     // message Inner { repeated Priority priority = 1 [packed=true]; }
     // message Outer { Inner inner = 1; }
     // enum Priority { UNKNOWN=0; FOO=1; BAR=2; }
-    byte[] validPriorities = concatBytes(encodeVarint(1), encodeVarint(2));
-    byte[] invalidPriorities = concatBytes(encodeVarint(1), encodeVarint(999));
+    byte[] validPriorities = concatBytes(encodeVarint(PRIORITY_FOO), encodeVarint(PRIORITY_BAR));
+    byte[] invalidPriorities = concatBytes(
+        encodeVarint(PRIORITY_FOO), encodeVarint(PRIORITY_INVALID));
     Byte[][] rows = {
         concat(box(tag(1, WT_LEN)), encodeMessage(concat(
             box(tag(1, WT_LEN)), encodeBytes(validPriorities)))),
@@ -4132,21 +4128,23 @@ public class ProtobufTest {
   @Test
   void testNestedRepeatedNumericEnumUnknownValueIsDropped() {
     Byte[] inner = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(2)));
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_FOO)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_BAR)));
     Byte[] row = concat(box(tag(1, WT_LEN)), encodeMessage(inner));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector expectedValues = ColumnVector.fromLists(
-             new ListType(true, new BasicType(true, DType.INT32)), Arrays.asList(1, 2));
+             new ListType(true, new BasicType(true, DType.INT32)),
+             Arrays.asList(PRIORITY_FOO, PRIORITY_BAR));
          ColumnVector expectedInner = ColumnVector.makeStruct(expectedValues);
          ColumnVector expectedOuter = ColumnVector.makeStruct(expectedInner);
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).down()
-                     .addField(1, DType.INT32).repeated().enumValidValues(new int[]{0, 1, 2})
+                     .addField(1, DType.INT32).repeated()
+                         .enumValidValues(new int[]{PRIORITY_UNKNOWN, PRIORITY_FOO, PRIORITY_BAR})
                  .up()
                  .build(),
              true)) {
@@ -4246,19 +4244,19 @@ public class ProtobufTest {
   @Test
   void testNestedNumericEnumUnknownValueUsesExplicitDefaultInBothModes() {
     Byte[] inner = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
         box(tag(2, WT_VARINT)), box(encodeVarint(20)));
     Byte[] row = concat(box(tag(1, WT_LEN)), encodeMessage(inner));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
-            .addField(1, DType.INT32).defaultValue(2)
-                .enumValidValues(new int[]{0, 1, 2})
+            .addField(1, DType.INT32).defaultValue(PRIORITY_BAR)
+                .enumValidValues(new int[]{PRIORITY_UNKNOWN, PRIORITY_FOO, PRIORITY_BAR})
             .addField(2, DType.INT32)
         .up()
         .build();
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
-         ColumnVector expectedPriority = ColumnVector.fromBoxedInts(2);
+         ColumnVector expectedPriority = ColumnVector.fromBoxedInts(PRIORITY_BAR);
          ColumnVector expectedCount = ColumnVector.fromBoxedInts(20);
          ColumnVector expectedInner = ColumnVector.makeStruct(expectedPriority, expectedCount);
          ColumnVector expectedOuter = ColumnVector.makeStruct(expectedInner);
@@ -4273,16 +4271,16 @@ public class ProtobufTest {
   @Test
   void testNestedEnumIgnoresUnknownOccurrencesWhenRecognizedValueExists() {
     Byte[] validThenUnknown = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(2, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(2, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_FOO)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
+        box(tag(2, WT_VARINT)), box(encodeVarint(PRIORITY_FOO)),
+        box(tag(2, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
         box(tag(3, WT_VARINT)), box(encodeVarint(20)));
     Byte[] unknownThenValid = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(2)),
-        box(tag(2, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(2, WT_VARINT)), box(encodeVarint(2)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_BAR)),
+        box(tag(2, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
+        box(tag(2, WT_VARINT)), box(encodeVarint(PRIORITY_BAR)),
         box(tag(3, WT_VARINT)), box(encodeVarint(30)));
     Byte[][] rows = {
         concat(box(tag(1, WT_LEN)), encodeMessage(validThenUnknown)),
@@ -4290,8 +4288,8 @@ public class ProtobufTest {
     };
 
     try (Table input = new Table.TestBuilder().column(rows).build();
-         ColumnVector expectedDefaulted = ColumnVector.fromBoxedInts(1, 2);
-         ColumnVector expectedRequired = ColumnVector.fromBoxedInts(1, 2);
+         ColumnVector expectedDefaulted = ColumnVector.fromBoxedInts(PRIORITY_FOO, PRIORITY_BAR);
+         ColumnVector expectedRequired = ColumnVector.fromBoxedInts(PRIORITY_FOO, PRIORITY_BAR);
          ColumnVector expectedCount = ColumnVector.fromBoxedInts(20, 30);
          ColumnVector expectedInner =
              ColumnVector.makeStruct(expectedDefaulted, expectedRequired, expectedCount);
@@ -4300,10 +4298,10 @@ public class ProtobufTest {
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).down()
-                     .addField(1, DType.INT32).defaultValue(2)
-                         .enumValidValues(new int[]{0, 1, 2})
+                     .addField(1, DType.INT32).defaultValue(PRIORITY_BAR)
+                         .enumValidValues(new int[]{PRIORITY_UNKNOWN, PRIORITY_FOO, PRIORITY_BAR})
                      .addField(2, DType.INT32).required()
-                         .enumValidValues(new int[]{0, 1, 2})
+                         .enumValidValues(new int[]{PRIORITY_UNKNOWN, PRIORITY_FOO, PRIORITY_BAR})
                      .addField(3, DType.INT32)
                  .up()
                  .build(),
@@ -4315,10 +4313,10 @@ public class ProtobufTest {
   @Test
   void testRepeatedMessageChildEnumUnknownValueUsesExplicitDefault() {
     Byte[] validItem = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_FOO)),
         box(tag(2, WT_VARINT)), box(encodeVarint(10)));
     Byte[] invalidItem = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
         box(tag(2, WT_VARINT)), box(encodeVarint(20)));
     Byte[] row = concat(
         box(tag(1, WT_LEN)), encodeMessage(validItem),
@@ -4335,7 +4333,7 @@ public class ProtobufTest {
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).repeated().down()
-                     .addField(1, DType.STRING).defaultValue(2)
+                     .addField(1, DType.STRING).defaultValue(PRIORITY_BAR)
                          .enumMetadata(PRIORITY_ENUM)
                      .addField(2, DType.INT32)
                  .up()
@@ -4396,14 +4394,15 @@ public class ProtobufTest {
   @Test
   void testRequiredNumericEnumInsideNestedMessageUnknownInvalidatesRoot() {
     Byte[] inner = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
         box(tag(2, WT_VARINT)), box(encodeVarint(20)));
     Byte[] row = concat(
         box(tag(1, WT_LEN)), encodeMessage(inner),
         box(tag(2, WT_LEN)), encodeString("outside"));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
-            .addField(1, DType.INT32).required().enumValidValues(new int[]{0, 1, 2})
+            .addField(1, DType.INT32).required()
+                .enumValidValues(new int[]{PRIORITY_UNKNOWN, PRIORITY_FOO, PRIORITY_BAR})
             .addField(2, DType.INT32)
         .up()
         .addField(2, DType.STRING)
@@ -4423,10 +4422,10 @@ public class ProtobufTest {
   @Test
   void testRequiredEnumInsideRepeatedMessageUnknownInvalidatesRoot() {
     Byte[] validItem = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_FOO)),
         box(tag(2, WT_VARINT)), box(encodeVarint(10)));
     Byte[] invalidItem = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
         box(tag(2, WT_VARINT)), box(encodeVarint(20)));
     Byte[] row = concat(
         box(tag(1, WT_LEN)), encodeMessage(validItem),
@@ -5537,9 +5536,10 @@ public class ProtobufTest {
 
   @Test
   void testFailOnErrorsTrue() {
-    Byte[] malformed = {(byte)0x08, (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                                   (byte)0xFF, (byte)0xFF, (byte)0xFF,
-                                   (byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF};
+    Byte[] malformed = {
+        (byte) 0x08, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF,
+        (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
     try (Table input = new Table.TestBuilder().column(new Byte[][]{malformed}).build()) {
       assertThrows(ai.rapids.cudf.CudfException.class, () -> {
         try (ColumnVector result = Protobuf.decodeToStruct(
@@ -5632,11 +5632,9 @@ public class ProtobufTest {
   void testSlicedNestedStringInput() {
     Byte[] sentinel = concat(box(tag(99, WT_VARINT)), box(encodeVarint(7)));
     Byte[] left = concat(
-        box(tag(1, WT_LEN)),
-        encodeMessage(concat(box(tag(1, WT_LEN)), encodeString("left"))));
+        box(tag(1, WT_LEN)), encodeMessage(concat(box(tag(1, WT_LEN)), encodeString("left"))));
     Byte[] right = concat(
-        box(tag(1, WT_LEN)),
-        encodeMessage(concat(box(tag(1, WT_LEN)), encodeString("right"))));
+        box(tag(1, WT_LEN)), encodeMessage(concat(box(tag(1, WT_LEN)), encodeString("right"))));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
             .addField(1, DType.STRING)
@@ -5751,15 +5749,15 @@ public class ProtobufTest {
   @Test
   void testTopLevelEnumAnyUnknownOccurrenceInvalidatesRow() {
     Byte[] validThenUnknown = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)),
         box(tag(2, WT_VARINT)), box(encodeVarint(20)));
     Byte[] unknownThenValid = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(2)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE)),
         box(tag(2, WT_VARINT)), box(encodeVarint(30)));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
-        .addField(1, DType.INT32).enumValidValues(new int[]{0, 1, 2})
+        .addField(1, DType.INT32).enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
         .addField(2, DType.INT32)
         .build();
     StructType outputType = new StructType(
@@ -5776,7 +5774,8 @@ public class ProtobufTest {
     }
 
     ProtobufSchemaDescriptor requiredSchema = new ProtobufSchemaDescriptorBuilder()
-        .addField(1, DType.INT32).required().enumValidValues(new int[]{0, 1, 2})
+        .addField(1, DType.INT32).required()
+            .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
         .addField(2, DType.INT32)
         .build();
     try (Table input = new Table.TestBuilder().column(validThenUnknown, unknownThenValid).build()) {
@@ -5794,10 +5793,10 @@ public class ProtobufTest {
   @Test
   void testMalformedWirePrecedesDeferredUnknownRootEnum_Failfast() {
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)),
         box(tag(2, WT_LEN)), new Byte[]{(byte) 0x80});
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
-        .addField(1, DType.INT32).enumValidValues(new int[]{0, 1, 2})
+        .addField(1, DType.INT32).enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
         .addField(2, DType.STRING)
         .build();
 
@@ -5817,16 +5816,17 @@ public class ProtobufTest {
   @Test
   void testRepeatedEnumUnknownValueReturnsNullRow() {
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(2)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_GREEN)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_INVALID)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(COLOR_BLUE)),
         box(tag(2, WT_VARINT)), box(encodeVarint(42)));
 
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).repeated().enumValidValues(new int[]{0, 1, 2})
+                 .addField(1, DType.INT32).repeated()
+                     .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                  .addField(2, DType.INT32)
                  .build(),
              false)) {
@@ -5837,7 +5837,8 @@ public class ProtobufTest {
 
   @Test
   void testRepeatedEnumUnknownValue_Failfast() {
-    byte[] packedValues = concatBytes(encodeVarint(1), encodeVarint(999), encodeVarint(2));
+    byte[] packedValues = concatBytes(
+        encodeVarint(COLOR_GREEN), encodeVarint(COLOR_INVALID), encodeVarint(COLOR_BLUE));
     Byte[] row = concat(
         box(tag(1, WT_LEN)), encodeBytes(packedValues),
         box(tag(2, WT_VARINT)), box(encodeVarint(42)));
@@ -5847,7 +5848,8 @@ public class ProtobufTest {
         try (ColumnVector ignored = Protobuf.decodeToStruct(
             input.getColumn(0),
             new ProtobufSchemaDescriptorBuilder()
-                .addField(1, DType.INT32).repeated().enumValidValues(new int[]{0, 1, 2})
+                .addField(1, DType.INT32).repeated()
+                    .enumValidValues(new int[]{COLOR_RED, COLOR_GREEN, COLOR_BLUE})
                 .addField(2, DType.INT32)
                 .build(),
             true)) {
@@ -5859,9 +5861,9 @@ public class ProtobufTest {
   @Test
   void testRepeatedEnumAsStringUnknownValue_Failfast() {
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(2)));
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_FOO)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_BAR)));
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build()) {
       assertThrows(ai.rapids.cudf.CudfException.class, () -> {
         try (ColumnVector ignored = Protobuf.decodeToStruct(
@@ -5878,9 +5880,9 @@ public class ProtobufTest {
   @Test
   void testRepeatedEnumAsStringUnknownValueReturnsNullRow() {
     Byte[] row = concat(
-        box(tag(1, WT_VARINT)), box(encodeVarint(1)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(999)),
-        box(tag(1, WT_VARINT)), box(encodeVarint(2)));
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_FOO)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_INVALID)),
+        box(tag(1, WT_VARINT)), box(encodeVarint(PRIORITY_BAR)));
     try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build();
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),

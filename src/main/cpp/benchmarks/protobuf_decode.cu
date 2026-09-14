@@ -45,7 +45,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
-#include <span>
+#include <ranges>
 #include <string>
 #include <utility>
 #include <vector>
@@ -154,7 +154,7 @@ std::unique_ptr<cudf::column> make_binary_column(std::vector<std::vector<uint8_t
   h_offsets[0] = 0;
   for (size_t i = 0; i < messages.size(); i++) {
     auto const next_offset = static_cast<size_t>(h_offsets[i]) + messages[i].size();
-    CUDF_EXPECTS(std::cmp_less_equal(next_offset, std::numeric_limits<int32_t>::max()),
+    CUDF_EXPECTS(std::in_range<int32_t>(next_offset),
                  "benchmark input exceeds the LIST offset range");
     h_offsets[i + 1] = static_cast<int32_t>(next_offset);
   }
@@ -220,6 +220,23 @@ constexpr auto GENERATED_TYPES = std::to_array<generated_field_type>({
   {cudf::type_id::STRING, proto_wire_type::LEN, proto_encoding::DEFAULT},
 });
 
+constexpr generated_field_type const& get_type(cudf::type_id id)
+{
+  auto const it = std::ranges::find(GENERATED_TYPES, id, &generated_field_type::output_type);
+  if (it == GENERATED_TYPES.end()) throw "unsupported generated field type";
+  return *it;
+}
+
+template <std::size_t N>
+constexpr auto get_types(cudf::type_id const (&ids)[N])
+{
+  std::array<generated_field_type, N> result{};
+  for (std::size_t i = 0; i < N; ++i) {
+    result[i] = get_type(ids[i]);
+  }
+  return result;
+}
+
 // Case 1: Flat scalars only — many top-level scalar fields.
 //   message FlatMessage {
 //     int32  f1 = 1;
@@ -229,7 +246,8 @@ constexpr auto GENERATED_TYPES = std::to_array<generated_field_type>({
 //     string s_k+1 = k+1;   (a few string fields)
 //   }
 struct FlatScalarCase {
-  static constexpr auto NON_STRING_TYPES = std::span{GENERATED_TYPES}.first<5>();
+  using enum cudf::type_id;
+  static constexpr auto NON_STRING_TYPES = get_types({INT32, INT64, FLOAT32, FLOAT64, BOOL8});
 
   int num_fields;
   int string_field_percent;
@@ -305,8 +323,8 @@ struct FlatScalarCase {
 //     ... (num_inner_fields fields)
 //   }
 struct NestedMessageCase {
-  static constexpr std::array INNER_TYPES{
-    GENERATED_TYPES[0], GENERATED_TYPES[1], GENERATED_TYPES[5]};
+  using enum cudf::type_id;
+  static constexpr auto INNER_TYPES = get_types({INT32, INT64, STRING});
 
   int num_inner_fields;  // scalar fields inside InnerMessage
 
@@ -477,17 +495,19 @@ struct RepeatedFieldCase {
 // This case is intentionally generic and contains no customer schema details.
 // Its wide repeated STRUCT payload approximates real-world schema-projection workloads.
 struct WideRepeatedMessageCase {
-  static constexpr int STRING_FIELD_PERIOD = 10;
+  using enum cudf::type_id;
+  static constexpr auto NON_STRING_TYPES = get_types({INT32, INT64, FLOAT32, FLOAT64, BOOL8});
+  static constexpr auto STRING_TYPE      = get_type(STRING);
 
   int num_child_fields;
+  int string_field_period;
   int avg_items_per_row;
 
-  static constexpr generated_field_type child_type(int index)
+  generated_field_type child_type(int index) const
   {
-    auto const type_index = index % STRING_FIELD_PERIOD == STRING_FIELD_PERIOD - 1
-                              ? GENERATED_TYPES.size() - 1
-                              : index % (GENERATED_TYPES.size() - 1);
-    return GENERATED_TYPES[type_index];
+    return index % string_field_period == string_field_period - 1
+             ? STRING_TYPE
+             : NON_STRING_TYPES[index % NON_STRING_TYPES.size()];
   }
 
   protobuf::protobuf_decode_context build_context() const
@@ -965,6 +985,7 @@ struct ManyRepeatedFieldsCase {
 
 template <typename T>
 struct constant_argument {
+  char const* name;
   T value;
 
   T get(nvbench::state const&) const { return value; }
@@ -1031,9 +1052,8 @@ auto prepare_decode_benchmark(nvbench::state const& state, Args const&... args)
 // ===========================================================================
 static void BM_protobuf_flat_scalars(nvbench::state& state)
 {
-  constexpr int string_field_percent = 10;
-  auto data                          = prepare_decode_benchmark<FlatScalarCase>(
-    state, int_axis_argument{"num_fields"}, constant_argument{string_field_percent});
+  auto data = prepare_decode_benchmark<FlatScalarCase>(
+    state, int_axis_argument{"num_fields"}, constant_argument{"string_field_percent", 10});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
@@ -1079,8 +1099,11 @@ NVBENCH_BENCH(BM_protobuf_nested)
 // ===========================================================================
 static void BM_protobuf_repeated(nvbench::state& state)
 {
-  auto data = prepare_decode_benchmark<RepeatedFieldCase>(
-    state, constant_argument<int>{5}, constant_argument<int>{3}, int_axis_argument{"avg_items"});
+  auto data =
+    prepare_decode_benchmark<RepeatedFieldCase>(state,
+                                                constant_argument{"avg_tags_per_row", 5},
+                                                constant_argument{"avg_labels_per_row", 3},
+                                                int_axis_argument{"avg_items"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
@@ -1103,8 +1126,11 @@ NVBENCH_BENCH(BM_protobuf_repeated)
 // ===========================================================================
 static void BM_protobuf_wide_repeated_message(nvbench::state& state)
 {
-  auto data = prepare_decode_benchmark<WideRepeatedMessageCase>(
-    state, int_axis_argument{"num_child_fields"}, int_axis_argument{"avg_items"});
+  auto data =
+    prepare_decode_benchmark<WideRepeatedMessageCase>(state,
+                                                      int_axis_argument{"num_child_fields"},
+                                                      constant_argument{"string_field_period", 10},
+                                                      int_axis_argument{"avg_items"});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
@@ -1212,8 +1238,8 @@ static void BM_protobuf_repeated_child_string_count_scan(nvbench::state& state)
   auto prepared = prepare_decode_benchmark<RepeatedChildStringOnlyCase>(
     state, int_axis_argument{"num_repeated_children"}, int_axis_argument{"avg_child_elems"});
   auto const num_rows              = prepared.num_rows;
-  auto const num_repeated_children = static_cast<int>(prepared.generated.counts_by_child.size());
   auto const& data                 = prepared.generated;
+  auto const num_repeated_children = static_cast<int>(data.counts_by_child.size());
 
   cuda::stream_ref stream = cudf::get_default_stream();
   auto mr                 = cudf::get_current_device_resource_ref();
@@ -1322,8 +1348,8 @@ static void BM_protobuf_repeated_child_string_build(nvbench::state& state)
   auto prepared = prepare_decode_benchmark<RepeatedChildStringOnlyCase>(
     state, int_axis_argument{"num_repeated_children"}, int_axis_argument{"avg_child_elems"});
   auto const num_rows              = prepared.num_rows;
-  auto const num_repeated_children = static_cast<int>(prepared.generated.counts_by_child.size());
   auto const& data                 = prepared.generated;
+  auto const num_repeated_children = static_cast<int>(data.counts_by_child.size());
 
   cuda::stream_ref stream = cudf::get_default_stream();
   auto mr                 = cudf::get_current_device_resource_ref();
@@ -1408,12 +1434,11 @@ NVBENCH_BENCH(BM_protobuf_repeated_child_string_build)
 // ===========================================================================
 static void BM_protobuf_many_repeated(nvbench::state& state)
 {
-  constexpr int string_field_percent = 20;
   auto data =
     prepare_decode_benchmark<ManyRepeatedFieldsCase>(state,
                                                      int_axis_argument{"num_rep_fields"},
-                                                     constant_argument{string_field_percent},
-                                                     constant_argument{3});
+                                                     constant_argument{"string_field_percent", 20},
+                                                     constant_argument{"avg_elems_per_field", 3});
 
   cuda::stream_ref stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));

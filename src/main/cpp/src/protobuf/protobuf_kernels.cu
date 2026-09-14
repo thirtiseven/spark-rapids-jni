@@ -113,7 +113,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
   auto const* msg_end  = context.end;
   auto* error_flag     = context.error;
   bool scan_succeeded  = true;
-  proto_tag tag;
+  proto_tag tag;  // Declared here for capture by advance.
   auto advance = [&](uint8_t const* cur) {
     uint8_t const* next;
     if (!skip_field(cur, msg_end, tag, context.max_group_depth, next)) {
@@ -167,6 +167,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
       }
       location = {data_location, static_cast<int32_t>(len)};
     } else {
+      // Fixed-width / varint: record the offset and the wire-type-derived size.
       int field_size = get_wire_type_size(tag.wire_type, cur, msg_end);
       if (field_size < 0) {
         set_error_once(error_flag, protobuf_error::FIELD_SIZE);
