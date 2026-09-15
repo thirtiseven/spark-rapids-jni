@@ -340,8 +340,7 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
   private static void validateEnumMetadata(int index, int encoding, int outputTypeId,
                                             int[] validValues, byte[][] names,
                                             boolean hasDefault, long defaultValue) {
-    boolean isStringEnum = outputTypeId == STRING_TYPE_ID &&
-        encoding == Protobuf.ENC_ENUM_STRING;
+    boolean isStringEnum = outputTypeId == STRING_TYPE_ID && encoding == Protobuf.ENC_ENUM_STRING;
     if (isStringEnum && (isNullOrEmpty(validValues) || isNullOrEmpty(names))) {
       throw new IllegalArgumentException(
           "Enum-as-string field at index " + index +
@@ -355,8 +354,7 @@ public final class ProtobufSchemaDescriptor implements java.io.Serializable {
       }
       return;
     }
-    boolean isNumericEnum = outputTypeId == INT32_TYPE_ID &&
-        encoding == Protobuf.ENC_DEFAULT;
+    boolean isNumericEnum = outputTypeId == INT32_TYPE_ID && encoding == Protobuf.ENC_DEFAULT;
     if (!isNumericEnum && !isStringEnum) {
       throw new IllegalArgumentException(
           "Enum metadata at index " + index +
