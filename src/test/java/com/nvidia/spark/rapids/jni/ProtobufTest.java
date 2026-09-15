@@ -2554,8 +2554,7 @@ public class ProtobufTest {
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32)
-                     .enumValidValues(COLOR_VALUES)
+                 .addField(1, DType.INT32).enumValidValues(COLOR_VALUES)
                  .build(),
              false)) {
       AssertUtils.assertStructColumnsAreEqual(expectedStruct, actualStruct);
@@ -2579,8 +2578,7 @@ public class ProtobufTest {
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32)
-                     .enumValidValues(COLOR_VALUES)
+                 .addField(1, DType.INT32).enumValidValues(COLOR_VALUES)
                      .defaultValue(COLOR_RED)
                  .build(),
              false)) {
@@ -2624,8 +2622,7 @@ public class ProtobufTest {
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).repeated()
-                     .enumValidValues(COLOR_VALUES)
+                 .addField(1, DType.INT32).repeated().enumValidValues(COLOR_VALUES)
                  .build(),
              true)) {
       AssertUtils.assertStructColumnsAreEqual(expected, actual);
@@ -2657,8 +2654,7 @@ public class ProtobufTest {
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).repeated().down()
-                     .addField(1, DType.INT32)
-                         .enumValidValues(COLOR_VALUES)
+                     .addField(1, DType.INT32).enumValidValues(COLOR_VALUES)
                  .up()
                  .build(),
              false)) {
@@ -2700,8 +2696,7 @@ public class ProtobufTest {
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).repeated().down()
-                     .addField(1, DType.INT32)
-                         .enumValidValues(COLOR_VALUES)
+                     .addField(1, DType.INT32).enumValidValues(COLOR_VALUES)
                      .addField(2, DType.INT32)
                  .up()
                  .build(),
@@ -2721,8 +2716,7 @@ public class ProtobufTest {
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32)
-                     .enumValidValues(COLOR_VALUES)
+                 .addField(1, DType.INT32).enumValidValues(COLOR_VALUES)
                  .build(),
              true)) {
       // Struct row should be valid (not null), only the field is null
@@ -2821,8 +2815,7 @@ public class ProtobufTest {
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.INT32)
                  .addField(2, DType.STRUCT).down()
-                     .addField(1, DType.INT32)
-                         .enumValidValues(STATUS_VALUES)
+                     .addField(1, DType.INT32).enumValidValues(STATUS_VALUES)
                      .addField(2, DType.INT32)
                  .up()
                  .addField(3, DType.STRING)
@@ -2847,8 +2840,7 @@ public class ProtobufTest {
          ColumnVector actualStruct = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32)
-                     .enumValidValues(COLOR_VALUES)
+                 .addField(1, DType.INT32).enumValidValues(COLOR_VALUES)
                  .addField(2, DType.INT32)
                  .build(),
              false)) {
@@ -4146,8 +4138,7 @@ public class ProtobufTest {
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
                  .addField(1, DType.STRUCT).down()
-                     .addField(1, DType.INT32).repeated()
-                         .enumValidValues(PRIORITY_VALUES)
+                     .addField(1, DType.INT32).repeated().enumValidValues(PRIORITY_VALUES)
                  .up()
                  .build(),
              true)) {
@@ -4252,8 +4243,7 @@ public class ProtobufTest {
     Byte[] row = concat(box(tag(1, WT_LEN)), encodeMessage(inner));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
-            .addField(1, DType.INT32).defaultValue(PRIORITY_BAR)
-                .enumValidValues(PRIORITY_VALUES)
+            .addField(1, DType.INT32).defaultValue(PRIORITY_BAR).enumValidValues(PRIORITY_VALUES)
             .addField(2, DType.INT32)
         .up()
         .build();
@@ -4303,8 +4293,7 @@ public class ProtobufTest {
                  .addField(1, DType.STRUCT).down()
                      .addField(1, DType.INT32).defaultValue(PRIORITY_BAR)
                          .enumValidValues(PRIORITY_VALUES)
-                     .addField(2, DType.INT32).required()
-                         .enumValidValues(PRIORITY_VALUES)
+                     .addField(2, DType.INT32).required().enumValidValues(PRIORITY_VALUES)
                      .addField(3, DType.INT32)
                  .up()
                  .build(),
@@ -4404,8 +4393,7 @@ public class ProtobufTest {
         box(tag(2, WT_LEN)), encodeString("outside"));
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
-            .addField(1, DType.INT32).required()
-                .enumValidValues(PRIORITY_VALUES)
+            .addField(1, DType.INT32).required().enumValidValues(PRIORITY_VALUES)
             .addField(2, DType.INT32)
         .up()
         .addField(2, DType.STRING)
@@ -5777,8 +5765,7 @@ public class ProtobufTest {
     }
 
     ProtobufSchemaDescriptor requiredSchema = new ProtobufSchemaDescriptorBuilder()
-        .addField(1, DType.INT32).required()
-            .enumValidValues(COLOR_VALUES)
+        .addField(1, DType.INT32).required().enumValidValues(COLOR_VALUES)
         .addField(2, DType.INT32)
         .build();
     try (Table input = new Table.TestBuilder().column(validThenUnknown, unknownThenValid).build()) {
@@ -5828,8 +5815,7 @@ public class ProtobufTest {
          ColumnVector actual = Protobuf.decodeToStruct(
              input.getColumn(0),
              new ProtobufSchemaDescriptorBuilder()
-                 .addField(1, DType.INT32).repeated()
-                     .enumValidValues(COLOR_VALUES)
+                 .addField(1, DType.INT32).repeated().enumValidValues(COLOR_VALUES)
                  .addField(2, DType.INT32)
                  .build(),
              false)) {
@@ -5851,8 +5837,7 @@ public class ProtobufTest {
         try (ColumnVector ignored = Protobuf.decodeToStruct(
             input.getColumn(0),
             new ProtobufSchemaDescriptorBuilder()
-                .addField(1, DType.INT32).repeated()
-                    .enumValidValues(COLOR_VALUES)
+                .addField(1, DType.INT32).repeated().enumValidValues(COLOR_VALUES)
                 .addField(2, DType.INT32)
                 .build(),
             true)) {

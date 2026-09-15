@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "protobuf/protobuf_device_helpers.cuh"
 #include "protobuf/protobuf_types.cuh"
 
 #include <cudf/column/column_factories.hpp>
