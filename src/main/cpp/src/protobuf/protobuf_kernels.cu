@@ -145,7 +145,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
       continue;
     }
 
-    int const data_offset = static_cast<int>(cur - msg_base);
+    auto const data_offset = static_cast<int>(cur - msg_base);
     field_location location;
     if (tag.wire_type == proto_wire_type::LEN) {
       // Length prefixes use raw-varint32 semantics and may consume up to ten bytes.
@@ -156,7 +156,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
         return false;
       }
       if (len > static_cast<uint32_t>(msg_end - cur - len_bytes) ||
-          len > static_cast<uint32_t>(cuda::std::numeric_limits<int>::max())) {
+          !cuda::std::in_range<int>(len)) {
         set_error_once(error_flag, protobuf_error::OVERFLOW);
         return false;
       }
@@ -183,7 +183,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
 /**
  * Top-level field scanner: one thread per row records each requested top-level field's location
  * via the shared `scan_message_field_locations`. Null rows and out-of-bounds messages leave the
- * row's locations as {-1, 0}; in permissive mode malformed rows are flagged for nulling.
+ * row's locations missing; in permissive mode malformed rows are flagged for nulling.
  */
 CUDF_KERNEL void scan_all_fields_kernel(cudf::column_device_view const d_in,
                                         field_scan_view fields,
@@ -202,7 +202,7 @@ CUDF_KERNEL void scan_all_fields_kernel(cudf::column_device_view const d_in,
 
   auto* field_locations = fields.locations.row_start(row);
   for (int f = 0; f < fields.locations.stride; f++) {
-    field_locations[f] = {-1, 0};
+    field_locations[f] = field_location::missing();
   }
 
   if (in.nullable() && in.is_null(row)) return;
@@ -381,7 +381,7 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
     locations.parent.locations == nullptr
       ? field_location{0, locations.input.row_offsets[row + 1] - locations.input.row_offsets[row]}
       : locations.parent.locations[row];
-  if (parent.offset < 0 || parent.length < 0 || fragment.offset < 0 || fragment.length < 0) {
+  if (!parent.is_present() || parent.length < 0 || fragment.offset < 0 || fragment.length < 0) {
     set_error_once(error_flag, protobuf_error::BOUNDS);
     mark_row_error();
     return;
@@ -404,9 +404,7 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
   auto const* fragment_begin = locations.input.message_data + fragment_start;
   auto const* fragment_limit = locations.input.message_data + fragment_end;
   auto validate_repeated     = [&](int f, uint8_t const* cur, proto_wire_type wire_type) {
-    auto ignore_occurrence = []([[maybe_unused]] int32_t offset, [[maybe_unused]] int32_t length) {
-      return true;
-    };
+    auto ignore_occurrence = [](int32_t, int32_t) { return true; };
     return walk_repeated_element<wire_type_mismatch_policy::continue_silently>(
       cur,
       fragment_begin,
@@ -453,7 +451,7 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
 
   auto* field_locations = fields.locations.row_start(row);
   for (int f = 0; f < fields.locations.stride; f++) {
-    field_locations[f] = {-1, 0};
+    field_locations[f] = field_location::missing();
   }
 
   auto* field_message_info = fields.singular_message_info.row_start(row);
@@ -632,7 +630,7 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
 
   auto* field_locations = fields.locations.row_start(row);
   for (int f = 0; f < fields.locations.stride; f++) {
-    field_locations[f] = {-1, 0};
+    field_locations[f] = field_location::missing();
   }
 
   auto* field_repeated_info = fields.repeated_info.row_start(row);
@@ -648,7 +646,7 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
   }
 
   auto const& parent_loc = parent.locations[row];
-  if (parent_loc.offset < 0) return;
+  if (!parent_loc.is_present()) return;
 
   // Do the subtraction in int64 to keep the bounds-check honest even if a future caller
   // ever passes a sliced LIST where parent_base_offset > parent_row_offsets[row].
@@ -682,7 +680,7 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
   };
   auto validate_repeated = [&](int f, uint8_t const* cur, proto_wire_type wt) {
     auto const expected_wire_type = fields.lookup.data[f].expected_wire_type;
-    auto count_occurrence = [&]([[maybe_unused]] int32_t off, [[maybe_unused]] int32_t len) {
+    auto count_occurrence         = [&](int32_t, int32_t) {
       if (field_repeated_info != nullptr) { field_repeated_info[f].count++; }
       return true;
     };
@@ -711,7 +709,7 @@ CUDF_KERNEL void scan_all_field_occurrences_in_nested_kernel(protobuf_input_view
   if (row >= input.num_rows) return;
 
   auto const& parent_loc = parent.locations[row];
-  if (parent_loc.offset < 0) return;
+  if (!parent_loc.is_present()) return;
 
   int64_t const row_off       = static_cast<int64_t>(input.row_offsets[row]) - input.base_offset;
   int64_t const msg_start_off = row_off + parent_loc.offset;
@@ -738,7 +736,7 @@ CUDF_KERNEL void compute_grandchild_parent_locations_kernel(nested_location_prov
   int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= num_rows) return;
 
-  gc_parent_locs[row] = loc_provider.get_rebased_child_location(row, error_flag);
+  gc_parent_locs[row] = loc_provider.row_location(row, error_flag);
 }
 
 CUDF_KERNEL void compute_virtual_parents_for_nested_repeated_kernel(
@@ -757,19 +755,13 @@ CUDF_KERNEL void compute_virtual_parents_for_nested_repeated_kernel(
   auto const& parent       = parent_locations[occurrence.row_idx];
   virtual_row_offsets[idx] = row_list_offsets[occurrence.row_idx];
 
-  if (parent.offset < 0) {
-    virtual_parent_locs[idx] = {-1, 0};
+  if (!parent.is_present()) {
+    virtual_parent_locs[idx] = field_location::missing();
     return;
   }
 
-  auto const offset = static_cast<int64_t>(parent.offset) + occurrence.offset;
-  if (offset < cuda::std::numeric_limits<int32_t>::min() ||
-      offset > cuda::std::numeric_limits<int32_t>::max()) {
-    virtual_parent_locs[idx] = {-1, 0};
-    set_error_once(error_flag, protobuf_error::OVERFLOW);
-    return;
-  }
-  virtual_parent_locs[idx] = {static_cast<int32_t>(offset), occurrence.length};
+  virtual_parent_locs[idx] =
+    rebase_location({occurrence.offset, occurrence.length}, parent.offset, error_flag);
 }
 
 CUDF_KERNEL void compute_msg_locations_from_occurrences_kernel(field_occurrence const* occurrences,
@@ -785,10 +777,9 @@ CUDF_KERNEL void compute_msg_locations_from_occurrences_kernel(field_occurrence 
 
   auto const& occurrence = occurrences[idx];
   auto const row_offset  = static_cast<int64_t>(list_offsets[occurrence.row_idx]) - base_offset;
-  if (row_offset < cuda::std::numeric_limits<cudf::size_type>::min() ||
-      row_offset > cuda::std::numeric_limits<cudf::size_type>::max()) {
+  if (!cuda::std::in_range<cudf::size_type>(row_offset)) {
     msg_row_offsets[idx] = 0;
-    msg_locs[idx]        = {-1, 0};
+    msg_locs[idx]        = field_location::missing();
     set_error_once(error_flag, protobuf_error::OVERFLOW);
     return;
   }
@@ -817,7 +808,7 @@ CUDF_KERNEL void extract_strided_locations_kernel(field_location const* nested_l
 // ============================================================================
 
 /**
- * Check if any required fields are missing (offset < 0) and set error flag.
+ * Check if any required fields are missing and set error flag.
  * This is called after the scan pass to validate required field constraints.
  */
 CUDF_KERNEL void check_required_fields_kernel(
@@ -833,10 +824,10 @@ CUDF_KERNEL void check_required_fields_kernel(
       !cudf::bit_is_set(input.input_null_mask, row + input.input_offset)) {
     return;
   }
-  if (input.parent_locations != nullptr && input.parent_locations[row].offset < 0) return;
+  if (input.parent_locations != nullptr && !input.parent_locations[row].is_present()) return;
 
   for (int f = 0; f < num_fields; f++) {
-    if (is_required[f] != 0 && input.locations[flat_index(row, num_fields, f)].offset < 0) {
+    if (is_required[f] != 0 && !input.locations[flat_index(row, num_fields, f)].is_present()) {
       if (row_force_null != nullptr) {
         auto const top_row = input.values.top_row_indices != nullptr
                                ? input.values.top_row_indices[row]

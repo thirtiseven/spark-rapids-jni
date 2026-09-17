@@ -62,6 +62,24 @@ namespace spark_rapids_jni::protobuf::detail {
 // Data Extraction Location Providers
 // ============================================================================
 
+// Slice bases and local offsets are signed; widen before addition and narrowing.
+__device__ inline field_location rebase_location(field_location location,
+                                                 int64_t base,
+                                                 protobuf_error* error = nullptr)
+{
+  if (!location.is_present()) { return field_location::missing(); }
+  if (base < 0 || base > cuda::std::numeric_limits<int32_t>::max()) {
+    if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
+    return field_location::missing();
+  }
+  auto const offset = base + location.offset;
+  if (!cuda::std::in_range<int32_t>(offset)) {
+    if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
+    return field_location::missing();
+  }
+  return {static_cast<int32_t>(offset), location.length};
+}
+
 struct top_level_location_provider {
   cudf::size_type const* offsets;
   cudf::size_type base_offset;
@@ -69,11 +87,10 @@ struct top_level_location_provider {
   int field_idx;
   int num_fields;
 
-  __device__ inline field_location get(int thread_idx, int32_t& data_offset) const
+  __device__ inline field_location input_location(int thread_idx) const
   {
-    auto loc = locations[flat_index(thread_idx, num_fields, field_idx)];
-    if (loc.offset >= 0) { data_offset = offsets[thread_idx] - base_offset + loc.offset; }
-    return loc;
+    return rebase_location(locations[flat_index(thread_idx, num_fields, field_idx)],
+                           static_cast<int64_t>(offsets[thread_idx]) - base_offset);
   }
 };
 
@@ -82,18 +99,17 @@ struct field_occurrence_location_provider {
   nested_parent_view parent;
   field_occurrence const* occurrences;
 
-  __device__ inline field_location get(int thread_idx, int32_t& data_offset) const
+  __device__ inline field_location input_location(int thread_idx) const
   {
     auto const occurrence = occurrences[thread_idx];
-    auto const parent_offset =
-      parent.locations == nullptr ? int32_t{0} : parent.locations[occurrence.row_idx].offset;
-    if (parent_offset < 0) {
-      data_offset = 0;
-      return {-1, 0};
-    }
-    data_offset =
-      input.row_offsets[occurrence.row_idx] - input.base_offset + parent_offset + occurrence.offset;
-    return {occurrence.offset, occurrence.length};
+    auto const parent_location =
+      parent.locations == nullptr ? field_location{0, 0} : parent.locations[occurrence.row_idx];
+    if (!parent_location.is_present()) { return field_location::missing(); }
+    auto const row_location =
+      rebase_location({occurrence.offset, occurrence.length}, parent_location.offset);
+    return rebase_location(
+      row_location,
+      static_cast<int64_t>(input.row_offsets[occurrence.row_idx]) - input.base_offset);
   }
 };
 
@@ -105,44 +121,34 @@ struct nested_location_provider {
   int field_idx;
   int num_fields;
 
-  // Rebase child offsets from the parent message to the row for recursive STRUCT decode.
-  __device__ inline field_location get_rebased_child_location(int thread_idx,
-                                                              protobuf_error* error_flag) const
+  // Recursive STRUCT decode stores locations relative to the row, not the input buffer.
+  __device__ inline field_location row_location(int thread_idx,
+                                                protobuf_error* error = nullptr) const
   {
-    auto ploc = parent_locations[thread_idx];
-    auto cloc = child_locations[flat_index(thread_idx, num_fields, field_idx)];
-    if (ploc.offset < 0 || cloc.offset < 0) { return {-1, 0}; }
-
-    auto const offset = static_cast<int64_t>(ploc.offset) + cloc.offset;
-    if (offset > cuda::std::numeric_limits<int32_t>::max()) {
-      if (error_flag != nullptr) { set_error_once(error_flag, protobuf_error::OVERFLOW); }
-      return {-1, 0};
-    }
-    return {static_cast<int32_t>(offset), cloc.length};
+    auto const parent = parent_locations[thread_idx];
+    if (!parent.is_present()) { return field_location::missing(); }
+    return rebase_location(
+      child_locations[flat_index(thread_idx, num_fields, field_idx)], parent.offset, error);
   }
 
-  __device__ inline field_location get(int thread_idx, int32_t& data_offset) const
+  __device__ inline field_location input_location(int thread_idx) const
   {
-    auto child_parent_loc = get_rebased_child_location(thread_idx, nullptr);
-    if (child_parent_loc.offset < 0) { return child_parent_loc; }
-
-    data_offset = row_offsets[thread_idx] - base_offset + child_parent_loc.offset;
-    return child_locations[flat_index(thread_idx, num_fields, field_idx)];
+    return rebase_location(row_location(thread_idx),
+                           static_cast<int64_t>(row_offsets[thread_idx]) - base_offset);
   }
 
   __device__ inline bool valid(int thread_idx) const
   {
-    return get_rebased_child_location(thread_idx, nullptr).offset >= 0;
+    return row_location(thread_idx).is_present();
   }
 };
 
 __device__ inline scalar_value_input resolve_scalar_value(uint8_t const* message_data,
-                                                          field_location location,
-                                                          int32_t data_offset)
+                                                          field_location location)
 {
-  return {location.offset < 0 ? nullptr : message_data + data_offset,
+  return {location.is_present() ? message_data + location.offset : nullptr,
           location.length,
-          location.offset >= 0};
+          location.is_present()};
 }
 
 template <typename OutputType, bool ZigZag = false>
@@ -320,9 +326,8 @@ __device__ void extract_scalar_kernel_impl(uint8_t const* message_data,
   auto idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (idx >= total_items) return;
 
-  int32_t data_offset = 0;
-  auto loc            = loc_provider.get(idx, data_offset);
-  DecodeFn(resolve_scalar_value(message_data, loc, data_offset), idx, options, output);
+  auto loc = loc_provider.input_location(idx);
+  DecodeFn(resolve_scalar_value(message_data, loc), idx, options, output);
 }
 
 // Kernel parameters stay by value because forwarding references preserve host lvalue references.
@@ -361,21 +366,17 @@ template <typename LocationProvider>
 CUDF_KERNEL void extract_lengths_kernel(LocationProvider loc_provider,
                                         int total_items,
                                         int32_t* out_lengths,
-                                        bool has_default       = false,
                                         int32_t default_length = 0)
 {
   auto idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (idx >= total_items) return;
 
-  int32_t data_offset = 0;
-  auto loc            = loc_provider.get(idx, data_offset);
+  auto loc = loc_provider.input_location(idx);
 
-  if (loc.offset >= 0) {
+  if (loc.is_present()) {
     out_lengths[idx] = loc.length;
-  } else if (has_default) {
-    out_lengths[idx] = default_length;
   } else {
-    out_lengths[idx] = 0;
+    out_lengths[idx] = default_length;
   }
 }
 
@@ -391,10 +392,9 @@ CUDF_KERNEL void extract_utf8_lengths_kernel(uint8_t const* message_data,
   auto idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (idx >= total_items) return;
 
-  int32_t data_offset = 0;
-  auto const loc      = loc_provider.get(idx, data_offset);
-  auto const* data    = loc.offset >= 0 ? message_data + data_offset : default_data;
-  auto const size     = static_cast<uint32_t>(loc.offset >= 0 ? loc.length : default_length);
+  auto const loc   = loc_provider.input_location(idx);
+  auto const* data = loc.is_present() ? message_data + loc.offset : default_data;
+  auto const size  = static_cast<uint32_t>(loc.is_present() ? loc.length : default_length);
   if (data == nullptr || size == 0) {
     out_lengths[idx] = 0;
     return;
@@ -421,10 +421,9 @@ CUDF_KERNEL void copy_repaired_utf8_kernel(uint8_t const* message_data,
   auto idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (idx >= total_items) return;
 
-  int32_t data_offset = 0;
-  auto const loc      = loc_provider.get(idx, data_offset);
-  auto const* data    = loc.offset >= 0 ? message_data + data_offset : default_data;
-  auto const size     = static_cast<uint32_t>(loc.offset >= 0 ? loc.length : default_length);
+  auto const loc   = loc_provider.input_location(idx);
+  auto const* data = loc.is_present() ? message_data + loc.offset : default_data;
+  auto const size  = static_cast<uint32_t>(loc.is_present() ? loc.length : default_length);
   if (data != nullptr && size > 0) { copy_repaired_utf8(data, size, output + output_offsets[idx]); }
 }
 
@@ -629,8 +628,8 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
                                                has_default ? d_default.data() : nullptr,
                                                def_len);
     } else {
-      extract_lengths_kernel<LocationProvider><<<blocks, threads, 0, stream.get()>>>(
-        loc_provider, num_rows, lengths.data(), has_default, def_len);
+      extract_lengths_kernel<LocationProvider>
+        <<<blocks, threads, 0, stream.get()>>>(loc_provider, num_rows, lengths.data(), def_len);
     }
     CUDF_CHECK_CUDA(stream.get());
   }
@@ -660,12 +659,11 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
         cuda::proclaim_return_type<void const*>(
           [message_data, loc_provider, has_default, default_ptr, def_len] __device__(
             int idx) -> void const* {
-            int32_t data_offset = 0;
-            auto loc            = loc_provider.get(idx, data_offset);
-            if (loc.offset < 0) {
+            auto loc = loc_provider.input_location(idx);
+            if (!loc.is_present()) {
               return (has_default && def_len > 0) ? static_cast<void const*>(default_ptr) : nullptr;
             }
-            return static_cast<void const*>(message_data + data_offset);
+            return static_cast<void const*>(message_data + loc.offset);
           }));
       auto dst_iter = cudf::detail::make_counting_transform_iterator(
         0,
@@ -676,9 +674,8 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
         0,
         cuda::proclaim_return_type<size_t>(
           [loc_provider, has_default, def_len] __device__(int idx) -> size_t {
-            int32_t data_offset = 0;
-            auto loc            = loc_provider.get(idx, data_offset);
-            if (loc.offset < 0) {
+            auto loc = loc_provider.input_location(idx);
+            if (!loc.is_present()) {
               return (has_default && def_len > 0) ? static_cast<size_t>(def_len) : 0;
             }
             return static_cast<size_t>(loc.length);

@@ -18,11 +18,21 @@
 
 #include "protobuf/protobuf.hpp"
 
+#include <concepts>
 #include <cstddef>
 #include <string>
 #include <type_traits>
 
 namespace spark_rapids_jni::protobuf::detail {
+
+// Row-major flat index into a [num_rows x width] array. Takes any integral types and widens to
+// size_t internally so call sites don't need to cast (the multiply happens in size_t).
+CUDF_HOST_DEVICE inline size_t flat_index(std::integral auto row,
+                                          std::integral auto width,
+                                          std::integral auto col)
+{
+  return static_cast<size_t>(row) * static_cast<size_t>(width) + static_cast<size_t>(col);
+}
 
 // Protobuf varints store 7 value bits per byte, so ceil(64 / 7) = 10 bytes.
 constexpr int MAX_VARINT_BYTES = 10;
@@ -85,13 +95,22 @@ inline std::string error_message(protobuf_error error)
 }
 
 /**
- * Structure to record field location within a message.
- * offset < 0 means field was not found.
+ * Field location with a coordinate base defined by its owning view or provider.
+ * input_location() returns input-buffer coordinates; row_location() returns row-relative
+ * coordinates.
  */
 struct field_location {
-  int32_t offset;  // Offset of field data within the message (-1 if not found)
-  int32_t length;  // Length of field data in bytes
+  static constexpr int32_t INVALID_OFFSET = -1;
+
+  int32_t offset;
+  int32_t length;
+
+  CUDF_HOST_DEVICE static constexpr field_location missing() { return {INVALID_OFFSET, 0}; }
+  CUDF_HOST_DEVICE constexpr bool is_present() const { return offset >= 0; }
+  CUDF_HOST_DEVICE constexpr bool operator==(field_location const&) const = default;
 };
+
+static_assert(sizeof(field_location) == 2 * sizeof(int32_t));
 
 /**
  * Field descriptor passed to the scanning kernel.

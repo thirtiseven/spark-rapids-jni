@@ -24,9 +24,9 @@
 #include <cuda/atomic>
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
+#include <cuda/std/utility>
 #include <cuda/stream>
 
-#include <concepts>
 #include <type_traits>
 
 namespace spark_rapids_jni::protobuf::detail {
@@ -210,8 +210,7 @@ __device__ inline bool get_field_data_location(uint8_t const* cur,
     uint32_t len;
     int len_bytes;
     if (!read_varint32(cur, end, len, len_bytes)) return false;
-    if (len > static_cast<uint32_t>(end - cur - len_bytes) ||
-        len > static_cast<uint32_t>(cuda::std::numeric_limits<int>::max())) {
+    if (len > static_cast<uint32_t>(end - cur - len_bytes) || !cuda::std::in_range<int>(len)) {
       return false;
     }
     data_offset = len_bytes;  // offset past the length prefix
@@ -226,22 +225,10 @@ __device__ inline bool get_field_data_location(uint8_t const* cur,
   return true;
 }
 
-// Row-major flat index into a [num_rows x width] array. Takes any integral types and widens to
-// size_t internally so call sites don't need to cast (the multiply happens in size_t).
-CUDF_HOST_DEVICE inline size_t flat_index(std::integral auto row,
-                                          std::integral auto width,
-                                          std::integral auto col)
-{
-  return static_cast<size_t>(row) * static_cast<size_t>(width) + static_cast<size_t>(col);
-}
-
 __device__ inline bool checked_add_int32(int32_t lhs, int32_t rhs, int32_t& out)
 {
   auto const sum = static_cast<int64_t>(lhs) + rhs;
-  if (sum < cuda::std::numeric_limits<int32_t>::min() ||
-      sum > cuda::std::numeric_limits<int32_t>::max()) {
-    return false;
-  }
+  if (!cuda::std::in_range<int32_t>(sum)) { return false; }
   out = static_cast<int32_t>(sum);
   return true;
 }

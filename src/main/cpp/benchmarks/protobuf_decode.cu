@@ -790,6 +790,8 @@ void encode_string_field_record(std::vector<uint8_t>& buf,
 {
   encode_tag(buf, field_number, static_cast<int>(proto_wire_type::LEN));
   encode_varint(buf, value.size());
+  CUDF_EXPECTS(std::in_range<int32_t>(buf.size()) && std::in_range<int32_t>(value.size()),
+               "protobuf benchmark field exceeds supported range");
   auto const data_offset = static_cast<int32_t>(buf.size());
   buf.insert(buf.end(), value.begin(), value.end());
   occurrences.push_back({row_idx, data_offset, static_cast<int32_t>(value.size())});
@@ -843,6 +845,8 @@ struct RepeatedChildStringOnlyCase {
                                      row);
         }
       }
+      CUDF_EXPECTS(std::in_range<int32_t>(message.size()),
+                   "protobuf benchmark parent exceeds supported length");
       result.parent_locations[row] = {0, static_cast<int32_t>(message.size())};
     }
     return result;

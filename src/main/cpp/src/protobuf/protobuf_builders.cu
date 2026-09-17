@@ -105,7 +105,7 @@ inline std::pair<rmm::device_buffer, cudf::size_type> make_null_mask_from_parent
   auto [mask, null_count] = cudf::detail::valid_if(
     thrust::make_counting_iterator<cudf::size_type>(0),
     thrust::make_counting_iterator<cudf::size_type>(num_rows),
-    [parent_locs] __device__(cudf::size_type row) { return parent_locs[row].offset >= 0; },
+    [parent_locs] __device__(cudf::size_type row) { return parent_locs[row].is_present(); },
     stream,
     mr);
   if (null_count == 0) { mask = rmm::device_buffer{}; }
@@ -491,10 +491,9 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
         0,
         cuda::proclaim_return_type<void const*>(
           [message_data, loc_provider] __device__(int idx) -> void const* {
-            int32_t data_offset = 0;
-            auto loc            = loc_provider.get(idx, data_offset);
-            if (loc.offset < 0) return nullptr;
-            return static_cast<void const*>(message_data + data_offset);
+            auto loc = loc_provider.input_location(idx);
+            if (!loc.is_present()) return nullptr;
+            return static_cast<void const*>(message_data + loc.offset);
           }));
       auto dst_iter = cudf::detail::make_counting_transform_iterator(
         0,
@@ -503,9 +502,8 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
         }));
       auto size_iter = cudf::detail::make_counting_transform_iterator(
         0, cuda::proclaim_return_type<size_t>([loc_provider] __device__(int idx) -> size_t {
-          int32_t data_offset = 0;
-          auto loc            = loc_provider.get(idx, data_offset);
-          if (loc.offset < 0) return 0;
+          auto loc = loc_provider.input_location(idx);
+          if (!loc.is_present()) return 0;
           return static_cast<size_t>(loc.length);
         }));
 
@@ -617,10 +615,9 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
         [message_data = input.message_data, fragment_locations, fragments, invalid] __device__(
           int idx) -> void const* {
           if (invalid[fragments[idx].row_idx]) { return nullptr; }
-          int32_t data_offset = 0;
-          auto const location = fragment_locations.get(idx, data_offset);
-          return location.offset < 0 ? nullptr
-                                     : static_cast<void const*>(message_data + data_offset);
+          auto const location = fragment_locations.input_location(idx);
+          return !location.is_present() ? nullptr
+                                        : static_cast<void const*>(message_data + location.offset);
         }));
     auto dst_iter = cudf::detail::make_counting_transform_iterator(
       0, cuda::proclaim_return_type<void*>([output, fragment_offsets] __device__(int idx) -> void* {
@@ -655,7 +652,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
      row_byte_offsets     = merged_row_offsets.data(),
      invalid              = invalid_rows.data()] __device__(int row) {
       if (invalid[row] || row_fragment_offsets[row] == row_fragment_offsets[row + 1]) {
-        return field_location{-1, 0};
+        return field_location::missing();
       }
       return field_location{0, row_byte_offsets[row + 1] - row_byte_offsets[row]};
     });
