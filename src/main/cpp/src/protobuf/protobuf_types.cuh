@@ -19,8 +19,6 @@
 #include "protobuf/protobuf.hpp"
 
 #include <cstddef>
-#include <cstdint>
-#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -87,26 +85,17 @@ inline std::string error_message(protobuf_error error)
 }
 
 /**
- * Field location with a coordinate base defined by its owning view or provider.
- * input_location() returns input-buffer coordinates; row_location() returns row-relative
- * coordinates. The missing marker is outside the supported input-offset range.
+ * Structure to record field location within a message.
+ * offset < 0 means field was not found.
  */
 struct field_location {
-  static constexpr uint32_t INVALID_OFFSET = std::numeric_limits<uint32_t>::max();
-
-  uint32_t offset;  // Byte offset relative to the owning coordinate base
-  uint32_t length;  // Length of field data in bytes
-
-  CUDF_HOST_DEVICE static constexpr field_location missing() { return {INVALID_OFFSET, 0}; }
-  CUDF_HOST_DEVICE constexpr bool is_present() const { return offset != INVALID_OFFSET; }
+  int32_t offset;  // Offset of field data within the message (-1 if not found)
+  int32_t length;  // Length of field data in bytes
 };
-
-static_assert(sizeof(field_location) == 2 * sizeof(uint32_t));
 
 /**
  * Field descriptor passed to the scanning kernel.
  */
-
 struct field_descriptor {
   int field_number;                    // Protobuf field number
   proto_wire_type expected_wire_type;  // Expected wire type for this field
@@ -129,8 +118,8 @@ struct field_occurrence_count {
  */
 struct field_occurrence {
   int32_t row_idx;  // Which row this occurrence belongs to
-  uint32_t offset;  // Offset within the message
-  uint32_t length;  // Length of the field data
+  int32_t offset;   // Offset within the message
+  int32_t length;   // Length of the field data
 };
 
 /**
@@ -188,7 +177,7 @@ struct required_field_input_view {
 
 struct scalar_value_input {
   uint8_t const* data;
-  uint32_t length;
+  int32_t length;
   bool present;
 };
 
