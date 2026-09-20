@@ -219,10 +219,9 @@ CUDF_KERNEL void rebase_locations_kernel(rebase_probe const* probes,
                                          field_location* output)
 {
   auto const idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (idx < num_probes) {
-    auto const& probe = probes[idx];
-    output[idx]       = protobuf_detail::rebase_location(probe.location, probe.base, probe.error);
-  }
+  if (idx >= num_probes) return;
+  auto const& probe = probes[idx];
+  output[idx]       = protobuf_detail::rebase_location(probe.location, probe.base, probe.error);
 }
 
 template <typename Actual, typename Expected>

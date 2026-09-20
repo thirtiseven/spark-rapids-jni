@@ -225,14 +225,6 @@ __device__ inline bool get_field_data_location(uint8_t const* cur,
   return true;
 }
 
-__device__ inline bool checked_add_int32(int32_t lhs, int32_t rhs, int32_t& out)
-{
-  auto const sum = static_cast<int64_t>(lhs) + rhs;
-  if (!cuda::std::in_range<int32_t>(sum)) { return false; }
-  out = static_cast<int32_t>(sum);
-  return true;
-}
-
 struct utf8_sequence {
   uint8_t bytes;
   bool valid;

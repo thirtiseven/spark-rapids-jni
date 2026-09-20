@@ -97,13 +97,13 @@ inline std::string error_message(protobuf_error error)
 /**
  * Field location with a coordinate base defined by its owning view or provider.
  * input_location() returns input-buffer coordinates; row_location() returns row-relative
- * coordinates.
+ * coordinates. The missing marker is outside the supported input-offset range.
  */
 struct field_location {
   static constexpr int32_t INVALID_OFFSET = -1;
 
-  int32_t offset;
-  int32_t length;
+  int32_t offset;  // Byte offset relative to the owning coordinate base
+  int32_t length;  // Length of field data in bytes
 
   CUDF_HOST_DEVICE static constexpr field_location missing() { return {INVALID_OFFSET, 0}; }
   CUDF_HOST_DEVICE constexpr bool is_present() const { return offset >= 0; }

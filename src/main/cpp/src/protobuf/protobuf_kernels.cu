@@ -160,12 +160,10 @@ __device__ bool scan_message_field_locations(message_scan_context context,
         set_error_once(error_flag, protobuf_error::OVERFLOW);
         return false;
       }
-      int32_t data_location;
-      if (!checked_add_int32(data_offset, len_bytes, data_location)) {
-        set_error_once(error_flag, protobuf_error::OVERFLOW);
-        return false;
-      }
-      location = {data_location, static_cast<int32_t>(len)};
+      auto const data_location =
+        rebase_location({data_offset, static_cast<int32_t>(len)}, len_bytes, error_flag);
+      if (!data_location.is_present()) { return false; }
+      location = data_location;
     } else {
       // Fixed-width / varint: record the offset and the wire-type-derived size.
       int field_size = get_wire_type_size(tag.wire_type, cur, msg_end);
@@ -350,7 +348,7 @@ __device__ bool walk_repeated_element(uint8_t const* cur,
       set_error_once(error_flag, protobuf_error::FIELD_SIZE);
       return false;
     }
-    int32_t abs_offset = static_cast<int32_t>(cur - msg_base) + data_offset;
+    auto const abs_offset = static_cast<int32_t>(cur - msg_base) + data_offset;
     if (!f(abs_offset, data_length)) return false;
   }
   return true;
@@ -367,8 +365,9 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
   auto const idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (idx >= num_fragments) return;
 
-  auto const fragment = locations.occurrences[idx];
-  auto const row      = fragment.row_idx;
+  auto const occurrence = locations.occurrences[idx];
+  auto const fragment   = field_location{occurrence.offset, occurrence.length};
+  auto const row        = occurrence.row_idx;
   auto const top_row =
     locations.parent.top_row_indices == nullptr ? row : locations.parent.top_row_indices[row];
   // Multiple fragments may map back to the same parent or top-level row.
@@ -381,7 +380,7 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
     locations.parent.locations == nullptr
       ? field_location{0, locations.input.row_offsets[row + 1] - locations.input.row_offsets[row]}
       : locations.parent.locations[row];
-  if (!parent.is_present() || parent.length < 0 || fragment.offset < 0 || fragment.length < 0) {
+  if (!parent.is_present() || parent.length < 0 || !fragment.is_present() || fragment.length < 0) {
     set_error_once(error_flag, protobuf_error::BOUNDS);
     mark_row_error();
     return;

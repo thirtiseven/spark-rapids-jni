@@ -62,22 +62,16 @@ namespace spark_rapids_jni::protobuf::detail {
 // Data Extraction Location Providers
 // ============================================================================
 
-// Slice bases and local offsets are signed; widen before addition and narrowing.
 __device__ inline field_location rebase_location(field_location location,
                                                  int64_t base,
                                                  protobuf_error* error = nullptr)
 {
   if (!location.is_present()) { return field_location::missing(); }
-  if (base < 0 || base > cuda::std::numeric_limits<int32_t>::max()) {
+  if (base < 0 || base > int64_t{cuda::std::numeric_limits<int32_t>::max()} - location.offset) {
     if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
     return field_location::missing();
   }
-  auto const offset = base + location.offset;
-  if (!cuda::std::in_range<int32_t>(offset)) {
-    if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
-    return field_location::missing();
-  }
-  return {static_cast<int32_t>(offset), location.length};
+  return {static_cast<int32_t>(base) + location.offset, location.length};
 }
 
 struct top_level_location_provider {
