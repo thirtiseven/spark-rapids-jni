@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -202,8 +202,8 @@ __device__ inline bool skip_field(uint8_t const* cur,
 __device__ inline bool get_field_data_location(uint8_t const* cur,
                                                uint8_t const* end,
                                                proto_wire_type wt,
-                                               int32_t& data_offset,
-                                               int32_t& data_length)
+                                               uint32_t& data_offset,
+                                               uint32_t& data_length)
 {
   if (wt == proto_wire_type::LEN) {
     // For length-delimited, read the length prefix
@@ -213,14 +213,14 @@ __device__ inline bool get_field_data_location(uint8_t const* cur,
     if (len > static_cast<uint32_t>(end - cur - len_bytes) || !cuda::std::in_range<int>(len)) {
       return false;
     }
-    data_offset = len_bytes;  // offset past the length prefix
-    data_length = static_cast<int32_t>(len);
+    data_offset = static_cast<uint32_t>(len_bytes);  // offset past the length prefix
+    data_length = len;
   } else {
     // For fixed-size and varint fields
     int field_size = get_wire_type_size(wt, cur, end);
     if (field_size < 0) return false;
     data_offset = 0;
-    data_length = field_size;
+    data_length = static_cast<uint32_t>(field_size);
   }
   return true;
 }

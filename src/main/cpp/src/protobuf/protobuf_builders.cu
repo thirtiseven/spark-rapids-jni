@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -372,7 +372,7 @@ std::unique_ptr<cudf::column> build_enum_string_values_column(
   rmm::device_async_resource_ref mr)
 {
   auto const scratch_mr = cudf::get_current_device_resource_ref();
-  rmm::device_uvector<int32_t> lengths(num_rows, stream, scratch_mr);
+  rmm::device_uvector<uint32_t> lengths(num_rows, stream, scratch_mr);
   auto const input = enum_value_device_view{enum_values.data(), valid.data(), num_rows};
   launch_compute_enum_string_lengths(input, lookup.view(), lengths.data(), stream);
 
@@ -457,7 +457,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
   auto const is_bytes    = field.output_type.id() == cudf::type_id::LIST;
   // Extract string lengths from occurrences
   auto const scratch_mr = cudf::get_current_device_resource_ref();
-  rmm::device_uvector<int32_t> str_lengths(total_count, stream, scratch_mr);
+  rmm::device_uvector<uint32_t> str_lengths(total_count, stream, scratch_mr);
   auto const threads = THREADS_PER_BLOCK;
   auto const blocks  = static_cast<int>((total_count + threads - 1u) / threads);
   field_occurrence_location_provider loc_provider{input, {}, occurrences.data()};
@@ -587,7 +587,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
 
   auto fragment_lengths = thrust::make_transform_iterator(
     work.occurrences.begin(),
-    [] __device__(field_occurrence const& fragment) -> int32_t { return fragment.length; });
+    [] __device__(field_occurrence const& fragment) -> uint32_t { return fragment.length; });
   auto fragment_byte_offsets = make_list_offsets_from_counts(
     fragment_lengths, work.total_count, "Merged singular message", stream, scratch_mr, scratch_mr);
   auto const total_bytes = fragment_byte_offsets.total_count;
@@ -654,7 +654,8 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
       if (invalid[row] || row_fragment_offsets[row] == row_fragment_offsets[row + 1]) {
         return field_location::missing();
       }
-      return field_location{0, row_byte_offsets[row + 1] - row_byte_offsets[row]};
+      return field_location{
+        0, static_cast<uint32_t>(row_byte_offsets[row + 1] - row_byte_offsets[row])};
     });
 
   return build_nested_struct_column(
