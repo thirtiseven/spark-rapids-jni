@@ -1177,9 +1177,7 @@ void maybe_check_required_fields(required_field_input_view input,
   auto const blocks =
     static_cast<int>((input.values.size + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
   auto* row_force_null =
-    decode_ctx.row_force_null != nullptr && !decode_ctx.row_force_null->is_empty()
-      ? static_cast<bool*>(decode_ctx.row_force_null->data())
-      : nullptr;
+    !decode_ctx.row_force_null.empty() ? decode_ctx.row_force_null.data() : nullptr;
   check_required_fields_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
     input,
     d_is_required.data(),
