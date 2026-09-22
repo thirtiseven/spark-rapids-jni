@@ -168,7 +168,7 @@ __device__ inline void decode_varint_value(scalar_value_input input,
 
   using varint_type = cuda::std::conditional_t<sizeof(OutputType) == 4, uint32_t, uint64_t>;
   varint_type v;
-  int n;
+  uint32_t n;
   bool decoded;
   if constexpr (sizeof(OutputType) == 4) {
     decoded = read_varint32(cur, cur_end, v, n);
@@ -655,25 +655,21 @@ inline std::unique_ptr<cudf::column> extract_and_build_string_or_bytes_column(
           [message_data, loc_provider, has_default, default_ptr, def_len] __device__(
             int idx) -> void const* {
             auto loc = loc_provider.input_location(idx);
-            if (!loc.is_present()) {
-              return (has_default && def_len > 0) ? static_cast<void const*>(default_ptr) : nullptr;
-            }
-            return static_cast<void const*>(message_data + loc.offset);
+            if (!loc.is_present()) { return (has_default && def_len > 0) ? default_ptr : nullptr; }
+            return message_data + loc.offset;
           }));
       auto dst_iter = cudf::detail::make_counting_transform_iterator(
         0,
         cuda::proclaim_return_type<void*>([chars_ptr, offsets_data] __device__(int idx) -> void* {
-          return static_cast<void*>(chars_ptr + offsets_data[idx]);
+          return chars_ptr + offsets_data[idx];
         }));
       auto size_iter = cudf::detail::make_counting_transform_iterator(
         0,
         cuda::proclaim_return_type<size_t>(
           [loc_provider, has_default, def_len] __device__(int idx) -> size_t {
             auto loc = loc_provider.input_location(idx);
-            if (!loc.is_present()) {
-              return (has_default && def_len > 0) ? static_cast<size_t>(def_len) : 0;
-            }
-            return static_cast<size_t>(loc.length);
+            if (!loc.is_present()) { return (has_default && def_len > 0) ? def_len : 0; }
+            return loc.length;
           }));
 
       size_t temp_storage_bytes = 0;

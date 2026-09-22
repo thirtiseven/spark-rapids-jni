@@ -67,7 +67,7 @@ __device__ bool read_enum_value(field_descriptor const& descriptor,
   if (descriptor.num_valid_enum_values == 0) return true;
 
   uint32_t raw_value;
-  [[maybe_unused]] int value_size;
+  [[maybe_unused]] uint32_t value_size;
   if (!read_varint32(value_start, value_end, raw_value, value_size)) {
     set_error_once(error_flag, protobuf_error::VARINT);
     return false;
@@ -150,7 +150,7 @@ __device__ bool scan_message_field_locations(message_scan_context context,
     if (tag.wire_type == proto_wire_type::LEN) {
       // Length prefixes use raw-varint32 semantics and may consume up to ten bytes.
       uint32_t len;
-      int len_bytes;
+      uint32_t len_bytes;
       if (!read_varint32(cur, msg_end, len, len_bytes)) {
         set_error_once(error_flag, protobuf_error::VARINT);
         return false;
@@ -165,12 +165,12 @@ __device__ bool scan_message_field_locations(message_scan_context context,
       location = data_location;
     } else {
       // Fixed-width / varint: record the offset and the wire-type-derived size.
-      int field_size = get_wire_type_size(tag.wire_type, cur, msg_end);
-      if (field_size < 0) {
+      uint32_t field_size;
+      if (!get_wire_type_size(tag.wire_type, cur, msg_end, field_size)) {
         set_error_once(error_flag, protobuf_error::FIELD_SIZE);
         return false;
       }
-      location = {data_offset, static_cast<uint32_t>(field_size)};
+      location = {data_offset, field_size};
     }
     if (!on_singular(f, location)) { return false; }
   }
@@ -285,7 +285,7 @@ __device__ bool walk_repeated_element(uint8_t const* cur,
 
   if (is_packed) {
     uint32_t packed_len;
-    int len_bytes;
+    uint32_t len_bytes;
     if (!read_varint32(cur, msg_end, packed_len, len_bytes)) {
       set_error_once(error_flag, protobuf_error::VARINT);
       return false;
@@ -304,7 +304,7 @@ __device__ bool walk_repeated_element(uint8_t const* cur,
         // potential "used before set" warning. `read_varint64` validates the varint stays
         // within `packed_end` (the packed payload's end), not `msg_end` — switching to a
         // generic skip helper here would over-read past the packed buffer.
-        int vbytes = cuda::std::numeric_limits<int>::max();
+        uint32_t vbytes = cuda::std::numeric_limits<uint32_t>::max();
         for (uint8_t const* p = packed_start; p < packed_end; p += vbytes) {
           auto const elem_offset = static_cast<uint32_t>(p - msg_base);
           uint64_t dummy;
@@ -312,7 +312,7 @@ __device__ bool walk_repeated_element(uint8_t const* cur,
             set_error_once(error_flag, protobuf_error::VARINT);
             return false;
           }
-          if (!f(elem_offset, static_cast<uint32_t>(vbytes))) return false;
+          if (!f(elem_offset, vbytes)) return false;
         }
         break;
       }
@@ -552,7 +552,6 @@ __device__ bool scan_all_field_occurrences_in_message(uint8_t const* msg_base,
 
   auto unreachable_singular = [](int, field_location) { return true; };
 
-  auto const row_i32    = static_cast<int32_t>(row);
   auto on_repeated_scan = [&](int f, uint8_t const* cur, proto_wire_type wt) {
     auto const& field = fields.data[f];
     auto* occs        = field.occurrences;
@@ -563,7 +562,7 @@ __device__ bool scan_all_field_occurrences_in_message(uint8_t const* msg_base,
         set_error_once(error_flag, protobuf_error::REPEATED_COUNT_MISMATCH);
         return false;
       }
-      occs[wi] = {row_i32, off, len};
+      occs[wi] = {row, off, len};
       wi++;
       return true;
     };
@@ -629,8 +628,7 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= input.num_rows) return;
 
-  auto const top_row =
-    parent.top_row_indices != nullptr ? parent.top_row_indices[row] : static_cast<int32_t>(row);
+  auto const top_row = parent.top_row_indices != nullptr ? parent.top_row_indices[row] : row;
   // Multiple nested values may map back to the same top-level row.
   auto mark_row_error = [&]() { set_atomically(row_has_invalid_data, top_row); };
 
@@ -835,9 +833,8 @@ CUDF_KERNEL void check_required_fields_kernel(
   for (int f = 0; f < num_fields; f++) {
     if (is_required[f] != 0 && !input.locations[flat_index(row, num_fields, f)].is_present()) {
       if (row_force_null != nullptr) {
-        auto const top_row = input.values.top_row_indices != nullptr
-                               ? input.values.top_row_indices[row]
-                               : static_cast<int32_t>(row);
+        auto const top_row =
+          input.values.top_row_indices != nullptr ? input.values.top_row_indices[row] : row;
         // Nested value rows may converge on the same top-level row.
         set_atomically(row_force_null, top_row);
       }

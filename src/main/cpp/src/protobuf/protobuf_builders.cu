@@ -333,21 +333,22 @@ enum_string_lookup_tables make_enum_string_lookup_tables(
   // Stream-ordered pinned deallocation keeps these staging buffers safe without a local sync.
   auto h_name_offsets =
     cudf::detail::make_pinned_vector_async<int32_t>(valid_enums.size() + 1, stream);
-  h_name_offsets[0]        = 0;
-  int64_t total_name_chars = 0;
+  h_name_offsets[0]       = 0;
+  size_t total_name_chars = 0;
   for (size_t k = 0; k < enum_name_bytes.size(); ++k) {
-    total_name_chars += static_cast<int64_t>(enum_name_bytes[k].size());
-    CUDF_EXPECTS(total_name_chars <= std::numeric_limits<int32_t>::max(),
+    CUDF_EXPECTS(enum_name_bytes[k].size() <=
+                   static_cast<size_t>(std::numeric_limits<int32_t>::max()) - total_name_chars,
                  "Enum name data exceeds 2 GB limit");
+    total_name_chars += enum_name_bytes[k].size();
     h_name_offsets[k + 1] = static_cast<int32_t>(total_name_chars);
   }
 
   auto h_name_chars = cudf::detail::make_pinned_vector_async<uint8_t>(total_name_chars, stream);
-  int32_t cursor    = 0;
+  size_t cursor     = 0;
   for (auto const& name : enum_name_bytes) {
     if (!name.empty()) {
       std::copy(name.data(), name.data() + name.size(), h_name_chars.data() + cursor);
-      cursor += static_cast<int32_t>(name.size());
+      cursor += name.size();
     }
   }
 
@@ -493,18 +494,18 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
           [message_data, loc_provider] __device__(int idx) -> void const* {
             auto loc = loc_provider.input_location(idx);
             if (!loc.is_present()) return nullptr;
-            return static_cast<void const*>(message_data + loc.offset);
+            return message_data + loc.offset;
           }));
       auto dst_iter = cudf::detail::make_counting_transform_iterator(
         0,
         cuda::proclaim_return_type<void*>([chars_ptr, offsets_data] __device__(int idx) -> void* {
-          return static_cast<void*>(chars_ptr + offsets_data[idx]);
+          return chars_ptr + offsets_data[idx];
         }));
       auto size_iter = cudf::detail::make_counting_transform_iterator(
         0, cuda::proclaim_return_type<size_t>([loc_provider] __device__(int idx) -> size_t {
           auto loc = loc_provider.input_location(idx);
           if (!loc.is_present()) return 0;
-          return static_cast<size_t>(loc.length);
+          return loc.length;
         }));
 
       size_t temp_storage_bytes = 0;
@@ -616,17 +617,16 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
           int idx) -> void const* {
           if (invalid[fragments[idx].row_idx]) { return nullptr; }
           auto const location = fragment_locations.input_location(idx);
-          return !location.is_present() ? nullptr
-                                        : static_cast<void const*>(message_data + location.offset);
+          return !location.is_present() ? nullptr : message_data + location.offset;
         }));
     auto dst_iter = cudf::detail::make_counting_transform_iterator(
       0, cuda::proclaim_return_type<void*>([output, fragment_offsets] __device__(int idx) -> void* {
-        return static_cast<void*>(output + fragment_offsets[idx]);
+        return output + fragment_offsets[idx];
       }));
     auto size_iter = cudf::detail::make_counting_transform_iterator(
       0, cuda::proclaim_return_type<size_t>([fragments, invalid] __device__(int idx) -> size_t {
         auto const fragment = fragments[idx];
-        return invalid[fragment.row_idx] ? 0 : static_cast<size_t>(fragment.length);
+        return invalid[fragment.row_idx] ? 0 : fragment.length;
       }));
 
     size_t temp_storage_bytes = 0;
@@ -659,11 +659,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
     });
 
   return build_nested_struct_column(
-    {merged_data.data(),
-     static_cast<cudf::size_type>(total_bytes),
-     merged_row_offsets.data(),
-     0,
-     input.num_rows},
+    {merged_data.data(), total_bytes, merged_row_offsets.data(), 0, input.num_rows},
     {merged_parent_locations.data(), merged_parent_locations.size(), parent.top_row_indices},
     child_field_indices,
     context,
