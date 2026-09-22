@@ -3749,20 +3749,34 @@ public class ProtobufTest {
     }
   }
 
-  @ParameterizedTest
-  @ValueSource(ints = {0, 1, 2})
-  void testWrongWireAroundDuplicateSingularMessageOccurrences_Permissive(int wrongWirePosition) {
+  private static Byte[][] duplicateSingularMessageRowsWithWrongWire(int wrongWirePosition) {
     Byte[] firstFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(1)));
     Byte[] secondFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(2)));
     Byte[] wrongWire = concat(box(tag(1, WT_VARINT)), box(encodeVarint(7)));
     Byte[] first = concat(box(tag(1, WT_LEN)), encodeMessage(firstFragment));
     Byte[] second = concat(box(tag(1, WT_LEN)), encodeMessage(secondFragment));
-    Byte[][] parts = {first, second, second};
-    for (int i = 2; i > wrongWirePosition; --i) {
-      parts[i] = parts[i - 1];
+    Byte[] malformed;
+    switch (wrongWirePosition) {
+      case 0:
+        malformed = concat(wrongWire, first, second);
+        break;
+      case 1:
+        malformed = concat(first, wrongWire, second);
+        break;
+      case 2:
+        malformed = concat(first, second, wrongWire);
+        break;
+      default:
+        throw new IllegalArgumentException("Invalid wrong-wire position: " + wrongWirePosition);
     }
-    parts[wrongWirePosition] = wrongWire;
-    Byte[] row = concat(parts);
+    Byte[] valid = concat(first, second);
+    return new Byte[][]{valid, malformed, valid};
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {0, 1, 2})
+  void testWrongWireAroundDuplicateSingularMessageOccurrences_Permissive(int wrongWirePosition) {
+    Byte[][] rows = duplicateSingularMessageRowsWithWrongWire(wrongWirePosition);
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
             .addField(1, DType.INT32)
@@ -3770,7 +3784,7 @@ public class ProtobufTest {
         .build();
 
     try (Table input = new Table.TestBuilder()
-             .column(new Byte[][]{concat(first, second), row, concat(first, second)}).build();
+             .column(rows).build();
          ColumnVector expected = ColumnVector.fromStructs(
              new StructType(true, new StructType(true, new BasicType(true, DType.INT32))),
              struct(struct(2)), null, struct(struct(2)));
@@ -3782,24 +3796,14 @@ public class ProtobufTest {
   @ParameterizedTest
   @ValueSource(ints = {0, 1, 2})
   void testWrongWireAroundDuplicateSingularMessageOccurrences_Failfast(int wrongWirePosition) {
-    Byte[] firstFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(1)));
-    Byte[] secondFragment = concat(box(tag(1, WT_VARINT)), box(encodeVarint(2)));
-    Byte[] wrongWire = concat(box(tag(1, WT_VARINT)), box(encodeVarint(7)));
-    Byte[] first = concat(box(tag(1, WT_LEN)), encodeMessage(firstFragment));
-    Byte[] second = concat(box(tag(1, WT_LEN)), encodeMessage(secondFragment));
-    Byte[][] parts = {first, second, second};
-    for (int i = 2; i > wrongWirePosition; --i) {
-      parts[i] = parts[i - 1];
-    }
-    parts[wrongWirePosition] = wrongWire;
-    Byte[] row = concat(parts);
+    Byte[][] rows = duplicateSingularMessageRowsWithWrongWire(wrongWirePosition);
     ProtobufSchemaDescriptor schema = new ProtobufSchemaDescriptorBuilder()
         .addField(1, DType.STRUCT).down()
             .addField(1, DType.INT32)
         .up()
         .build();
 
-    try (Table input = new Table.TestBuilder().column(new Byte[][]{row}).build()) {
+    try (Table input = new Table.TestBuilder().column(rows).build()) {
       ai.rapids.cudf.CudfException error = assertThrows(ai.rapids.cudf.CudfException.class, () -> {
         try (ColumnVector ignored = Protobuf.decodeToStruct(input.getColumn(0), schema, true)) {
         }
