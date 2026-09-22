@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -570,7 +570,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
   auto d_field_lookup = cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
 
   auto invalid_rows =
-    cudf::detail::make_zeroed_device_uvector_async<bool>(input.num_rows, stream, scratch_mr);
+    cudf::detail::make_zeroed_device_uvector_async<uint32_t>(input.num_rows, stream, scratch_mr);
   field_occurrence_location_provider fragment_locations{input, parent, work.occurrences.data()};
   launch_validate_message_fragments(
     fragment_locations,

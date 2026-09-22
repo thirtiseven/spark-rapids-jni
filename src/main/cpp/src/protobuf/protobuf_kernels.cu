@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,11 +46,11 @@ CUDF_KERNEL void set_error_if_unset_kernel(protobuf_error* error_flag, protobuf_
   if (blockIdx.x == 0 && threadIdx.x == 0) { set_error_once(error_flag, error); }
 }
 
-__device__ inline void set_atomically(bool* values, int32_t index)
+__device__ inline void set_atomically(uint32_t* values, int32_t index)
 {
   if (values == nullptr) { return; }
-  cuda::atomic_ref<bool, cuda::thread_scope_device> ref(values[index]);
-  ref.store(true, cuda::memory_order_relaxed);
+  cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ref(values[index]);
+  ref.store(1, cuda::memory_order_relaxed);
 }
 
 __device__ inline int enum_binary_search(int32_t const* valid_enum_values,
@@ -99,7 +99,7 @@ struct message_scan_context {
   uint8_t const* begin;
   uint8_t const* end;
   protobuf_error* error;
-  bool* row_invalid;
+  uint32_t* row_invalid;
   int max_group_depth;  // Enclosing messages share protobuf-java's recursion budget.
 };
 
@@ -187,7 +187,7 @@ CUDF_KERNEL void scan_all_fields_kernel(cudf::column_device_view const d_in,
                                         field_scan_view fields,
                                         protobuf_error* error_flag,
                                         protobuf_error* deferred_enum_error,
-                                        bool* row_has_invalid_data)
+                                        uint32_t* row_has_invalid_data)
 {
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
   cudf::lists_column_device_view in{d_in};
@@ -357,8 +357,8 @@ __device__ bool walk_repeated_element(uint8_t const* cur,
 CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_provider locations,
                                                    message_validation_view fields,
                                                    int num_fragments,
-                                                   bool* invalid_rows,
-                                                   bool* row_has_invalid_data,
+                                                   uint32_t* invalid_rows,
+                                                   uint32_t* row_has_invalid_data,
                                                    protobuf_error* error_flag,
                                                    int max_group_depth)
 {
@@ -438,7 +438,7 @@ CUDF_KERNEL void count_repeated_fields_kernel(cudf::column_device_view const d_i
                                               field_scan_view fields,
                                               protobuf_error* error_flag,
                                               protobuf_error* deferred_enum_error,
-                                              bool* row_has_invalid_data)
+                                              uint32_t* row_has_invalid_data)
 {
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
   cudf::lists_column_device_view in{d_in};
@@ -581,6 +581,7 @@ __device__ bool scan_all_field_occurrences_in_message(uint8_t const* msg_base,
   return true;
 }
 
+template <wire_type_mismatch_policy MismatchPolicy>
 CUDF_KERNEL void scan_all_field_occurrences_kernel(cudf::column_device_view const d_in,
                                                    field_occurrence_scan_view fields,
                                                    protobuf_error* error_flag)
@@ -599,7 +600,7 @@ CUDF_KERNEL void scan_all_field_occurrences_kernel(cudf::column_device_view cons
   if (!check_message_bounds(start, end, child.size(), error_flag)) return;
 
   [[maybe_unused]] auto const scan_succeeded =
-    scan_all_field_occurrences_in_message<wire_type_mismatch_policy::report_error_and_abort>(
+    scan_all_field_occurrences_in_message<MismatchPolicy>(
       bytes + start, bytes + end, fields, error_flag, row, PROTOBUF_JAVA_RECURSION_LIMIT);
 }
 
@@ -616,7 +617,7 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
                                                    nested_parent_view parent,
                                                    field_scan_view fields,
                                                    protobuf_error* error_flag,
-                                                   bool* row_has_invalid_data,
+                                                   uint32_t* row_has_invalid_data,
                                                    int max_group_depth)
 {
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -814,7 +815,7 @@ CUDF_KERNEL void check_required_fields_kernel(
   required_field_input_view input,
   uint8_t const* is_required,  // [num_fields] (1 = required, 0 = optional)
   int num_fields,
-  bool* row_force_null,  // [top_level_num_rows] optional permissive row nulling
+  uint32_t* row_force_null,  // [top_level_num_rows] optional permissive row nulling
   protobuf_error* error_flag)
 {
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -935,7 +936,7 @@ void launch_scan_all_fields(cudf::column_device_view const& d_in,
                             field_scan_view fields,
                             protobuf_error* error_flag,
                             protobuf_error* deferred_enum_error,
-                            bool* row_has_invalid_data,
+                            uint32_t* row_has_invalid_data,
                             cuda::stream_ref stream)
 {
   auto const num_rows = d_in.size();
@@ -950,7 +951,7 @@ void launch_count_repeated_fields(cudf::column_device_view const& d_in,
                                   field_scan_view fields,
                                   protobuf_error* error_flag,
                                   protobuf_error* deferred_enum_error,
-                                  bool* row_has_invalid_data,
+                                  uint32_t* row_has_invalid_data,
                                   cuda::stream_ref stream)
 {
   auto const num_rows = d_in.size();
@@ -969,8 +970,8 @@ void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
   auto const num_rows = d_in.size();
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
-    d_in, fields, error_flag);
+  scan_all_field_occurrences_kernel<wire_type_mismatch_policy::report_error_and_abort>
+    <<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(d_in, fields, error_flag);
   CUDF_CHECK_CUDA(stream.get());
 }
 
@@ -982,8 +983,9 @@ void launch_scan_singular_message_occurrences(cudf::column_device_view const& d_
   auto const num_rows = d_in.size();
   if (num_rows == 0) return;
   auto const blocks = static_cast<int>((num_rows + THREADS_PER_BLOCK - 1u) / THREADS_PER_BLOCK);
-  scan_all_field_occurrences_kernel<<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(
-    d_in, fields, error_flag);
+  // Match the singular-message count pass so every counted fragment is initialized.
+  scan_all_field_occurrences_kernel<wire_type_mismatch_policy::report_error_and_continue>
+    <<<blocks, THREADS_PER_BLOCK, 0, stream.get()>>>(d_in, fields, error_flag);
   CUDF_CHECK_CUDA(stream.get());
 }
 
@@ -1005,7 +1007,7 @@ void launch_scan_nested_message_fields(protobuf_input_view input,
                                        nested_parent_view parent,
                                        field_scan_view fields,
                                        protobuf_error* error_flag,
-                                       bool* row_has_invalid_data,
+                                       uint32_t* row_has_invalid_data,
                                        int recursion_depth,
                                        cuda::stream_ref stream)
 {
@@ -1037,8 +1039,8 @@ void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
 void launch_validate_message_fragments(field_occurrence_location_provider locations,
                                        message_validation_view fields,
                                        int num_fragments,
-                                       bool* invalid_rows,
-                                       bool* row_has_invalid_data,
+                                       uint32_t* invalid_rows,
+                                       uint32_t* row_has_invalid_data,
                                        protobuf_error* error_flag,
                                        int recursion_depth,
                                        cuda::stream_ref stream)

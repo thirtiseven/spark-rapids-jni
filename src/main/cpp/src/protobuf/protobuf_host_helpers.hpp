@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -119,7 +119,7 @@ field_descriptor_bundle make_field_descriptors(std::vector<int> const& field_ind
 // ============================================================================
 
 struct protobuf_decode_runtime_context {
-  rmm::device_uvector<bool>* row_force_null;
+  rmm::device_uvector<uint32_t>* row_force_null;
   rmm::device_uvector<protobuf_error>* error;
 };
 

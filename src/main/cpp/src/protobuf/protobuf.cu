@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -434,12 +434,9 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   // PERMISSIVE-mode row nulling support for malformed input, root enum mismatches, and missing
   // required fields.
   bool const track_permissive_null_rows = !fail_on_errors;
-  rmm::device_uvector<bool> d_row_force_null(
+  // Subword atomics may access a full 32-bit word, including beyond a bool allocation's end.
+  auto d_row_force_null = cudf::detail::make_zeroed_device_uvector_async<uint32_t>(
     track_permissive_null_rows ? num_rows : 0, stream, scratch_mr);
-  if (track_permissive_null_rows) {
-    CUDF_CUDA_TRY(
-      cudaMemsetAsync(d_row_force_null.data(), 0, num_rows * sizeof(bool), stream.get()));
-  }
   auto const decode_ctx        = protobuf_decode_runtime_context{&d_row_force_null, &d_error};
   auto const recursive_context = recursive_decode_context{schema_context, decode_ctx};
 
