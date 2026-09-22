@@ -429,7 +429,7 @@ void launch_count_repeated_fields(cudf::column_device_view const& d_in,
                                   field_scan_view fields,
                                   protobuf_error* error_flag,
                                   protobuf_error* deferred_enum_error,
-                                  uint32_t* row_has_invalid_data,
+                                  bool* row_has_invalid_data,
                                   cuda::stream_ref stream);
 
 void launch_scan_all_field_occurrences(cudf::column_device_view const& d_in,
@@ -453,7 +453,7 @@ void launch_scan_nested_message_fields(protobuf_input_view input,
                                        nested_parent_view parent,
                                        field_scan_view fields,
                                        protobuf_error* error_flag,
-                                       uint32_t* row_has_invalid_data,
+                                       bool* row_has_invalid_data,
                                        int recursion_depth,
                                        cuda::stream_ref stream);
 
@@ -467,8 +467,8 @@ void launch_scan_all_field_occurrences_in_nested(protobuf_input_view input,
 void launch_validate_message_fragments(field_occurrence_location_provider locations,
                                        message_validation_view fields,
                                        int num_fragments,
-                                       uint32_t* invalid_rows,
-                                       uint32_t* row_has_invalid_data,
+                                       bool* invalid_rows,
+                                       bool* row_has_invalid_data,
                                        protobuf_error* error_flag,
                                        int recursion_depth,
                                        cuda::stream_ref stream);
@@ -869,7 +869,7 @@ void launch_scan_all_fields(cudf::column_device_view const& d_in,
                             field_scan_view fields,
                             protobuf_error* error_flag,
                             protobuf_error* deferred_enum_error,
-                            uint32_t* row_has_invalid_data,
+                            bool* row_has_invalid_data,
                             cuda::stream_ref stream);
 
 void launch_validate_enum_values(enum_value_device_view input,

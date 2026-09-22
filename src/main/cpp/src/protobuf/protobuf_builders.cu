@@ -569,21 +569,21 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
     validation_fields.host.data(), static_cast<int>(validation_fields.host.size()), stream);
   auto d_field_lookup = cudf::detail::make_device_uvector_async(h_field_lookup, stream, scratch_mr);
 
-  auto invalid_rows =
-    cudf::detail::make_zeroed_device_uvector_async<uint32_t>(input.num_rows, stream, scratch_mr);
+  auto invalid_rows = make_zeroed_atomic_flags(input.num_rows, stream, scratch_mr);
   field_occurrence_location_provider fragment_locations{input, parent, work.occurrences.data()};
-  launch_validate_message_fragments(
-    fragment_locations,
-    {{validation_fields.device.data(),
-      static_cast<int>(validation_fields.device.size()),
-      d_field_lookup.is_empty() ? nullptr : d_field_lookup.data(),
-      static_cast<int>(d_field_lookup.size())}},
-    work.total_count,
-    invalid_rows.data(),
-    context.runtime.row_force_null->is_empty() ? nullptr : context.runtime.row_force_null->data(),
-    context.runtime.error->data(),
-    depth + 1,
-    stream);
+  launch_validate_message_fragments(fragment_locations,
+                                    {{validation_fields.device.data(),
+                                      static_cast<int>(validation_fields.device.size()),
+                                      d_field_lookup.is_empty() ? nullptr : d_field_lookup.data(),
+                                      static_cast<int>(d_field_lookup.size())}},
+                                    work.total_count,
+                                    static_cast<bool*>(invalid_rows.data()),
+                                    context.runtime.row_force_null->is_empty()
+                                      ? nullptr
+                                      : static_cast<bool*>(context.runtime.row_force_null->data()),
+                                    context.runtime.error->data(),
+                                    depth + 1,
+                                    stream);
 
   auto fragment_lengths = thrust::make_transform_iterator(
     work.occurrences.begin(),
@@ -604,7 +604,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
 
   rmm::device_uvector<uint8_t> merged_data(std::max<int32_t>(total_bytes, 1), stream, scratch_mr);
   if (total_bytes > 0) {
-    auto const* invalid          = invalid_rows.data();
+    auto const* invalid          = static_cast<bool*>(invalid_rows.data());
     auto const* fragments        = work.occurrences.data();
     auto const* fragment_offsets = fragment_byte_offsets.offsets.data();
     auto* output                 = merged_data.data();
@@ -650,7 +650,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
     merged_parent_locations.begin(),
     [row_fragment_offsets = work.offsets.data(),
      row_byte_offsets     = merged_row_offsets.data(),
-     invalid              = invalid_rows.data()] __device__(int row) {
+     invalid              = static_cast<bool*>(invalid_rows.data())] __device__(int row) {
       if (invalid[row] || row_fragment_offsets[row] == row_fragment_offsets[row + 1]) {
         return field_location::missing();
       }
@@ -755,7 +755,8 @@ std::unique_ptr<cudf::column> build_nested_struct_column(
                                   .direct      = nullptr,
                                   .direct_size = 0}},
     decode_ctx.error->data(),
-    !decode_ctx.row_force_null->is_empty() ? decode_ctx.row_force_null->data() : nullptr,
+    !decode_ctx.row_force_null->is_empty() ? static_cast<bool*>(decode_ctx.row_force_null->data())
+                                           : nullptr,
     depth + 1,
     stream);
 

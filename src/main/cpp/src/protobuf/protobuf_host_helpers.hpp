@@ -22,6 +22,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/host_vector.hpp>
+#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -118,8 +119,24 @@ field_descriptor_bundle make_field_descriptors(std::vector<int> const& field_ind
 // Nested decode view bundles
 // ============================================================================
 
+inline rmm::device_buffer make_zeroed_atomic_flags(std::size_t num_rows,
+                                                   cuda::stream_ref stream,
+                                                   rmm::device_async_resource_ref mr)
+{
+  static_assert(sizeof(bool) == 1);
+  // Subword atomics access the containing 32-bit word, including the allocation tail.
+  auto const padded_size = cudf::util::round_up_safe(num_rows, sizeof(uint32_t));
+  rmm::device_buffer flags(padded_size, alignof(uint32_t), stream, mr);
+  if (padded_size != 0) {
+    CUDF_CUDA_TRY(cudaMemsetAsync(flags.data(), 0, padded_size, stream.get()));
+  }
+  // Preserve the logical row count without releasing the padding capacity.
+  flags.resize(num_rows, stream);
+  return flags;
+}
+
 struct protobuf_decode_runtime_context {
-  rmm::device_uvector<uint32_t>* row_force_null;
+  rmm::device_buffer* row_force_null;
   rmm::device_uvector<protobuf_error>* error;
 };
 

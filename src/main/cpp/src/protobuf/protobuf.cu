@@ -434,9 +434,8 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   // PERMISSIVE-mode row nulling support for malformed input, root enum mismatches, and missing
   // required fields.
   bool const track_permissive_null_rows = !fail_on_errors;
-  // Subword atomics may access a full 32-bit word, including beyond a bool allocation's end.
-  auto d_row_force_null = cudf::detail::make_zeroed_device_uvector_async<uint32_t>(
-    track_permissive_null_rows ? num_rows : 0, stream, scratch_mr);
+  auto d_row_force_null =
+    make_zeroed_atomic_flags(track_permissive_null_rows ? num_rows : 0, stream, scratch_mr);
   auto const decode_ctx        = protobuf_decode_runtime_context{&d_row_force_null, &d_error};
   auto const recursive_context = recursive_decode_context{schema_context, decode_ctx};
 
@@ -486,7 +485,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                     .direct_size = static_cast<int>(h_field_lookup.size())}},
       d_error.data(),
       d_deferred_enum_error.data(),
-      track_permissive_null_rows ? d_row_force_null.data() : nullptr,
+      track_permissive_null_rows ? static_cast<bool*>(d_row_force_null.data()) : nullptr,
       stream);
   }
 
@@ -548,7 +547,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                                   .direct_size = static_cast<int>(h_field_lookup.size())}},
       d_error.data(),
       d_deferred_enum_error.data(),
-      track_permissive_null_rows ? d_row_force_null.data() : nullptr,
+      track_permissive_null_rows ? static_cast<bool*>(d_row_force_null.data()) : nullptr,
       stream);
 
     // Required-field validation applies to all scalar leaves, not just top-level numerics.
@@ -887,7 +886,8 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     auto [mask, null_count] = cudf::detail::valid_if(
       thrust::make_counting_iterator<cudf::size_type>(0),
       thrust::make_counting_iterator<cudf::size_type>(num_rows),
-      [row_invalid = track_permissive_null_rows ? d_row_force_null.data() : nullptr,
+      [row_invalid =
+         track_permissive_null_rows ? static_cast<bool*>(d_row_force_null.data()) : nullptr,
        input_mask,
        input_offset] __device__(cudf::size_type row) {
         if (input_mask != nullptr && !cudf::bit_is_set(input_mask, input_offset + row)) {
