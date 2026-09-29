@@ -54,7 +54,7 @@ namespace spark_rapids_jni {
  *
  * @param left_keys The left table for equality comparison
  * @param right_keys The right table for equality comparison
- * @param is_left_sorted Whether the left table is pre-sorted
+ * @param is_left_sorted Ignored by cuDF; retained for caller compatibility
  * @param is_right_sorted Whether the right table is pre-sorted
  * @param compare_nulls Whether null values in equality keys join to each other
  * @param stream CUDA stream for device operations
