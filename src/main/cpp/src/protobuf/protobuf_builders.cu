@@ -373,7 +373,7 @@ std::unique_ptr<cudf::column> build_enum_string_values_column(
   rmm::device_async_resource_ref mr)
 {
   auto const scratch_mr = cudf::get_current_device_resource_ref();
-  rmm::device_uvector<uint32_t> lengths(num_rows, stream, scratch_mr);
+  rmm::device_uvector<int32_t> lengths(num_rows, stream, scratch_mr);
   auto const input = enum_value_device_view{enum_values.data(), valid.data(), num_rows};
   launch_compute_enum_string_lengths(input, lookup.view(), lengths.data(), stream);
 
@@ -458,7 +458,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
   auto const is_bytes    = field.output_type.id() == cudf::type_id::LIST;
   // Extract string lengths from occurrences
   auto const scratch_mr = cudf::get_current_device_resource_ref();
-  rmm::device_uvector<uint32_t> str_lengths(total_count, stream, scratch_mr);
+  rmm::device_uvector<int32_t> str_lengths(total_count, stream, scratch_mr);
   auto const threads = THREADS_PER_BLOCK;
   auto const blocks  = static_cast<int>((total_count + threads - 1u) / threads);
   field_occurrence_location_provider loc_provider{input, {}, occurrences.data()};
@@ -494,18 +494,18 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
           [message_data, loc_provider] __device__(int idx) -> void const* {
             auto loc = loc_provider.input_location(idx);
             if (!loc.is_present()) return nullptr;
-            return message_data + loc.offset;
+            return static_cast<void const*>(message_data + loc.offset);
           }));
       auto dst_iter = cudf::detail::make_counting_transform_iterator(
         0,
         cuda::proclaim_return_type<void*>([chars_ptr, offsets_data] __device__(int idx) -> void* {
-          return chars_ptr + offsets_data[idx];
+          return static_cast<void*>(chars_ptr + offsets_data[idx]);
         }));
       auto size_iter = cudf::detail::make_counting_transform_iterator(
         0, cuda::proclaim_return_type<size_t>([loc_provider] __device__(int idx) -> size_t {
           auto loc = loc_provider.input_location(idx);
           if (!loc.is_present()) return 0;
-          return loc.length;
+          return static_cast<size_t>(loc.length);
         }));
 
       size_t temp_storage_bytes = 0;
@@ -617,16 +617,17 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
           int idx) -> void const* {
           if (invalid[fragments[idx].row_idx]) { return nullptr; }
           auto const location = fragment_locations.input_location(idx);
-          return !location.is_present() ? nullptr : message_data + location.offset;
+          return !location.is_present() ? nullptr
+                                        : static_cast<void const*>(message_data + location.offset);
         }));
     auto dst_iter = cudf::detail::make_counting_transform_iterator(
       0, cuda::proclaim_return_type<void*>([output, fragment_offsets] __device__(int idx) -> void* {
-        return output + fragment_offsets[idx];
+        return static_cast<void*>(output + fragment_offsets[idx]);
       }));
     auto size_iter = cudf::detail::make_counting_transform_iterator(
       0, cuda::proclaim_return_type<size_t>([fragments, invalid] __device__(int idx) -> size_t {
         auto const fragment = fragments[idx];
-        return invalid[fragment.row_idx] ? 0 : fragment.length;
+        return invalid[fragment.row_idx] ? 0 : static_cast<size_t>(fragment.length);
       }));
 
     size_t temp_storage_bytes = 0;

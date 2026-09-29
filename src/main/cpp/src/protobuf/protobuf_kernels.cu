@@ -381,12 +381,6 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
                        static_cast<uint32_t>(locations.input.row_offsets[row + 1] -
                                              locations.input.row_offsets[row])}
       : locations.parent.locations[row];
-  if (!cuda::std::in_range<int32_t>(parent.length) ||
-      !cuda::std::in_range<int32_t>(fragment.length)) {
-    set_error_once(error_flag, protobuf_error::FIELD_SIZE);
-    mark_row_error();
-    return;
-  }
   if (!parent.is_present() || !fragment.is_present()) {
     set_error_once(error_flag, protobuf_error::BOUNDS);
     mark_row_error();
@@ -552,6 +546,7 @@ __device__ bool scan_all_field_occurrences_in_message(uint8_t const* msg_base,
 
   auto unreachable_singular = [](int, field_location) { return true; };
 
+  auto const row_i32    = static_cast<int32_t>(row);
   auto on_repeated_scan = [&](int f, uint8_t const* cur, proto_wire_type wt) {
     auto const& field = fields.data[f];
     auto* occs        = field.occurrences;
@@ -562,7 +557,7 @@ __device__ bool scan_all_field_occurrences_in_message(uint8_t const* msg_base,
         set_error_once(error_flag, protobuf_error::REPEATED_COUNT_MISMATCH);
         return false;
       }
-      occs[wi] = {row, off, len};
+      occs[wi] = {row_i32, off, len};
       wi++;
       return true;
     };
@@ -628,7 +623,8 @@ CUDF_KERNEL void scan_nested_message_fields_kernel(protobuf_input_view input,
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= input.num_rows) return;
 
-  auto const top_row = parent.top_row_indices != nullptr ? parent.top_row_indices[row] : row;
+  auto const top_row =
+    parent.top_row_indices != nullptr ? parent.top_row_indices[row] : static_cast<int32_t>(row);
   // Multiple nested values may map back to the same top-level row.
   auto mark_row_error = [&]() { set_atomically(row_has_invalid_data, top_row); };
 
@@ -833,8 +829,9 @@ CUDF_KERNEL void check_required_fields_kernel(
   for (int f = 0; f < num_fields; f++) {
     if (is_required[f] != 0 && !input.locations[flat_index(row, num_fields, f)].is_present()) {
       if (row_force_null != nullptr) {
-        auto const top_row =
-          input.values.top_row_indices != nullptr ? input.values.top_row_indices[row] : row;
+        auto const top_row = input.values.top_row_indices != nullptr
+                               ? input.values.top_row_indices[row]
+                               : static_cast<int32_t>(row);
         // Nested value rows may converge on the same top-level row.
         set_atomically(row_force_null, top_row);
       }
@@ -887,7 +884,7 @@ CUDF_KERNEL void validate_enum_values_kernel(enum_value_device_view input,
  */
 CUDF_KERNEL void compute_enum_string_lengths_kernel(enum_value_device_view input,
                                                     enum_string_lookup_device_view lookup,
-                                                    uint32_t* lengths)
+                                                    int32_t* lengths)
 {
   auto row = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= input.size) return;
@@ -899,8 +896,7 @@ CUDF_KERNEL void compute_enum_string_lengths_kernel(enum_value_device_view input
 
   int idx = enum_binary_search(lookup.domain.valid_values, lookup.domain.size, input.values[row]);
   // Should not happen when validate_enum_values_kernel has already run, but keep safe.
-  lengths[row] =
-    idx >= 0 ? static_cast<uint32_t>(lookup.name_offsets[idx + 1] - lookup.name_offsets[idx]) : 0u;
+  lengths[row] = idx >= 0 ? (lookup.name_offsets[idx + 1] - lookup.name_offsets[idx]) : 0;
 }
 
 /**
@@ -1133,7 +1129,7 @@ void launch_validate_enum_values(enum_value_device_view input,
 
 void launch_compute_enum_string_lengths(enum_value_device_view input,
                                         enum_string_lookup_device_view lookup,
-                                        uint32_t* lengths,
+                                        int32_t* lengths,
                                         cuda::stream_ref stream)
 {
   if (input.size == 0) return;

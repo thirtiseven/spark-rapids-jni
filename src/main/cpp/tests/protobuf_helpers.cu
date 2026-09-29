@@ -422,14 +422,14 @@ TEST_F(ProtobufHelpersTest, ByteLengthsUseDefaultOnlyForMissingFields)
     std::vector<field_location>{{0, 3}, field_location::missing(), {0, 0}}, stream, mr);
   protobuf_detail::top_level_location_provider const provider{
     offsets.data(), 0, locations.data(), 0, 1};
-  rmm::device_uvector<uint32_t> lengths(3, stream, mr);
+  rmm::device_uvector<int32_t> lengths(3, stream, mr);
   protobuf_detail::extract_lengths_kernel<<<1, 3, 0, stream.get()>>>(provider, 3, lengths.data());
   CUDF_CHECK_CUDA(stream.get());
-  EXPECT_EQ(cudf::detail::make_std_vector(lengths, stream), (std::vector<uint32_t>{3, 0, 0}));
+  EXPECT_EQ(cudf::detail::make_std_vector(lengths, stream), (std::vector<int32_t>{3, 0, 0}));
   protobuf_detail::extract_lengths_kernel<<<1, 3, 0, stream.get()>>>(
     provider, 3, lengths.data(), 7);
   CUDF_CHECK_CUDA(stream.get());
-  EXPECT_EQ(cudf::detail::make_std_vector(lengths, stream), (std::vector<uint32_t>{3, 7, 0}));
+  EXPECT_EQ(cudf::detail::make_std_vector(lengths, stream), (std::vector<int32_t>{3, 7, 0}));
 }
 
 TEST_F(ProtobufHelpersTest, UnsignedFragmentLengthsRetainSignedOffsetLimit)
@@ -464,7 +464,7 @@ TEST_F(ProtobufHelpersTest, UnsignedFragmentLengthsRetainSignedOffsetLimit)
   EXPECT_THROW(make_offsets(std::numeric_limits<uint32_t>::max(), 1), cudf::logic_error);
 }
 
-TEST_F(ProtobufHelpersTest, FragmentValidationDistinguishesLengthsFromBounds)
+TEST_F(ProtobufHelpersTest, FragmentValidationRejectsUnsupportedLocations)
 {
   using protobuf_detail::protobuf_error;
   auto const stream    = cudf::get_default_stream();
@@ -477,13 +477,13 @@ TEST_F(ProtobufHelpersTest, FragmentValidationDistinguishesLengthsFromBounds)
   };
   auto const cases = std::to_array<validation_case>(
     {{{0, 8}, {0, 0}, protobuf_error::NONE},
-     {{0, 8}, {0, oversized}, protobuf_error::FIELD_SIZE},
-     {{0, oversized}, {0, 0}, protobuf_error::FIELD_SIZE},
-     {{0, 8}, {0, std::numeric_limits<uint32_t>::max()}, protobuf_error::FIELD_SIZE},
+     {{0, 8}, {0, oversized}, protobuf_error::BOUNDS},
+     {{0, 8}, {0, std::numeric_limits<uint32_t>::max()}, protobuf_error::BOUNDS},
+     {{0, 8}, {oversized, 0}, protobuf_error::BOUNDS},
      {{0, 8}, {7, 2}, protobuf_error::BOUNDS},
      {field_location::missing(), {0, 0}, protobuf_error::BOUNDS},
      {{0, 8}, field_location::missing(), protobuf_error::BOUNDS},
-     {field_location::missing(), {0, oversized}, protobuf_error::FIELD_SIZE}});
+     {field_location::missing(), {0, oversized}, protobuf_error::BOUNDS}});
   auto const bytes   = cudf::detail::make_zeroed_device_uvector_async<uint8_t>(8, stream, mr);
   auto const offsets = cudf::detail::make_device_uvector(std::vector<int32_t>{0, 8, 8}, stream, mr);
   auto const top_rows = cudf::detail::make_device_uvector(std::vector<int32_t>{1, 0}, stream, mr);
