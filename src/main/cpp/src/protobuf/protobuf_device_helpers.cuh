@@ -112,16 +112,13 @@ __device__ inline bool get_wire_type_size(proto_wire_type wt,
       uint64_t dummy_value;
       return read_varint64(cur, end, dummy_value, size);
     }
-    case proto_wire_type::I64BIT:
-      // Check if there's enough data for 8 bytes
-      if (end - cur < 8) return false;
-      size = 8;
-      return true;
     case proto_wire_type::I32BIT:
-      // Check if there's enough data for 4 bytes
-      if (end - cur < 4) return false;
-      size = 4;
+    case proto_wire_type::I64BIT: {
+      uint32_t const width = wt == proto_wire_type::I32BIT ? 4 : 8;
+      if (end - cur < width) return false;
+      size = width;
       return true;
+    }
     case proto_wire_type::LEN: {
       uint32_t len;
       uint32_t n;
@@ -137,6 +134,23 @@ __device__ inline bool get_wire_type_size(proto_wire_type wt,
   }
 }
 
+__device__ inline bool skip_sized_field(uint8_t const* cur,
+                                        uint8_t const* end,
+                                        proto_wire_type wt,
+                                        uint8_t const*& out_cur)
+{
+  uint32_t size;
+  // Ensure we don't skip past the end of the buffer
+  if (!get_wire_type_size(wt, cur, end, size) || size > end - cur) return false;
+  out_cur = cur + size;
+  return true;
+}
+
+__device__ inline bool decode_tag(uint8_t const*& cur,
+                                  uint8_t const* end,
+                                  proto_tag& tag,
+                                  protobuf_error* error_flag);
+
 // Keep the rare group stack out of the scanner hot paths.
 static __device__ __noinline__ bool skip_group(uint8_t const* cur,
                                                uint8_t const* end,
@@ -150,31 +164,20 @@ static __device__ __noinline__ bool skip_group(uint8_t const* cur,
   group_fields[0] = field_number;
 
   while (cur < end) {
-    uint32_t key;
-    uint32_t key_bytes;
-    if (!read_varint32(cur, end, key, key_bytes)) return false;
-    cur += key_bytes;
-
-    int const inner_field_number = static_cast<int>(key >> 3);
-    if (inner_field_number == 0 || inner_field_number > MAX_FIELD_NUMBER) { return false; }
-    auto const inner_wire_type = static_cast<proto_wire_type>(key & 0x7);
-    if (inner_wire_type == proto_wire_type::EGROUP) {
-      if (inner_field_number != group_fields[depth - 1]) return false;
+    proto_tag inner_tag;
+    if (!decode_tag(cur, end, inner_tag, nullptr)) { return false; }
+    if (inner_tag.wire_type == proto_wire_type::EGROUP) {
+      if (inner_tag.field_number != group_fields[depth - 1]) return false;
       if (--depth == 0) {
         out_cur = cur;
         return true;
       }
-      continue;
-    } else if (inner_wire_type == proto_wire_type::SGROUP) {
+    } else if (inner_tag.wire_type == proto_wire_type::SGROUP) {
       if (depth == max_group_depth) return false;
-      group_fields[depth++] = inner_field_number;
-      continue;
-    }
-
-    uint32_t inner_size;
-    if (!get_wire_type_size(inner_wire_type, cur, end, inner_size) || inner_size > end - cur)
+      group_fields[depth++] = inner_tag.field_number;
+    } else if (!skip_sized_field(cur, end, inner_tag.wire_type, cur)) {
       return false;
-    cur += inner_size;
+    }
   }
   return false;
 }
@@ -193,12 +196,7 @@ __device__ inline bool skip_field(uint8_t const* cur,
     return skip_group(cur, end, tag.field_number, max_group_depth, out_cur);
   }
 
-  uint32_t size;
-  if (!get_wire_type_size(tag.wire_type, cur, end, size)) return false;
-  // Ensure we don't skip past the end of the buffer
-  if (cur + size > end) return false;
-  out_cur = cur + size;
-  return true;
+  return skip_sized_field(cur, end, tag.wire_type, out_cur);
 }
 
 /**
@@ -208,8 +206,7 @@ __device__ inline bool skip_field(uint8_t const* cur,
 __device__ inline bool get_field_data_location(uint8_t const* cur,
                                                uint8_t const* end,
                                                proto_wire_type wt,
-                                               uint32_t& data_offset,
-                                               uint32_t& data_length)
+                                               field_location& location)
 {
   if (wt == proto_wire_type::LEN) {
     // For length-delimited, read the length prefix
@@ -219,12 +216,11 @@ __device__ inline bool get_field_data_location(uint8_t const* cur,
     if (len > static_cast<uint32_t>(end - cur - len_bytes) || !cuda::std::in_range<int>(len)) {
       return false;
     }
-    data_offset = len_bytes;  // offset past the length prefix
-    data_length = len;
+    location = {len_bytes, len};  // offset past the length prefix
   } else {
     // For fixed-size and varint fields
-    if (!get_wire_type_size(wt, cur, end, data_length)) return false;
-    data_offset = 0;
+    if (!get_wire_type_size(wt, cur, end, location.length)) return false;
+    location.offset = 0;
   }
   return true;
 }
@@ -326,14 +322,14 @@ __device__ inline bool decode_tag(uint8_t const*& cur,
   uint32_t key;
   uint32_t key_bytes;
   if (!read_varint32(cur, end, key, key_bytes)) {
-    set_error_once(error_flag, protobuf_error::VARINT);
+    if (error_flag != nullptr) { set_error_once(error_flag, protobuf_error::VARINT); }
     return false;
   }
 
   cur += key_bytes;
   uint32_t fn = key >> 3;
   if (fn == 0 || fn > static_cast<uint32_t>(MAX_FIELD_NUMBER)) {
-    set_error_once(error_flag, protobuf_error::FIELD_NUMBER);
+    if (error_flag != nullptr) { set_error_once(error_flag, protobuf_error::FIELD_NUMBER); }
     return false;
   }
   tag.field_number = static_cast<int>(fn);

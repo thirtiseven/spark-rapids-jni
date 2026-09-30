@@ -342,13 +342,13 @@ __device__ bool walk_repeated_element(uint8_t const* cur,
     // occurrence; `skip_field` advances past the field but doesn't surface those. The count
     // path's `f` ignores them, but sharing one helper keeps the walker generic over both
     // actions and avoids re-validating field bounds twice.
-    uint32_t data_offset, data_length;
-    if (!get_field_data_location(cur, msg_end, wt, data_offset, data_length)) {
+    field_location data;
+    if (!get_field_data_location(cur, msg_end, wt, data)) {
       set_error_once(error_flag, protobuf_error::FIELD_SIZE);
       return false;
     }
-    auto const abs_offset = static_cast<uint32_t>(cur - msg_base) + data_offset;
-    if (!f(abs_offset, data_length)) return false;
+    auto const abs_offset = static_cast<uint32_t>(cur - msg_base) + data.offset;
+    if (!f(abs_offset, data.length)) return false;
   }
   return true;
 }
@@ -381,6 +381,8 @@ CUDF_KERNEL void validate_message_fragments_kernel(field_occurrence_location_pro
                        static_cast<uint32_t>(locations.input.row_offsets[row + 1] -
                                              locations.input.row_offsets[row])}
       : locations.parent.locations[row];
+  // Unsigned lengths need no sign check. Producers bound them by the input buffer, and the
+  // widened comparisons below reject any fragment outside its parent or the input buffer.
   if (!parent.is_present() || !fragment.is_present()) {
     set_error_once(error_flag, protobuf_error::BOUNDS);
     mark_row_error();
@@ -827,18 +829,19 @@ CUDF_KERNEL void check_required_fields_kernel(
   if (input.parent_locations != nullptr && !input.parent_locations[row].is_present()) return;
 
   for (int f = 0; f < num_fields; f++) {
-    if (is_required[f] != 0 && !input.locations[flat_index(row, num_fields, f)].is_present()) {
-      if (row_force_null != nullptr) {
-        auto const top_row = input.values.top_row_indices != nullptr
-                               ? input.values.top_row_indices[row]
-                               : static_cast<int32_t>(row);
-        // Nested value rows may converge on the same top-level row.
-        set_atomically(row_force_null, top_row);
-      }
-      // Required field is missing - set error flag
-      set_error_once(error_flag, protobuf_error::REQUIRED);
-      return;  // No need to check other fields for this row
+    if (is_required[f] == 0 || input.locations[flat_index(row, num_fields, f)].is_present()) {
+      continue;
     }
+    if (row_force_null != nullptr) {
+      auto const top_row = input.values.top_row_indices != nullptr
+                             ? input.values.top_row_indices[row]
+                             : static_cast<int32_t>(row);
+      // Nested value rows may converge on the same top-level row.
+      set_atomically(row_force_null, top_row);
+    }
+    // Required field is missing - set error flag
+    set_error_once(error_flag, protobuf_error::REQUIRED);
+    return;  // No need to check other fields for this row
   }
 }
 

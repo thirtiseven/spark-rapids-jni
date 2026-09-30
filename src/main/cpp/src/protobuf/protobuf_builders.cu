@@ -344,22 +344,15 @@ enum_string_lookup_tables make_enum_string_lookup_tables(
   }
 
   auto h_name_chars = cudf::detail::make_pinned_vector_async<uint8_t>(total_name_chars, stream);
-  size_t cursor     = 0;
+  uint8_t* cursor   = h_name_chars.data();
   for (auto const& name : enum_name_bytes) {
-    if (!name.empty()) {
-      std::copy(name.data(), name.data() + name.size(), h_name_chars.data() + cursor);
-      cursor += name.size();
-    }
+    if (name.empty()) { continue; }
+    std::copy(name.cbegin(), name.cend(), cursor);
+    cursor += name.size();
   }
 
   auto d_name_offsets = cudf::detail::make_device_uvector_async(h_name_offsets, stream, scratch_mr);
-
-  auto d_name_chars = [&]() {
-    if (total_name_chars > 0) {
-      return cudf::detail::make_device_uvector_async(h_name_chars, stream, scratch_mr);
-    }
-    return rmm::device_uvector<uint8_t>(0, stream, scratch_mr);
-  }();
+  auto d_name_chars   = cudf::detail::make_device_uvector_async(h_name_chars, stream, scratch_mr);
 
   return {std::move(d_valid_enums), std::move(d_name_offsets), std::move(d_name_chars)};
 }
@@ -505,7 +498,7 @@ std::unique_ptr<cudf::column> build_repeated_string_column(
         0, cuda::proclaim_return_type<size_t>([loc_provider] __device__(int idx) -> size_t {
           auto loc = loc_provider.input_location(idx);
           if (!loc.is_present()) return 0;
-          return static_cast<size_t>(loc.length);
+          return loc.length;
         }));
 
       size_t temp_storage_bytes = 0;
@@ -627,7 +620,7 @@ std::unique_ptr<cudf::column> build_merged_singular_struct_column(
     auto size_iter = cudf::detail::make_counting_transform_iterator(
       0, cuda::proclaim_return_type<size_t>([fragments, invalid] __device__(int idx) -> size_t {
         auto const fragment = fragments[idx];
-        return invalid[fragment.row_idx] ? 0 : static_cast<size_t>(fragment.length);
+        return invalid[fragment.row_idx] ? 0 : fragment.length;
       }));
 
     size_t temp_storage_bytes = 0;
