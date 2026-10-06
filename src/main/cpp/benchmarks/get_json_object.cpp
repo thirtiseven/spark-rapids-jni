@@ -15,6 +15,7 @@
  */
 
 #include "common/generate_input.hpp"
+#include "common/gjo_input_cache.hpp"
 
 #include <cudf_test/column_wrapper.hpp>
 
@@ -22,19 +23,17 @@
 #include <cudf/io/types.hpp>
 #include <cudf/strings/split/split.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda/stream>
 
 #include <get_json_object.hpp>
 #include <nvbench/nvbench.cuh>
 
-// #define DEBUG_PRINT
-
-#ifdef DEBUG_PRINT
-
-#include <cudf/utilities/type_dispatcher.hpp>
-
 #include <iostream>
+
+// #define DEBUG_PRINT
+#ifdef DEBUG_PRINT
 
 namespace {
 
@@ -140,7 +139,11 @@ void BM_get_json_object(nvbench::state& state)
   auto const size_bytes = static_cast<cudf::size_type>(state.get_int64("size_bytes"));
   auto const max_depth  = static_cast<cudf::size_type>(state.get_int64("max_depth"));
 
-  auto const json_strings = generate_input(size_bytes, max_depth);
+  // Gen-once process-global cache (single H2D per input); the deterministic generator
+  // (create_random_table seeds with 1) makes cached data byte-identical to a fresh generation.
+  auto const json_strings_col = spark_rapids_jni::bench::get_or_generate_input(
+    spark_rapids_jni::bench::make_input_cache_key(max_depth, size_bytes, /*seed=*/0),
+    [&] { return generate_input(size_bytes, max_depth); });
 
   using path_instruction_type = spark_rapids_jni::path_instruction_type;
   std::vector<std::tuple<path_instruction_type, std::string, int32_t>> instructions;
@@ -152,8 +155,8 @@ void BM_get_json_object(nvbench::state& state)
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
     // Can also verify at https://jsonpath.com/.
-    [[maybe_unused]] auto const output = spark_rapids_jni::get_json_object(
-      cudf::strings_column_view{json_strings->view()}, instructions);
+    [[maybe_unused]] auto const output =
+      spark_rapids_jni::get_json_object(cudf::strings_column_view{json_strings_col}, instructions);
 
 #ifdef DEBUG_PRINT
     {
