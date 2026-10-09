@@ -81,6 +81,7 @@ __device__ inline bool read_varint32(uint8_t const* cur,
 
 __device__ inline void set_error_once(protobuf_error* error_flag, protobuf_error error)
 {
+  if (error_flag == nullptr) { return; }
   auto expected = protobuf_error::NONE;
   cuda::atomic_ref<protobuf_error, cuda::thread_scope_device> ref(*error_flag);
   ref.compare_exchange_strong(expected, error, cuda::memory_order_relaxed);
@@ -322,14 +323,14 @@ __device__ inline bool decode_tag(uint8_t const*& cur,
   uint32_t key;
   uint32_t key_bytes;
   if (!read_varint32(cur, end, key, key_bytes)) {
-    if (error_flag != nullptr) { set_error_once(error_flag, protobuf_error::VARINT); }
+    set_error_once(error_flag, protobuf_error::VARINT);
     return false;
   }
 
   cur += key_bytes;
   uint32_t fn = key >> 3;
   if (fn == 0 || fn > static_cast<uint32_t>(MAX_FIELD_NUMBER)) {
-    if (error_flag != nullptr) { set_error_once(error_flag, protobuf_error::FIELD_NUMBER); }
+    set_error_once(error_flag, protobuf_error::FIELD_NUMBER);
     return false;
   }
   tag.field_number = static_cast<int>(fn);

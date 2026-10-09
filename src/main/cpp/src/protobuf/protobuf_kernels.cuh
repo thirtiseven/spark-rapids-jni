@@ -69,7 +69,7 @@ __device__ inline field_location rebase_location(field_location location,
   if (!location.is_present()) { return field_location::missing(); }
   // Widen before subtraction: presence alone does not guarantee a cuDF-supported offset.
   if (base < 0 || base > int64_t{cuda::std::numeric_limits<int32_t>::max()} - location.offset) {
-    if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
+    set_error_once(error, protobuf_error::OVERFLOW);
     return field_location::missing();
   }
   return {static_cast<uint32_t>(base) + location.offset, location.length};
@@ -395,7 +395,7 @@ CUDF_KERNEL void extract_utf8_lengths_kernel(uint8_t const* message_data,
   auto const repaired_length = repaired_utf8_length(data, size);
   if (!cuda::std::in_range<int32_t>(repaired_length)) {
     out_lengths[idx] = 0;
-    if (error != nullptr) { set_error_once(error, protobuf_error::OVERFLOW); }
+    set_error_once(error, protobuf_error::OVERFLOW);
     return;
   }
   out_lengths[idx] = static_cast<int32_t>(repaired_length);
