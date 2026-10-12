@@ -61,9 +61,9 @@ namespace {
 //   mix 1 pure-WILDCARD    : all root elements; nested [7,8,9] elements
 //   mix 2 INDEX + NAMED    : s0 / s1 / s3 / 1 / s4
 //   mix 3 NAMED + WILDCARD : s0 / all root elements / s1 / s0 / s2+s3
-//   mix 4 INDEX + WILDCARD : all root elements / 7+8+9 / both arr elements / s2+s3
+//   mix 4 INDEX + WILDCARD : all root elements / 9 / both arr elements / 7
 //   mix 5 all three        : s0 / s1 / s1 / s2+s3 / all root elements / 1 / s0 / s3
-// The lists exploit engine semantics (src/main/cpp/src/get_json_object.cu): WILDCARD matches
+// Hit semantics follow the engine (src/main/cpp/src/get_json_object.cu): WILDCARD matches
 // ARRAY children only — a wildcard reaching an object value returns null; a NAMED-led path
 // cannot hit the array root, so it is adapted with a `$[0]`/`$[*]` prefix (why mixes 2/3/5 carry
 // INDEX segments); `$.a.*` and a missing top-level field can never hit, so they appear as
@@ -167,8 +167,8 @@ std::vector<path_instructions> const& mix_paths(int64_t mix)
     // mix 4 — INDEX + WILDCARD
     mixes[4] = {{wild_seg()},
                 {index_seg(2), wild_seg()},
-                {index_seg(0), named_seg("arr"), wild_seg()},
-                {index_seg(0), named_seg("m"), named_seg("n"), wild_seg()}};
+                {index_seg(0), index_seg(1), wild_seg()},
+                {index_seg(2), index_seg(0), wild_seg()}};
     // mix 5 — all three
     mixes[5] = {{index_seg(0), named_seg("a"), named_seg("b")},
                 {index_seg(0), named_seg("arr"), index_seg(0), named_seg("x")},
@@ -266,7 +266,9 @@ void BM_get_json_object_path_types(nvbench::state& state)
         spark_rapids_jni::get_json_object(cudf::strings_column_view{input}, *path);
     }
   });
-  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
+  // Every cell_paths entry runs get_json_object once per sample; count all of them so the
+  // reported bytes match the timed work.
+  state.add_global_memory_reads<nvbench::int8_t>(size_bytes * num_paths);
 }
 
 }  // namespace
