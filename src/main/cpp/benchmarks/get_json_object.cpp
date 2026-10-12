@@ -139,8 +139,7 @@ void BM_get_json_object(nvbench::state& state)
   auto const size_bytes = static_cast<cudf::size_type>(state.get_int64("size_bytes"));
   auto const max_depth  = static_cast<cudf::size_type>(state.get_int64("max_depth"));
 
-  // Gen-once process-global cache (single H2D per input); the deterministic generator
-  // (create_random_table seeds with 1) makes cached data byte-identical to a fresh generation.
+  // Gen-once process-global cache (deterministic generator, seed 1) — identical to a fresh run.
   auto const json_strings_col = spark_rapids_jni::bench::get_or_generate_input(
     spark_rapids_jni::bench::make_input_cache_key(max_depth, size_bytes, /*seed=*/0),
     [&] { return generate_input(size_bytes, max_depth); });

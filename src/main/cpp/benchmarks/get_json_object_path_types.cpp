@@ -46,45 +46,25 @@ namespace {
 // differently gets its own cells. Axis values and the resulting cell count live in the
 // NVBENCH_BENCH registration below — single source of truth, never duplicated here.
 //
-// == Shared generated input (generated exactly once) ==
-// One array-root row shape serves ALL mixes:
+// One array-root row shape serves ALL mixes (hand-rendered: cudf data_factory / the JSON writer
+// cannot emit it), with value tokens "s<i>_<zero-padded row index>":
 //   [{"a":{"b":"<s0>"},"arr":[{"x":"<s1>"},[1,2]],
 //    "m":{"n":["<s2>","<s3>"],"p":"<s4>"}},"<s5>",[7,8,9]]
-// Rows are hand-rendered (cudf data_factory / the JSON writer cannot emit this exact shape)
-// with value tokens "s<i>_<zero-padded 10-digit row index>", so every row has a fixed byte
-// length. size_bytes is not a multiple of it, so the LAST row's final token widens by the
-// leftover digits and the generated column is exactly size_bytes bytes. One input per size axis
-// value is generated once per process; all cells read them from the shared
-// gjo_input_cache.hpp cache (key: row_kind=0 x size_bytes x seed=0, one H2D each).
+// Every row has a fixed byte length; size_bytes is not a multiple of it, so the LAST row's
+// final token widens by the leftover digits and the column is exactly size_bytes bytes. One
+// input per size axis value, generated once per process (shared gjo_input_cache.hpp, row_kind=0).
 //
-// == Per-mix fixed path lists ==
-// Fixed per mix; num_paths takes the first N entries and duplicates the list cyclically past
-// its end (mirrors production path repeats). Hit = at least one non-null result row
-// (pre-flight enforced).
-//   mix 0  pure-INDEX       : $[0] $[1] $[2][0] $[2][1] $[2][2]
-//          hits: root element 0 (object), element 1 (string), 7 / 8 / 9 of [7,8,9]
-//   mix 1  pure-WILDCARD    : $[*] $[*][*]
-//          hits: all root elements; nested elements of [7,8,9] (double-wildcard flatten)
-//   mix 2  INDEX + NAMED    : $[0].a.b $[0].arr[0].x $[0].m.n[1] $[0].arr[1][0] $[0].m.p
-//          hits: s0 / s1 / s3 / 1 / s4
-//   mix 3  NAMED + WILDCARD : $[0].a.b $.* $[0].arr[*].x $[*].a.b $[0].m.n[*]
-//          hits: s0 / all root elements / s1 / s0 / s2+s3
-//   mix 4  INDEX + WILDCARD : $[*] $[2][*] $[0].arr[*] $[0].m.n[*]
-//          hits: all root elements / 7+8+9 / both arr elements / s2+s3
-//   mix 5  all three        : $[0].a.b $[0].arr[0].x $[0].arr[*].x $[0].m.n[*] $.*
-//                             $[0].arr[1][0] $[*].a.b $[0].m.n[1]
-//          hits: s0 / s1 / s1 / s2+s3 / all root elements / 1 / s0 / s3
+// mix_paths holds the fixed per-mix path lists; num_paths takes the first N and duplicates the
+// list cyclically past its end (mirrors production path repeats). Hit = >= 1 non-null result row.
+// The lists exploit engine semantics (src/main/cpp/src/get_json_object.cu): WILDCARD matches
+// ARRAY children only — a wildcard reaching an object value returns null; a NAMED-led path
+// cannot hit the array root, so it is adapted with a `$[0]`/`$[*]` prefix (why mixes 2/3/5 carry
+// INDEX segments); `$.a.*` and a missing top-level field can never hit, so they appear as
+// `$[*].a.b` / `$[0].m.p`.
 //
-// The lists exploit engine semantics (verified in src/main/cpp/src/get_json_object.cu):
-// WILDCARD matches ARRAY children only — a wildcard reaching an object value returns null;
-// a NAMED-led path cannot hit the array root, so it is adapted with a `$[0]`/`$[*]` prefix
-// (why mixes 2/3/5 carry INDEX segments); `$.a.*` (wildcard over an object) and `$.k` (no
-// top-level `k` field) can never hit, so they appear as `$[*].a.b` / `$[0].m.p`.
-//
-// == Pre-flight hit assertion (mandatory) ==
-// On the first invocation, before any timed sample, every mix's full path list runs against
-// the first k_slice_rows rows of a fixed cached input; each path must produce >= 1 non-null
-// row. A miss aborts the benchmark (CUDF_EXPECTS) — the bench refuses to gate on an all-miss cell.
+// Pre-flight (mandatory): on the first invocation, before any timed sample, every mix's full
+// path list runs against the first k_slice_rows rows of a fixed cached input; each path must
+// produce >= 1 non-null row or the benchmark aborts (CUDF_EXPECTS).
 
 using path_instruction_type = spark_rapids_jni::path_instruction_type;
 using path_instructions     = std::vector<std::tuple<path_instruction_type, std::string, int32_t>>;
@@ -145,7 +125,7 @@ cudf::column_view cached_input(std::size_t size_bytes)
     spark_rapids_jni::bench::make_input_cache_key(k_row_kind, size_bytes, /*seed=*/0), generate);
 }
 
-// == Per-mix fixed path lists (hit composition documented in the file header) =================
+// == Per-mix fixed path lists =================================================================
 
 std::vector<path_instructions> const& mix_paths(int64_t mix)
 {

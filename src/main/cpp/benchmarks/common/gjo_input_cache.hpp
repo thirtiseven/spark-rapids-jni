@@ -23,21 +23,18 @@
 #include <unordered_map>
 #include <utility>
 
-// Process-global gen-once input cache shared by EVERY get_json_object benchmark linked into
-// this binary: each distinct input is generated exactly once per process and uploaded to the
-// device exactly once (single H2D), no matter how many benchmark cells read it. nvbench runs
-// benchmark invocations serially in one thread, so the map needs no locking.
+// Process-global gen-once input cache shared by every get_json_object benchmark in this binary:
+// each input is generated and uploaded once, however many cells read it (nvbench is serial).
 namespace spark_rapids_jni {
 namespace bench {
 
 using input_cache_key = std::uint64_t;
 
 /**
- * @brief Pack (scenario, size_bytes, seed) into a single cache key.
+ * @brief Pack (scenario, size_bytes, seed) into one cache key: 16 / 32 / 16 bits.
  *
- * `size_bytes` must fit 32 bits (max ~4 GiB); `scenario` and `seed` must fit 16 bits.
- * `scenario` disambiguates different input shapes for the same byte size (e.g. a row kind or
- * a data_factory `max_depth`), `seed` different generator seeds.
+ * `scenario` distinguishes input shapes at the same byte size (row kind, `max_depth`); `seed`
+ * distinguishes generator seeds.
  */
 constexpr input_cache_key make_input_cache_key(std::uint64_t scenario,
                                                std::uint64_t size_bytes,
@@ -47,27 +44,13 @@ constexpr input_cache_key make_input_cache_key(std::uint64_t scenario,
 }
 
 /**
- * @brief Return a view of the process-cached input column for `key`, generating it exactly
- * once.
+ * @brief Return a borrowed view of the process-cached input column for `key`, generating it on
+ * the first call. `generate()` must be deterministic in the key.
  *
- * Ownership: the map stores every cached column as `std::unique_ptr<cudf::column>`; view types
- * are passed BY VALUE; a borrowed view is valid only while the owning column lives — the
- * never-destroyed cache owns every cached column for the whole process.
- *
- * On the first call `generate()` runs and its column is stored; every later call with the
- * same key returns that stored column, so the generator must be deterministic in the key.
- *
- * The map is heap-allocated and deliberately never destroyed: freeing the cached columns'
- * device memory during static teardown crashes (cudaFreeAsync after the CUDA runtime has
- * started exiting — observed as a SIGSEGV from `cudaEventRecord` under cuda-gdb), so the
- * columns are intentionally leaked and reclaimed by the driver at process exit.
- *
- * Memory growth is bounded by the number of distinct keys actually generated (worst case:
- * every benchmark's full input set, a few hundred MiB), not by cell count or run time.
+ * The map is heap-allocated and never destroyed on purpose: freeing the cached device memory
+ * during static teardown crashes (cudaFreeAsync after the CUDA runtime exits — SIGSEGV), so the
+ * columns leak and the driver reclaims them at process exit.
  */
-// One shared map instance: an inline function's static local is unique per FUNCTION, so every
-// cache consumer must reach the cache through THIS accessor or its statics would be distinct
-// maps (a split cache means clear/inspect logic silently no-ops).
 inline std::unordered_map<input_cache_key, std::unique_ptr<cudf::column>>& input_cache()
 {
   static auto* cache = new std::unordered_map<input_cache_key, std::unique_ptr<cudf::column>>();
