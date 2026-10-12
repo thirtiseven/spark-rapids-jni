@@ -59,9 +59,6 @@ __device__ inline void set_device_flag(int8_t* flag)
   ref.store(1, cuda::memory_order_relaxed);
 }
 
-/**
- * @brief JSON style to write.
- */
 enum class write_style : int8_t { RAW, QUOTED, FLATTEN };
 
 struct path_instruction {
@@ -73,18 +70,17 @@ struct path_instruction {
   path_instruction_type type;
 };
 
-// Only array emission needs generator state.
+// Objects are copied whole; only generated arrays need comma state.
 class json_generator {
  public:
   __device__ json_generator(int _offset = 0) : offset(_offset), output_len(0) {}
 
+  // The child shares the output buffer and starts at the parent's current end.
   __device__ json_generator new_child_generator() const
   {
     return json_generator(offset + output_len);
   }
 
-  // Write '['; an extra comma is added first when needed:
-  // e.g.: when JSON content is [[1,2,3], writing a new [ gives [[1,2,3],[
   __device__ void write_start_array(char* out_begin)
   {
     try_write_comma(out_begin);
@@ -103,6 +99,7 @@ class json_generator {
     is_curr_array_empty = false;
   }
 
+  // Delay outer brackets until the wildcard match count is known.
   __device__ void write_first_start_array_without_output()
   {
     array_depth++;
@@ -119,6 +116,7 @@ class json_generator {
     }
   }
 
+  // Container copies validate each child through the matching close token.
   __device__ bool copy_current_structure(json_parser& parser, char* out_begin)
   {
     try_write_comma(out_begin);
@@ -130,7 +128,7 @@ class json_generator {
     return b;
   }
 
-  // Decode string escapes; numeric tokens are copied without decoding.
+  // String escapes must be decoded into output rather than exposed as a source span.
   __device__ void write_raw(json_parser& parser, char* out_begin)
   {
     if (array_depth > 0) { is_curr_array_empty = false; }
@@ -140,26 +138,16 @@ class json_generator {
   }
 
   /**
-   * write child raw value
-   * e.g. with need_comma = true:
+   * Writes a child generator's buffer into this one, inserting a comma if
+   * needed and optionally wrapping the child in outer array tokens:
    *
-   * write_outer_array_tokens = false
-   * [1,2,3]1,2,3
-   *        ^
-   *        |
-   *    child pointer
-   * ==>>
-   * [1,2,3],1,2,3
+   *   write_outer_array_tokens = false, need_comma = true:
+   *     [1,2,3]1,2,3  ->  [1,2,3],1,2,3
+   *   write_outer_array_tokens = true, need_comma = true:
+   *     [12,3,4       ->  [1,[2,3,4]
    *
-   * write_outer_array_tokens = true
-   *   [12,3,4
-   *     ^
-   *     |
-   * child pointer
-   * ==>>
-   *   [1,[2,3,4]
-   *
-   * See `write_first_start_array_without_output` for write_outer_array_tokens semantics.
+   * `write_outer_array_tokens` pairs with
+   * `write_first_start_array_without_output`.
    */
   __device__ void write_child_raw_value(char* child_block_begin,
                                         int child_block_len,
@@ -185,21 +173,15 @@ class json_generator {
         move_forward(child_block_begin, child_block_len, 1);
         *(child_block_begin) = ',';
       } else {
-        // do not need comma && do not need write outer array tokens
-        // do nothing, because child generator buff is directly after the
-        // parent generator
       }
     }
 
-    // update length
     if (insert_comma) { output_len++; }
     if (write_outer_array_tokens) { output_len += 2; }
     output_len += child_block_len;
   }
 
-  // Copy backward because source and destination may overlap.
-  // e.g.: memory is 1 2 0 0, len is 2, forward is 2, after moving: 1 2 1 2
-  // e.g.: memory is 1 2 0 0, len is 2, forward is 1, after moving: 1 1 2 0
+  // Copy backward so shifting an overlapping block cannot overwrite unread bytes.
   static __device__ void move_forward(char* begin, size_t len, int forward)
   {
     char* pos = begin + len + forward - 1;
@@ -213,28 +195,20 @@ class json_generator {
   __device__ inline int get_offset() const { return offset; }
   __device__ inline int get_output_len() const { return output_len; }
 
-  /**
-   * generator may contain trash output, e.g.: generator writes some output,
-   * then JSON format is invalid, the previous output becomes trash.
-   */
   __device__ inline void set_output_len_zero() { output_len = 0; }
 
   __device__ inline void set_output_len(size_t len) { output_len = len; }
 
  private:
-  int offset;  // offset from the global output buffer
+  int offset;  // global buffer offset
   int output_len;
 
   int array_depth = 0;
 
-  // whether already worte a item in current array
-  // used to decide whether add a comma before writing out a new item.
+  // Closing an inner array makes its parent non-empty, so one emptiness flag suffices.
   bool is_curr_array_empty;
 };
 
-/**
- * path evaluator which can run on both CPU and GPU
- */
 __device__ inline bool path_is_empty(size_t path_size) { return path_size == 0; }
 
 __device__ inline bool path_match_element(cudf::device_span<path_instruction const> path,
@@ -275,9 +249,7 @@ __device__ inline cuda::std::tuple<bool, int> path_match_index_wildcard(
   }
 }
 
-/**
- * @brief The cases that mirro Apache Spark case path in `jsonExpressions.scala#evaluatePath()`.
- */
+// Parent contexts resume according to the case that created their child.
 enum class evaluation_case_path : int8_t {
   INVALID                                           = -1,
   START_ARRAY___EMPTY_PATH___FLATTEN_STYLE          = 2,
@@ -292,11 +264,12 @@ enum class evaluation_case_path : int8_t {
 struct context {
   json_generator g;
 
+  // Saved across returns from children in case 6.
   json_generator child_g;
 
   cudf::device_span<path_instruction const> path;
 
-  // A positive dirty count means at least one child matched.
+  // Match count for case 6; other wildcard cases clamp successful output to 1.
   int dirty;
 
   evaluation_case_path case_path;
@@ -305,12 +278,13 @@ struct context {
 
   write_style style;
 
+  // One-time setup must not repeat when a child returns to this context.
   bool is_first_enter;
 
   bool task_is_done;
 };
 
-// Returns validity and output size; host checks deferred depth errors after launch.
+// Depth errors are deferred to the host; ordinary evaluation failure returns a zero size.
 __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
   json_parser& p,
   cudf::device_span<path_instruction const> path_commands,
@@ -320,6 +294,7 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
   p.next_token();
   if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
+  // One extra slot for the root context.
   context stack[MAX_JSON_PATH_DEPTH + 1];
   int stack_size = 0;
 
@@ -329,8 +304,7 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
                                 cudf::device_span<path_instruction const> _path) {
     if (stack_size > MAX_JSON_PATH_DEPTH) {
       set_device_flag(max_path_depth_exceeded);
-      // Because no more context is pushed, the evaluation output should be wrong.
-      // But that is not important, since we will throw exception after the kernel finishes.
+      // The host rejects this batch, so partial output need not be repaired.
       return;
     }
     auto& ctx          = stack[stack_size++];
@@ -349,16 +323,14 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
   while (stack_size > 0) {
     auto& ctx = stack[stack_size - 1];
     if (!ctx.task_is_done) {
-      // case (VALUE_STRING, Nil) if style == RawStyle
-      // case path 1
+      // Case 1: terminal string with raw output.
       if (json_token::VALUE_STRING == ctx.token && path_is_empty(ctx.path.size()) &&
           ctx.style == write_style::RAW) {
         ctx.g.write_raw(p, out_buf);
         ctx.dirty        = 1;
         ctx.task_is_done = true;
       }
-      // case (START_ARRAY, Nil) if style == FlattenStyle
-      // case path 2
+      // Case 2: flatten a terminal array.
       else if (json_token::START_ARRAY == ctx.token && path_is_empty(ctx.path.size()) &&
                ctx.style == write_style::FLATTEN) {
         if (json_token::END_ARRAY != p.next_token()) {
@@ -371,66 +343,45 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           ctx.task_is_done = true;
         }
       }
-      // case (_, Nil)
-      // case path 3
+      // Case 3: terminal value.
       else if (path_is_empty(ctx.path.size())) {
-        // general case: just copy the child tree verbatim
-        if (!(ctx.g.copy_current_structure(p, out_buf))) {
-          // JSON validation check
-          return {false, 0};
-        }
+        if (!(ctx.g.copy_current_structure(p, out_buf))) { return {false, 0}; }
         ctx.dirty        = 1;
         ctx.task_is_done = true;
       }
-      // case (START_OBJECT, Named :: xs)
-      // case path 4
+      // Case 4: named object field.
       else if (json_token::START_OBJECT == ctx.token &&
                ctx.path.front().type == path_instruction_type::NAMED) {
         if (!ctx.is_first_enter) {
-          // 2st enter
-          // skip the following children after the expect
+          // Validate the remaining fields even after a successful match.
           if (ctx.dirty > 0) {
             while (json_token::END_OBJECT != p.next_token()) {
-              // JSON validation check
               if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
-              // skip FIELD_NAME token
               p.next_token();
-              // JSON validation check
               if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
-              // skip value of FIELD_NAME
-              if (!p.try_skip_children()) {
-                // JSON validation check
-                return {false, 0};
-              }
+              if (!p.try_skip_children()) { return {false, 0}; }
             }
           }
-          // Mark task is done regardless whether the expected child was found.
           ctx.task_is_done = true;
         } else {
-          // below is 1st enter
           ctx.is_first_enter = false;
-          // match first mached children with expected name
+          // A missed child path must not fall back to a later duplicate.
           bool found_expected_child = false;
           auto const to_match_name  = ctx.path.front().name;
           while (true) {
             auto const is_name_matched = p.parse_next_token_with_matching(to_match_name);
             if (json_token::END_OBJECT == p.get_current_token()) { break; }
 
-            // JSON validation check
             if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
-            // current token is FIELD_NAME
             if (is_name_matched) {
-              // skip FIELD_NAME token
               p.next_token();
-              // JSON validation check
               if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
-              // meets null token, it's not expected, return false
+              // A null first occurrence does not fall back to a later duplicate.
               if (json_token::VALUE_NULL == p.get_current_token()) { return {false, 0}; }
-              // push sub task; sub task will update the result of path 4
               push_context(evaluation_case_path::START_OBJECT___MATCHED_NAME_PATH,
                            ctx.g,
                            ctx.style,
@@ -438,39 +389,29 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
               found_expected_child = true;
               break;
             } else {
-              // skip FIELD_NAME token
               p.next_token();
-              // JSON validation check
               if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
-              // current child is not expected, skip current child
-              if (!p.try_skip_children()) {
-                // JSON validation check
-                return {false, 0};
-              }
+              if (!p.try_skip_children()) { return {false, 0}; }
             }
           }
           if (!found_expected_child) {
-            // did not find any expected sub child
             ctx.task_is_done = true;
             ctx.dirty        = false;
           }
         }
       }
-      // case (START_ARRAY, Wildcard :: Wildcard :: xs)
-      // case path 5
+      // Case 5: consecutive array wildcards.
       else if (json_token::START_ARRAY == ctx.token &&
                path_match_elements(
                  ctx.path, path_instruction_type::WILDCARD, path_instruction_type::WILDCARD)) {
-        // special handling for the non-structure preserving double wildcard
-        // behavior in Hive
+        // Consecutive wildcards flatten terminal arrays instead of preserving their nesting.
         if (ctx.is_first_enter) {
           ctx.is_first_enter = false;
           ctx.g.write_start_array(out_buf);
         }
 
         if (p.next_token() != json_token::END_ARRAY) {
-          // JSON validation check
           if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
           push_context(evaluation_case_path::START_ARRAY___MATCHED_DOUBLE_WILDCARD,
                        ctx.g,
@@ -481,38 +422,30 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           ctx.task_is_done = true;
         }
       }
-      // case (START_ARRAY, Wildcard :: xs) if style != QuotedStyle
-      // case path 6
+      // Case 6: array wildcard outside quoted output.
       else if (json_token::START_ARRAY == ctx.token &&
                path_match_element(ctx.path, path_instruction_type::WILDCARD) &&
                ctx.style != write_style::QUOTED) {
-        // retain Flatten, otherwise use Quoted... cannot use Raw within an array
+        // Raw strings would make multiple matches invalid JSON array items.
         write_style next_style = write_style::RAW;
         switch (ctx.style) {
           case write_style::RAW: next_style = write_style::QUOTED; break;
           case write_style::FLATTEN: next_style = write_style::FLATTEN; break;
-          case write_style::QUOTED: next_style = write_style::QUOTED;  // never happen
+          case write_style::QUOTED: next_style = write_style::QUOTED;  // unreachable
         }
 
-        // temporarily buffer child matches, the emitted json will need to be
-        // modified slightly if there is only a single element written
-
+        // Delay brackets until the number of successful matches is known.
         json_generator child_g;
         if (ctx.is_first_enter) {
           ctx.is_first_enter = false;
-          // create a child generator with hide outer array tokens mode.
-          child_g = ctx.g.new_child_generator();
-          // write first [ without output, without update len, only update internal state
+          child_g            = ctx.g.new_child_generator();
           child_g.write_first_start_array_without_output();
         } else {
           child_g = ctx.child_g;
         }
 
         if (p.next_token() != json_token::END_ARRAY) {
-          // JSON validation check
           if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
-          // track the number of array elements and only emit an outer array if
-          // we've written more than one element, this matches Hive's behavior
           push_context(evaluation_case_path::START_ARRAY___MATCHED_WILDCARD___STYLE_NOT_QUOTED,
                        child_g,
                        next_style,
@@ -521,21 +454,17 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           char* child_g_start = out_buf + child_g.get_offset();
           int child_g_len     = child_g.get_output_len();
           if (ctx.dirty > 1) {
-            // add outer array tokens
             ctx.g.write_child_raw_value(
               child_g_start, child_g_len, /* write_outer_array_tokens */ true);
           } else if (ctx.dirty == 1) {
-            // remove outer array tokens
             ctx.g.write_child_raw_value(
               child_g_start, child_g_len, /* write_outer_array_tokens */ false);
-          }  // else do not write anything
+          }
 
-          // Done anyway, since we already reached the end array.
           ctx.task_is_done = true;
         }
       }
-      // case (START_ARRAY, Wildcard :: xs)
-      // case path 7
+      // Case 7: array wildcard with quoted output.
       else if (json_token::START_ARRAY == ctx.token &&
                path_match_element(ctx.path, path_instruction_type::WILDCARD)) {
         if (ctx.is_first_enter) {
@@ -543,11 +472,8 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           ctx.g.write_start_array(out_buf);
         }
         if (p.next_token() != json_token::END_ARRAY) {
-          // JSON validation check
           if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
-          // wildcards can have multiple matches, continually update the dirty
-          // count
           push_context(evaluation_case_path::START_ARRAY___MATCHED_WILDCARD,
                        ctx.g,
                        write_style::QUOTED,
@@ -557,162 +483,122 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           ctx.task_is_done = true;
         }
       }
-      /* case (START_ARRAY, Index(idx) :: (xs@Wildcard :: _)) */
-      // case path 8
+      // Case 8: array index followed by a wildcard.
       else if (json_token::START_ARRAY == ctx.token &&
                cuda::std::get<0>(path_match_index_wildcard(ctx.path))) {
         int idx = cuda::std::get<1>(path_match_index_wildcard(ctx.path));
 
         p.next_token();
-        // JSON validation check
         if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
         ctx.is_first_enter = false;
 
         int i = idx;
         while (i > 0) {
-          if (p.get_current_token() == json_token::END_ARRAY) {
-            // terminate, nothing has been written
-            return {false, 0};
-          }
+          if (p.get_current_token() == json_token::END_ARRAY) { return {false, 0}; }
 
           if (!p.try_skip_children()) { return {false, 0}; }
 
           p.next_token();
-          // JSON validation check
           if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
           --i;
         }
 
-        // i == 0
         push_context(evaluation_case_path::START_ARRAY___MATCHED_INDEX_AND_WILDCARD,
                      ctx.g,
                      write_style::QUOTED,
                      {ctx.path.data() + 1, ctx.path.size() - 1});
       }
-      // case (START_ARRAY, Index(idx) :: xs)
-      // case path 9
+      // Case 9: array index.
       else if (json_token::START_ARRAY == ctx.token &&
                cuda::std::get<0>(path_match_index(ctx.path))) {
         int idx = cuda::std::get<1>(path_match_index(ctx.path));
 
         p.next_token();
-        // JSON validation check
         if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
         int i = idx;
         while (i > 0) {
-          if (p.get_current_token() == json_token::END_ARRAY) {
-            // terminate, nothing has been written
-            return {false, 0};
-          }
+          if (p.get_current_token() == json_token::END_ARRAY) { return {false, 0}; }
 
           if (!p.try_skip_children()) { return {false, 0}; }
 
           p.next_token();
-          // JSON validation check
           if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
 
           --i;
         }
 
-        // i == 0
         push_context(evaluation_case_path::START_ARRAY___MATCHED_INDEX,
                      ctx.g,
                      ctx.style,
                      {ctx.path.data() + 1, ctx.path.size() - 1});
       }
-      // case _ =>
-      // case path 12
+      // Case 12: no match.
       else {
         if (!p.try_skip_children()) { return {false, 0}; }
-        // default case path, return false for this task
         ctx.dirty        = 0;
         ctx.task_is_done = true;
       }
-    }  // if (!ctx.task_is_done)
-    else {  // current context is done.
-      // pop current top context
+    } else {
       stack_size--;
 
-      // has no parent task, stack is empty, will exit
       if (stack_size == 0) { break; }
 
-      // peek parent context task
-      // update parent task info according to current task result
       auto& p_ctx = stack[stack_size - 1];
 
       switch (ctx.case_path) {
-          // path 2: case (START_ARRAY, Nil) if style == FlattenStyle
-          // path 5: case (START_ARRAY, Wildcard :: Wildcard :: xs)
-          // path 7: case (START_ARRAY, Wildcard :: xs)
+          // Cases 2, 5, 7: only case 6 needs a match count rather than a success flag.
         case evaluation_case_path::START_ARRAY___EMPTY_PATH___FLATTEN_STYLE:
         case evaluation_case_path::START_ARRAY___MATCHED_DOUBLE_WILDCARD:
         case evaluation_case_path::START_ARRAY___MATCHED_WILDCARD: {
-          // collect result from child task
           p_ctx.dirty += ctx.dirty;
           if (p_ctx.dirty > 0) { p_ctx.dirty = 1; }
-          // copy generator states to parent task;
           p_ctx.g = ctx.g;
 
           break;
         }
 
-          // case (START_OBJECT, Named :: xs)
-          // case path 4
+          // Case 4.
         case evaluation_case_path::START_OBJECT___MATCHED_NAME_PATH: {
           p_ctx.dirty = ctx.dirty;
-          // copy generator states to parent task;
+
           p_ctx.g = ctx.g;
 
           break;
         }
 
-          // case (START_ARRAY, Wildcard :: xs) if style != QuotedStyle
-          // case path 6
+          // Case 6.
         case evaluation_case_path::START_ARRAY___MATCHED_WILDCARD___STYLE_NOT_QUOTED: {
-          // collect result from child task
           p_ctx.dirty += ctx.dirty;
-          // update child generator for parent task
           p_ctx.child_g = ctx.g;
 
           break;
         }
 
-          /* case (START_ARRAY, Index(idx) :: (xs@Wildcard :: _)) */
-          // case path 8
-          // case (START_ARRAY, Index(idx) :: xs)
-          // case path 9
+          // Cases 8 and 9.
         case evaluation_case_path::START_ARRAY___MATCHED_INDEX_AND_WILDCARD:
         case evaluation_case_path::START_ARRAY___MATCHED_INDEX: {
-          // collect result from child task
           p_ctx.dirty += ctx.dirty;
 
-          // post logic:
           while (p.next_token() != json_token::END_ARRAY) {
-            // JSON validation check
             if (json_token::ERROR == p.get_current_token()) { return {false, 0}; }
-            // advance the token stream to the end of the array
             if (!p.try_skip_children()) { return {false, 0}; }
           }
-          // task is done
           p_ctx.task_is_done = true;
-          // copy generator states to parent task;
-          p_ctx.g = ctx.g;
+          p_ctx.g            = ctx.g;
 
           break;
         }
 
-        default:;  // Never happens!
-      }  // end switch (ctx.case_path)
-    }  // ctx.task_is_done
-  }  // while (stack_size > 0)
+        default:;
+      }
+    }
+  }
 
   auto const success = stack[0].dirty > 0;
 
-  // generator may contain trash output, e.g.: generator writes some output,
-  // then JSON format is invalid, the previous output becomes trash.
-  // We need to return output size as zero.
+  // Partial output must not contribute to the retry buffer size.
   return {success, success ? stack[0].g.get_output_len() : 0};
 }
 
@@ -721,13 +607,7 @@ struct named_path_selection {
   char_range value;
 };
 
-/**
- * @brief Select the last non-null occurrence of a top-level field for Spark's json_tuple.
- *
- * Capture the value's range while validating the whole object. Only the final selection is
- * serialized, using evaluate_path with an empty path so the existing writer and exact-size retry
- * handle its output. Ordinary get_json_object calls do not use this scan.
- */
+// Null duplicates preserve an earlier value; serialize only the final selection.
 __device__ named_path_selection select_last_non_null(json_parser& p,
                                                      cudf::string_view name,
                                                      int8_t* max_path_depth_exceeded)
@@ -748,7 +628,7 @@ __device__ named_path_selection select_last_non_null(json_parser& p,
       if (p.max_nesting_depth_exceeded()) { set_device_flag(max_path_depth_exceeded); }
       return {false, char_range::null()};
     }
-    // Spark json_tuple stops at the end of the first object.
+    // The first object is validated to its end; trailing input is ignored.
     if (token == json_token::END_OBJECT) { return {true, selected}; }
 
     token = p.next_token();
@@ -769,10 +649,6 @@ __device__ named_path_selection select_last_non_null(json_parser& p,
   }
 }
 
-/**
- * @brief Struct storing data such as path instructions, output buffer etc, corresponding to a
- * single JSON path.
- */
 struct json_path_processing_data {
   cudf::device_span<path_instruction const> path_commands;
   cudf::detail::input_offsetalator offsets;
@@ -781,17 +657,7 @@ struct json_path_processing_data {
   int8_t* has_out_of_bound;
 };
 
-/**
- * @brief Kernel running the JSONPath query; one row is processed by ceil(num_paths /
- * warp_size) warps. Launch bounds set `min_block_per_sm` explicitly: NVCC's register/parallelism
- * heuristic gets it wrong here, and spilling costs more than the extra parallelism would gain.
- *
- * @param input The input JSON strings stored in a strings column
- * @param path_data Array containing all path data
- * @param num_threads_per_row Number of threads processing each input row
- * @param max_path_depth_exceeded A marker to record if the maximum path depth has been reached
- *        during parsing the input string
- */
+// Each active thread evaluates one (row, path); rows occupy whole warps.
 template <int block_size, int min_block_per_sm, bool use_last_non_null>
 __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
   void get_json_object_kernel(cudf::column_device_view input,
@@ -830,7 +696,7 @@ __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
         evaluate_path(p, path.path_commands, dst, max_path_depth_exceeded);
     }
 
-    // Discard depth-overflow output; host throws after the kernel finishes.
+    // The host throws on depth overflow before using any output.
     if (p.max_nesting_depth_exceeded()) {
       set_device_flag(max_path_depth_exceeded);
       return;
@@ -840,7 +706,7 @@ __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
     if (out_size > max_size) { set_device_flag(path.has_out_of_bound); }
   }
 
-  // Null pointers mark null outputs; retry launches do not rewrite stringviews.
+  // The retry reuses first-pass lengths and validity, so it need not rewrite string views.
   if (path.out_stringviews) {
     path.out_stringviews[row_idx] = {is_valid ? dst : nullptr, out_size};
   }
@@ -853,11 +719,11 @@ struct kernel_launcher {
                    bool use_last_non_null,
                    cuda::stream_ref stream)
   {
-    // Keep the tuned 128-thread, eight-block launch bounds.
+    // Specifying both bounds lets NVCC trade extra registers for fewer instructions.
+    // Testing favored these 128-thread, 8-block bounds over a 256-thread, 4-block alternative.
     static constexpr int block_size       = 128;
     static constexpr int min_block_per_sm = 8;
 
-    // At least one warp per row, rounded up for all paths.
     auto const num_threads_per_row =
       cudf::util::div_rounding_up_safe(path_data.size(),
                                        static_cast<std::size_t>(cudf::detail::warp_size)) *
@@ -877,7 +743,7 @@ struct kernel_launcher {
   }
 };
 
-// Keep returned host and device upload sources alive until the asynchronous copies finish.
+// Keep every returned owner alive until the asynchronous uploads and kernel use finish.
 std::tuple<std::vector<rmm::device_uvector<path_instruction>>,
            std::unique_ptr<std::vector<std::vector<path_instruction>>>,
            cudf::string_scalar,
@@ -955,7 +821,7 @@ int64_t calc_scratch_size(cudf::strings_column_view const& input,
     int64_t{0},
     cuda::maximum{});
 
-  // Speculative output uses input bytes plus ten max-sized rows; the kernel checks OOB.
+  // Padding covers speculative writes beyond the final row's input-sized slice.
   auto const scratch_size = [&, max_row_size = max_row_size] {
     auto constexpr padding_rows = 10;
     return input.chars_size(stream) + max_row_size * padding_rows;
@@ -963,13 +829,13 @@ int64_t calc_scratch_size(cudf::strings_column_view const& input,
   return scratch_size;
 }
 
-// Depth errors throw before deciding whether output must be rebuilt after OOB.
+// Depth errors must throw before deciding whether oversized output needs a retry.
 bool check_error(cudf::detail::host_vector<int8_t> const& error_check)
 {
   CUDF_EXPECTS(error_check.back() == 0,
                "The processed input has nesting depth exceeds depth limit.");
 
-  // The depth marker is already zero, so the whole range can be checked.
+  // The checked depth marker is zero, so it can remain in the range.
   return std::none_of(
     error_check.cbegin(), error_check.cend(), [](auto const val) { return val != 0; });
 }
@@ -989,7 +855,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
 
   auto const num_outputs = json_paths.size();
 
-  // One OOB marker per output, followed by the shared depth marker.
+  // One size-overflow flag per output, then the shared depth-overflow flag.
   rmm::device_uvector<int8_t> d_error_check(num_outputs + 1, stream);
   auto const d_max_path_depth_exceeded = d_error_check.data() + num_outputs;
 
@@ -1032,14 +898,13 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
     batch_stringviews;
   batch_stringviews.reserve(out_stringviews.size());
 
-  // No OOB: gather all outputs without another evaluation.
   if (has_no_oob) {
     for (auto const& out_sview : out_stringviews) {
       batch_stringviews.emplace_back(out_sview);
     }
     return cudf::make_strings_column_batch(batch_stringviews, stream, mr);
   }
-  // Rebuild only outputs that exceeded their speculative scratch slice.
+  // Retry only oversized outputs; the first pass already recorded exact lengths and validity.
 
   std::vector<std::pair<cuda::device_buffer<std::byte>, cudf::size_type>>
     out_null_masks_and_null_counts;
@@ -1052,7 +917,6 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
     return item.first != nullptr;
   };
 
-  // Preserve the first-pass lengths while rebuilding only failing paths.
   h_path_data.clear();
   for (std::size_t idx = 0; idx < num_outputs; ++idx) {
     auto const& out_sview = out_stringviews[idx];
@@ -1063,7 +927,6 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
       out_null_masks_and_null_counts.emplace_back(
         cudf::detail::valid_if(out_sview.begin(), out_sview.end(), validator, stream, mr));
 
-      // First-pass lengths size the retry buffers.
       auto const size_it = spark_rapids_jni::util::make_counting_transform_iterator(
         0,
         cuda::proclaim_return_type<cudf::size_type>(
@@ -1109,7 +972,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   h_error_check = cudf::detail::make_host_vector(d_error_check, stream);
   has_no_oob    = check_error(h_error_check);
 
-  // A retry uses exact output lengths and must not encounter OOB.
+  // Identical input and paths must reproduce the recorded lengths.
   CUDF_EXPECTS(has_no_oob, "Unexpected out-of-bound write in get_json_object kernel.");
 
   for (std::size_t idx = 0; idx < oob_indices.size(); ++idx) {
@@ -1136,7 +999,6 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object(
 {
   auto const num_outputs = json_paths.size();
 
-  // Empty or all-null input returns matching null columns.
   if (input.is_empty() || input.size() == input.null_count()) {
     std::vector<std::unique_ptr<cudf::column>> output;
     for (std::size_t idx = 0; idx < num_outputs; ++idx) {
@@ -1146,7 +1008,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object(
   }
 
   std::vector<std::size_t> sorted_indices(json_paths.size());
-  std::iota(sorted_indices.begin(), sorted_indices.end(), 0);  // Fill with 0, 1, 2, ...
+  std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
 
   std::sort(sorted_indices.begin(), sorted_indices.end(), [&json_paths](size_t i, size_t j) {
     return json_paths[i] < json_paths[j];
