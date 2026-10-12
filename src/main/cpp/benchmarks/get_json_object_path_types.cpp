@@ -61,7 +61,7 @@ namespace {
 //   mix 1 pure-WILDCARD    : all root elements; nested [7,8,9] elements
 //   mix 2 INDEX + NAMED    : s0 / s1 / s3 / 1 / s4
 //   mix 3 NAMED + WILDCARD : s0 / all root elements / s1 / s0 / s2+s3
-//   mix 4 INDEX + WILDCARD : all root elements / 7+8+9 / root[0] / root[2]
+//   mix 4 INDEX + WILDCARD : all root elements / 7+8+9 / root[2][0] / root[2][2]
 //   mix 5 all three        : s0 / s1 / s1 / s2+s3 / all root elements / 1 / s0 / s3
 // Hit semantics follow the engine (src/main/cpp/src/get_json_object.cu): WILDCARD matches
 // ARRAY children only — a wildcard reaching an object value returns null; a NAMED-led path
