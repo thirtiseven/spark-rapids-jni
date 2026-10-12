@@ -24,14 +24,15 @@
 #include <utility>
 
 // Process-global gen-once input cache shared by every get_json_object benchmark in this binary:
-// each input is generated and uploaded once, however many cells read it (nvbench is serial).
+// each input is generated and uploaded once, however many cells read it (nvbench runs
+// invocations serially, so the map needs no locking).
 namespace spark_rapids_jni {
 namespace bench {
 
 using input_cache_key = std::uint64_t;
 
 /**
- * @brief Pack (scenario, size_bytes, seed) into one cache key: 16 / 32 / 16 bits.
+ * @brief Pack (scenario, size_bytes, seed) into one cache key: 16 / 32 / 16 bits respectively.
  *
  * `scenario` distinguishes input shapes at the same byte size (row kind, `max_depth`); `seed`
  * distinguishes generator seeds.
@@ -47,9 +48,9 @@ constexpr input_cache_key make_input_cache_key(std::uint64_t scenario,
  * @brief Return a borrowed view of the process-cached input column for `key`, generating it on
  * the first call. `generate()` must be deterministic in the key.
  *
- * The map is heap-allocated and never destroyed on purpose: freeing the cached device memory
- * during static teardown crashes (cudaFreeAsync after the CUDA runtime exits — SIGSEGV), so the
- * columns leak and the driver reclaims them at process exit.
+ * The map is heap-allocated and never destroyed on purpose: freeing the cached device memory at
+ * static teardown crashes (the CUDA runtime has already started exiting), so the columns leak
+ * and the driver reclaims them at process exit.
  */
 inline std::unordered_map<input_cache_key, std::unique_ptr<cudf::column>>& input_cache()
 {

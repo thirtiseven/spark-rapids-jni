@@ -56,15 +56,18 @@ namespace {
 //
 // mix_paths holds the fixed per-mix path lists; num_paths takes the first N and duplicates the
 // list cyclically past its end (mirrors production path repeats). Hit = >= 1 non-null result row.
+// Per-mix hit composition:
+//   mix 0 pure-INDEX       : root[0] (object), root[1] (string), 7/8/9 of [7,8,9]
+//   mix 1 pure-WILDCARD    : all root elements; nested [7,8,9] elements
+//   mix 2 INDEX + NAMED    : s0 / s1 / s3 / 1 / s4
+//   mix 3 NAMED + WILDCARD : s0 / all root elements / s1 / s0 / s2+s3
+//   mix 4 INDEX + WILDCARD : all root elements / 7+8+9 / both arr elements / s2+s3
+//   mix 5 all three        : s0 / s1 / s1 / s2+s3 / all root elements / 1 / s0 / s3
 // The lists exploit engine semantics (src/main/cpp/src/get_json_object.cu): WILDCARD matches
 // ARRAY children only — a wildcard reaching an object value returns null; a NAMED-led path
 // cannot hit the array root, so it is adapted with a `$[0]`/`$[*]` prefix (why mixes 2/3/5 carry
 // INDEX segments); `$.a.*` and a missing top-level field can never hit, so they appear as
 // `$[*].a.b` / `$[0].m.p`.
-//
-// Pre-flight (mandatory): on the first invocation, before any timed sample, every mix's full
-// path list runs against the first k_slice_rows rows of a fixed cached input; each path must
-// produce >= 1 non-null row or the benchmark aborts (CUDF_EXPECTS).
 
 using path_instruction_type = spark_rapids_jni::path_instruction_type;
 using path_instructions     = std::vector<std::tuple<path_instruction_type, std::string, int32_t>>;
