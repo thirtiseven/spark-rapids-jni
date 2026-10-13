@@ -154,7 +154,6 @@ void BM_get_json_object(nvbench::state& state)
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-    // Can also verify at https://jsonpath.com/.
     [[maybe_unused]] auto const output =
       spark_rapids_jni::get_json_object(cudf::strings_column_view{json_strings_col}, instructions);
 
