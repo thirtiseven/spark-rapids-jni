@@ -132,13 +132,19 @@ inline multi_paths nested_build_paths(std::vector<nested_prefix_entry> const& ta
 inline std::vector<std::string> nested_build_rows(std::mt19937_64& rng,
                                                   std::vector<nested_prefix_entry> const& prefixes,
                                                   std::size_t num_rows,
-                                                  std::size_t row_bytes)
+                                                  std::size_t row_bytes,
+                                                  std::uint64_t seed)
 {
+  // Seed-derived salt so different seeds produce different field values and
+  // absence patterns; without it every seed yields identical inputs.
+  std::uint64_t const salt = seed * 0x9E3779B97F4A7C15ULL;
   std::vector<std::string> rows;
   rows.reserve(num_rows);
   for (std::size_t r = 0; r < num_rows; ++r) {
     // 10% of scalar leaves absent, deterministic per (row, leaf index).
-    auto present = [&](std::size_t idx) { return (r * 7919u + idx * 104729u) % 1000u < 900u; };
+    auto present = [&](std::size_t idx) {
+      return (r * 7919u + idx * 104729u + salt) % 1000u < 900u;
+    };
     std::string row;
     row.reserve(row_bytes + 64);
     row += '{';
@@ -179,7 +185,7 @@ inline std::vector<std::string> nested_build_rows(std::mt19937_64& rng,
           row += "\\\",\\\"semanticContext\\\":\\\"source-role=";
           row += segs[d];
           row += "|sequence=";
-          row += std::to_string((r * 7919u) % 10000000u);
+          row += std::to_string((r * 7919u + salt) % 10000000u);
           row += "\\\"}\"";
           need_comma[depth] = true;
         } else if (present(scalar_idx)) {
@@ -195,7 +201,7 @@ inline std::vector<std::string> nested_build_rows(std::mt19937_64& rng,
           s += std::to_string(r % 101);
           s += "|branch-element=root";
           s += "|sequence=";
-          s += std::to_string((r * 7919u + scalar_idx) % 10000000u);
+          s += std::to_string((r * 7919u + scalar_idx + salt) % 10000000u);
           s += "|tenant=US_REGION_1X|platform=ios|action=moduleView";
           if (s.size() > 128) { s.resize(128); }
           row += '"';

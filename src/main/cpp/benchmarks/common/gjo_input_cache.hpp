@@ -45,18 +45,14 @@ constexpr input_cache_key make_input_cache_key(std::uint64_t scenario,
 }
 
 /**
- * @brief Return a borrowed view of the process-cached input column for `key`, generating it on
- * the first call. `generate()` must be deterministic in the key.
+ * @brief Return a reference to the process-cached input column map for `key` lookups.
  *
  * The map is heap-allocated and never destroyed on purpose: freeing the cached device memory at
  * static teardown crashes (the CUDA runtime has already started exiting), so the columns leak
- * and the driver reclaims them at process exit.
+ * and the driver reclaims them at process exit. Defined in `gjo_input_cache.cpp` so every
+ * translation unit shares one map.
  */
-inline std::unordered_map<input_cache_key, std::unique_ptr<cudf::column>>& input_cache()
-{
-  static auto* cache = new std::unordered_map<input_cache_key, std::unique_ptr<cudf::column>>();
-  return *cache;
-}
+std::unordered_map<input_cache_key, std::unique_ptr<cudf::column>>& input_cache();
 
 template <typename Generate>
 cudf::column_view get_or_generate_input(input_cache_key key, Generate&& generate)

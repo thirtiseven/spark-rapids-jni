@@ -83,7 +83,8 @@ ConfigureBench(BLOOM_FILTER_BENCH
 
 ConfigureBench(GET_JSON_OBJECT_BENCH
   get_json_object.cpp
-  get_json_object_path_types.cpp)
+  get_json_object_path_types.cpp
+  gjo_input_cache.cpp)
 
 ConfigureBench(FROM_JSON_TO_STRUCTS_BENCH
   from_json_to_structs.cu)
