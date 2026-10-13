@@ -657,7 +657,13 @@ struct json_path_processing_data {
   int8_t* has_out_of_bound;
 };
 
-// Each active thread evaluates one (row, path); rows occupy whole warps.
+/**
+ * Evaluates the JSONPath queries: each active thread owns one (row, path)
+ * pair and parses the row's JSON for that path independently. Each row uses
+ * `num_threads_per_row` consecutive threads — a whole number of warps, so a
+ * warp never mixes rows; slots beyond the path count are idle. Threads
+ * beyond the last row return without parsing.
+ */
 template <int block_size, int min_block_per_sm, bool use_last_non_null>
 __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
   void get_json_object_kernel(cudf::column_device_view input,
@@ -702,6 +708,8 @@ __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
       return;
     }
 
+    // The scratch buffer is sized from the input, not the output; a large
+    // extracted value can exceed its slot. Flag it and record the exact size.
     auto const max_size = path.offsets[row_idx + 1] - path.offsets[row_idx];
     if (out_size > max_size) { set_device_flag(path.has_out_of_bound); }
   }
@@ -898,6 +906,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
     batch_stringviews;
   batch_stringviews.reserve(out_stringviews.size());
 
+  // Common case: every output fit its slot, so the string views are final.
   if (has_no_oob) {
     for (auto const& out_sview : out_stringviews) {
       batch_stringviews.emplace_back(out_sview);
@@ -905,7 +914,8 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
     return cudf::make_strings_column_batch(batch_stringviews, stream, mr);
   }
   // Retry only oversized outputs; the first pass already recorded exact lengths and validity.
-
+  // Pass 1 counted each output size while writing (possibly overflowing); the recorded sizes
+  // let the retry allocate exact buffers, so it cannot overflow again.
   std::vector<std::pair<cuda::device_buffer<std::byte>, cudf::size_type>>
     out_null_masks_and_null_counts;
   std::vector<std::pair<std::unique_ptr<cudf::column>, int64_t>> out_offsets_and_sizes;
@@ -913,6 +923,8 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   std::vector<std::size_t> oob_indices;
   std::vector<std::size_t> no_oob_indices;
 
+  // Validity comes from pass 1: a row with valid output has a non-null char
+  // pointer; oversized rows are still valid, only relocated.
   auto const validator = [] __device__(cuda::std::pair<char const*, cudf::size_type> const item) {
     return item.first != nullptr;
   };
@@ -961,6 +973,8 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   scratch_buffers.clear();
   out_stringviews.clear();
 
+  // Second pass: only the oversized paths are relaunched, writing into the
+  // exact-sized buffers allocated above.
   d_path_data = cudf::detail::make_device_uvector_async(
     h_path_data, stream, rmm::mr::get_current_device_resource_ref());
   thrust::uninitialized_fill(
