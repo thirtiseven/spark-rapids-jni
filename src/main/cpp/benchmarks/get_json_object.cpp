@@ -14,160 +14,102 @@
  * limitations under the License.
  */
 
-#include "common/generate_input.hpp"
-#include "common/gjo_input_cache.hpp"
+#include "common/gjo_scenario_generators.hpp"
 
 #include <cudf_test/column_wrapper.hpp>
 
-#include <cudf/io/json.hpp>
-#include <cudf/io/types.hpp>
-#include <cudf/strings/split/split.hpp>
 #include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cuda/stream>
 
 #include <get_json_object.hpp>
 #include <nvbench/nvbench.cuh>
 
-#include <iostream>
+#include <algorithm>
+#include <random>
+#include <string>
+#include <vector>
 
-// #define DEBUG_PRINT
-#ifdef DEBUG_PRINT
+using namespace spark_rapids_jni::gjo_scenarios;
+
+// Benchmarks the two nested-path shapes with reproducible row seeds.
 
 namespace {
 
-// Copy from `cudf/cpp/tests/utilities/column_utilities.cu`.
-struct strings_to_host_fn {
-  template <typename OffsetType,
-            std::enable_if_t<std::is_same_v<OffsetType, int32_t> ||
-                             std::is_same_v<OffsetType, int64_t>>* = nullptr>
-  void operator()(std::vector<std::string>& host_data,
-                  char const* chars,
-                  cudf::column_view const& offsets,
-                  cuda::stream_ref stream)
-  {
-    auto const h_offsets = cudf::detail::make_std_vector_sync(
-      cudf::device_span<OffsetType const>(offsets.data<OffsetType>(), offsets.size()), stream);
-    // build std::string vector from chars and offsets
-    std::transform(std::begin(h_offsets),
-                   std::end(h_offsets) - 1,
-                   std::begin(h_offsets) + 1,
-                   host_data.begin(),
-                   [&](auto start, auto end) { return std::string(chars + start, end - start); });
-  }
+// Byte unit for the size->rows derivation below (rows sized at ~10 KiB each).
+constexpr std::size_t ki_b = 1'024;
 
-  template <typename OffsetType,
-            std::enable_if_t<!std::is_same_v<OffsetType, int32_t> &&
-                             !std::is_same_v<OffsetType, int64_t>>* = nullptr>
-  void operator()(std::vector<std::string>&,
-                  char const*,
-                  cudf::column_view const&,
-                  cuda::stream_ref)
-  {
-    CUDF_FAIL("invalid offsets type");
-  }
-};
-
-template <typename CV>
-std::vector<std::string> to_host_strings(CV const& c)
-{
-  std::vector<std::string> host_strs(c.size());
-  auto stream        = cudf::get_default_stream();
-  auto const scv     = cudf::strings_column_view(c);
-  auto const h_chars = cudf::detail::make_std_vector_sync<char>(
-    cudf::device_span<char const>(scv.chars_begin(stream), scv.chars_size(stream)), stream);
-  auto const offsets =
-    cudf::slice(scv.offsets(), {scv.offset(), scv.offset() + scv.size() + 1}).front();
-  cudf::type_dispatcher(
-    offsets.type(), strings_to_host_fn{}, host_strs, h_chars.data(), offsets, stream);
-  return host_strs;
-}
+// Nested layouts served by gjo_scenario_generators.hpp — NESTED_135 (the
+// largest fused call, 135 distinct paths) and NESTED_33 (the narrower
+// per-branch extraction, 33 paths).
+enum class scenario_id : int32_t { NESTED_135 = 0, NESTED_33 = 1 };
 
 }  // namespace
-#endif  // #ifdef DEBUG_PRINT
 
-constexpr auto list_depth = 2;
-constexpr auto min_width  = 10;
-constexpr auto max_width  = 10;
+// Pool allocation avoids synchronizing cudaFree costs absent from deployment.
+namespace {
+rmm::mr::pool_memory_resource pool_mr{rmm::mr::cuda_memory_resource{},
+                                      rmm::percent_of_free_device_memory(50)};
+auto* pool_guard = [] {
+  cudf::set_current_device_resource(pool_mr);
+  return &pool_mr;
+}();
+}  // namespace
 
-auto generate_input(std::size_t size_bytes, cudf::size_type max_depth)
+void BM_get_json_object_multiple_paths(nvbench::state& state)
 {
-  data_profile const table_profile =
-    data_profile_builder()
-      .no_validity()
-      .distribution(cudf::type_id::STRING, distribution_id::NORMAL, min_width, max_width)
-      .distribution(cudf::type_id::LIST, distribution_id::NORMAL, min_width, max_width)
-      .list_depth(list_depth)
-      .list_type(cudf::type_id::STRING)
-      .struct_depth(max_depth > list_depth ? max_depth - list_depth : 1)
-      .struct_types(std::vector<cudf::type_id>{cudf::type_id::LIST});
+  auto const size_bytes = static_cast<std::size_t>(state.get_int64("size_bytes"));
+  auto const num_paths  = static_cast<std::size_t>(state.get_int64("num_paths"));
+  auto const seed       = static_cast<uint64_t>(state.get_int64("seed"));
+  auto const scenario   = static_cast<scenario_id>(state.get_int64("scenario"));
 
-  auto const input_table = create_random_table(
-    std::vector<cudf::type_id>{cudf::type_id::INT32, cudf::type_id::STRING, cudf::type_id::STRUCT},
-    table_size_bytes{size_bytes},
-    table_profile);
-
-  std::vector<char> buffer;
-  cudf::io::sink_info sink(&buffer);
-  cudf::io::table_metadata mt{{{"int32"}, {"string"}, {"struct"}}};
-  auto write_opts =
-    cudf::io::json_writer_options::builder(sink, input_table->view()).lines(true).metadata(mt);
-  cudf::io::write_json(write_opts);
-
-  // Split one JSON string into separate JSON objects.
-  auto const json_str = std::string{buffer.begin(), buffer.end()};
-  auto const json_col = cudf::test::strings_column_wrapper{{json_str}};
-  auto split_strs =
-    cudf::strings::split_record(cudf::strings_column_view{json_col}, cudf::string_scalar("\n"))
-      ->release();
-
-  // Note that split_strs is a list of strings thus we need to extract the strings column.
-  auto& json_strings = split_strs.children[cudf::lists_column_view::child_column_index];
-
-#ifdef DEBUG_PRINT
-  {
-    auto const strs = to_host_strings(json_strings->view());
-    std::cout << "First input row: \n" << strs.front() << std::endl;
+  auto const& table = scenario == scenario_id::NESTED_135 ? nested_table_135() : nested_table_33();
+  auto const paths  = nested_build_paths(table, scenario == scenario_id::NESTED_135 ? 135 : 33);
+  multi_paths tiled;
+  tiled.reserve(num_paths);
+  for (std::size_t i = 0; i < num_paths; ++i) {
+    tiled.push_back(paths[i % paths.size()]);
   }
-#endif  // #ifdef DEBUG_PRINT
-  return std::move(json_strings);
-}
 
-void BM_get_json_object(nvbench::state& state)
-{
-  auto const size_bytes = static_cast<cudf::size_type>(state.get_int64("size_bytes"));
-  auto const max_depth  = static_cast<cudf::size_type>(state.get_int64("max_depth"));
+  // Keep generated rows parseable at small requested sizes.
+  auto const num_rows  = std::max<std::size_t>(size_bytes / (10 * ki_b), 8);
+  auto const row_bytes = std::max<std::size_t>(size_bytes / num_rows, 16);
 
-  // Gen-once process-global cache; the generator is deterministic, so reuse
-  // matches a fresh run. The key carries no real seed.
-  auto const json_strings_col = spark_rapids_jni::bench::get_or_generate_input(
-    spark_rapids_jni::bench::make_input_cache_key(max_depth, size_bytes, /*seed=*/0),
-    [&] { return generate_input(size_bytes, max_depth); });
+  std::mt19937_64 rng{seed};
+  auto rows            = nested_build_rows(rng, table, num_rows, row_bytes);
+  auto const input_col = cudf::test::strings_column_wrapper(rows.begin(), rows.end()).release();
 
-  using path_instruction_type = spark_rapids_jni::path_instruction_type;
-  std::vector<std::tuple<path_instruction_type, std::string, int32_t>> instructions;
-  instructions.emplace_back(path_instruction_type::NAMED, "struct", -1);
-  for (int i = 0; i < max_depth - list_depth; ++i) {
-    instructions.emplace_back(path_instruction_type::NAMED, "0", -1);
+  // Report actual generated bytes rather than the target `size_bytes`.
+  std::size_t input_bytes = 0;
+  for (auto const& r : rows) {
+    input_bytes += r.size();
   }
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
-  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+  state.add_global_memory_reads<nvbench::int8_t>(input_bytes);
+  state.add_element_count(num_rows, "rows");
+  state.add_element_count(num_paths, "paths");
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output =
-      spark_rapids_jni::get_json_object(cudf::strings_column_view{json_strings_col}, instructions);
-
-#ifdef DEBUG_PRINT
-    {
-      auto const strs = to_host_strings(output->view());
-      std::cout << "First output row: \n" << strs.front() << std::endl << std::endl << std::endl;
-    }
-#endif  // #ifdef DEBUG_PRINT
+      spark_rapids_jni::get_json_object_multiple_paths(cudf::strings_column_view{input_col->view()},
+                                                       tiled,
+                                                       -1,
+                                                       -1,
+                                                       cudf::get_default_stream(),
+                                                       rmm::mr::get_current_device_resource_ref());
   });
-  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
 }
 
-NVBENCH_BENCH(BM_get_json_object)
-  .set_name("get_json_object")
-  .add_int64_axis("size_bytes", {1'000'000, 10'000'000, 100'000'000, 1'000'000'000})
-  .add_int64_axis("max_depth", {2, 4, 6, 8});
+NVBENCH_BENCH(BM_get_json_object_multiple_paths)
+  .set_name("get_json_object_multiple_paths")
+  .add_int64_axis("scenario",
+                  {static_cast<nvbench::int64_t>(scenario_id::NESTED_135),
+                   static_cast<nvbench::int64_t>(scenario_id::NESTED_33)})
+  .add_int64_axis("size_bytes", {10 * 1'024 * 1'024, 100 * 1'024 * 1'024})
+  .add_int64_axis("num_paths", {1, 8, 32, 33, 135})
+  .add_int64_axis("seed", {1, 2});
