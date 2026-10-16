@@ -41,13 +41,10 @@ using multi_paths   = std::vector<path_list>;
  */
 inline std::string random_string(std::mt19937_64& rng, std::size_t len)
 {
-  static std::string const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  std::uniform_int_distribution<std::size_t> char_dist(0, chars.size() - 1);
-  std::string out;
-  out.reserve(len);
-  for (std::size_t i = 0; i < len; ++i) {
-    out.push_back(chars[char_dist(rng)]);
-  }
+  static constexpr char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+  std::uniform_int_distribution<std::size_t> char_dist(0, sizeof(chars) - 2);
+  std::string out(len, '\0');
+  std::generate(out.begin(), out.end(), [&] { return chars[char_dist(rng)]; });
   return out;
 }
 
@@ -136,7 +133,12 @@ inline std::vector<std::string> nested_build_rows(std::mt19937_64& rng,
                                                   std::uint64_t seed)
 {
   // Seed-derived salt so different seeds produce different field values and
-  // absence patterns; without it every seed yields identical inputs.
+  // absence patterns; without it every seed yields identical inputs. The
+  // multiplier is the golden-ratio fractional constant 2^64 / phi
+  // (0x9E3779B97F4A7C15), the standard integer mixer: multiplying by it
+  // scatters consecutive seeds evenly across the 64-bit range, and the
+  // subsequent modulos turn that spread into well-mixed presence flags and
+  // field values.
   std::uint64_t const salt = seed * 0x9E3779B97F4A7C15ULL;
   std::vector<std::string> rows;
   rows.reserve(num_rows);
