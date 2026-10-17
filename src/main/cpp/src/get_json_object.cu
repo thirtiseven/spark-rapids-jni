@@ -916,7 +916,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   // Retry only oversized outputs; the first pass already recorded exact lengths and validity.
   // Pass 1 counted each output size while writing (possibly overflowing); the recorded sizes
   // let the retry allocate exact buffers, so it cannot overflow again.
-  std::vector<std::pair<cuda::device_buffer<std::byte>, cudf::size_type>>
+  std::vector<std::pair<cuda::device_buffer<cudf::bitmask_type>, cudf::size_type>>
     out_null_masks_and_null_counts;
   std::vector<std::pair<std::unique_ptr<cudf::column>, int64_t>> out_offsets_and_sizes;
   std::vector<rmm::device_uvector<char>> out_char_buffers;
