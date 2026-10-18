@@ -195,6 +195,7 @@ class json_generator {
   __device__ inline int get_offset() const { return offset; }
   __device__ inline int get_output_len() const { return output_len; }
 
+  // A failed evaluation leaves stale bytes in the shared buffer; zeroing discards them.
   __device__ inline void set_output_len_zero() { output_len = 0; }
 
   __device__ inline void set_output_len(size_t len) { output_len = len; }
@@ -250,6 +251,8 @@ __device__ inline cuda::std::tuple<bool, int> path_match_index_wildcard(
 }
 
 // Parent contexts resume according to the case that created their child.
+// Cases mirror Spark's JSONPath evaluation in jsonExpressions.scala#evaluatePath();
+// parents resume per the creating case.
 enum class evaluation_case_path : int8_t {
   INVALID                                           = -1,
   START_ARRAY___EMPTY_PATH___FLATTEN_STYLE          = 2,

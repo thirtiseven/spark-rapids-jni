@@ -70,6 +70,7 @@ class char_range {
   {
   }
 
+  // CUDA bug: never initialize a member variable via a static-method call like this.
   __device__ inline static char_range null() { return char_range(nullptr, 0); }
 
   __device__ inline char_range(char_range const&)            = default;
