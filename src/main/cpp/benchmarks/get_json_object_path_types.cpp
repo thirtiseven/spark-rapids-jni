@@ -160,20 +160,20 @@ std::vector<path_instructions> const& mix_paths(int64_t mix)
                 {index_seg(0), named_seg("arr"), index_seg(1), index_seg(0)},
                 {index_seg(0), named_seg("m"), named_seg("p")}};
     // mix 3 — NAMED + WILDCARD
-    mixes[3] = {{index_seg(0), named_seg("a"), named_seg("b")},
+    mixes[3] = {{wild_seg(), named_seg("a"), named_seg("b")},
+                {index_seg(0), named_seg("a"), named_seg("b")},
                 {wild_seg()},
                 {index_seg(0), named_seg("arr"), wild_seg(), named_seg("x")},
-                {wild_seg(), named_seg("a"), named_seg("b")},
                 {index_seg(0), named_seg("m"), named_seg("n"), wild_seg()}};
     // mix 4 — INDEX + WILDCARD
-    mixes[4] = {{wild_seg()},
-                {index_seg(2), wild_seg()},
+    mixes[4] = {{index_seg(2), wild_seg()},
+                {wild_seg()},
                 {wild_seg(), index_seg(0)},
                 {wild_seg(), index_seg(2)}};
     // mix 5 — all three
-    mixes[5] = {{index_seg(0), named_seg("a"), named_seg("b")},
+    mixes[5] = {{index_seg(0), named_seg("arr"), wild_seg(), named_seg("x")},
+                {index_seg(0), named_seg("a"), named_seg("b")},
                 {index_seg(0), named_seg("arr"), index_seg(0), named_seg("x")},
-                {index_seg(0), named_seg("arr"), wild_seg(), named_seg("x")},
                 {index_seg(0), named_seg("m"), named_seg("n"), wild_seg()},
                 {wild_seg()},
                 {index_seg(0), named_seg("arr"), index_seg(1), index_seg(0)},
