@@ -29,8 +29,7 @@ namespace spark_rapids_jni {
 enum class escape_style {
   // Omits quotes and decodes escapes, e.g. \r becomes one carriage-return byte.
   UNESCAPED,
-
-  // Adds quotes: one double quote writes four bytes; Unicode escapes stay decoded.
+  // Adds quotes and re-escapes content; Unicode escapes stay decoded.
   ESCAPED
 };
 
@@ -70,7 +69,7 @@ class char_range {
   {
   }
 
-  // CUDA bug: never initialize a member variable via a static-method call like this.
+  // Keep member initialization explicit rather than calling this factory.
   __device__ inline static char_range null() { return char_range(nullptr, 0); }
 
   __device__ inline char_range(char_range const&)            = default;
@@ -575,7 +574,6 @@ class json_parser {
           return true;
         case 'u':
           str.next();
-
           return try_skip_unicode(str, to_match, copy_dest, output_size_bytes, matched_field_name);
         default: return false;
       }
@@ -687,7 +685,6 @@ class json_parser {
     }
 
     auto utf_char = codepoint_to_utf8(code_point);
-    // A decoded value needs at most four bytes.
     char buff[4];
     cudf::size_type const bytes = from_char_utf8(utf_char, buff);
     output_size_bytes += bytes;
@@ -1246,11 +1243,9 @@ class json_parser {
  private:
   char_range const chars;
   cudf::size_type curr_pos;
-
   // One bit per nesting level: 1 for object, 0 for array.
   int64_t context_stack;
   int stack_size = 0;
-
   cudf::size_type current_token_start_pos;
   cudf::size_type number_token_len;
 

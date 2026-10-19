@@ -85,7 +85,7 @@ inline std::string pad_row_to(std::mt19937_64& rng, std::string content, std::si
 // Paths read by other kernels (from_json, single-path calls) are not benched
 // here — they are not multi-path work.
 // NESTED_135 depth histogram over the queried paths: 35x1, 85x2, 13x3, 2x5
-// (three table entries are unqueried prefixes; dotted keys are real
+// (13 table entries are unqueried prefixes; dotted keys are real
 // multi-segment paths). No wildcards, no indices.
 
 // Prefix-entry node kind: internal = has children (a queried internal path
@@ -122,9 +122,9 @@ inline multi_paths nested_build_paths(std::vector<nested_prefix_entry> const& ta
  * tree built in table order.
  *
  * The table is lexicographically sorted, so children follow their parent and
- * each key opens exactly once. Leaf scalars use the ~128B shape (10% absent,
- * deterministic per row/leaf); internal nodes open nested objects; `pad_row_to`
- * absorbs the remaining row budget.
+ * each key opens exactly once. Scalar values use the ~128B shape or null
+ * (10%, deterministic per row/leaf); internal nodes open nested objects;
+ * `pad_row_to` absorbs the remaining row budget.
  */
 inline std::vector<std::string> nested_build_rows(std::mt19937_64& rng,
                                                   std::vector<nested_prefix_entry> const& prefixes,
@@ -132,18 +132,12 @@ inline std::vector<std::string> nested_build_rows(std::mt19937_64& rng,
                                                   std::size_t row_bytes,
                                                   std::uint64_t seed)
 {
-  // Seed-derived salt so different seeds produce different field values and
-  // absence patterns; without it every seed yields identical inputs. The
-  // multiplier is the golden-ratio fractional constant 2^64 / phi
-  // (0x9E3779B97F4A7C15), the standard integer mixer: multiplying by it
-  // scatters consecutive seeds evenly across the 64-bit range, and the
-  // subsequent modulos turn that spread into well-mixed presence flags and
-  // field values.
+  // The seed changes scalar values, null placement, and sequence values.
   std::uint64_t const salt = seed * 0x9E3779B97F4A7C15ULL;
   std::vector<std::string> rows;
   rows.reserve(num_rows);
   for (std::size_t r = 0; r < num_rows; ++r) {
-    // 10% of scalar leaves absent, deterministic per (row, leaf index).
+    // Scalar null selection is deterministic for each seed, row, and leaf.
     auto present = [&](std::size_t idx) {
       return (r * 7919u + idx * 104729u + salt) % 1000u < 900u;
     };
@@ -179,7 +173,7 @@ inline std::vector<std::string> nested_build_rows(std::mt19937_64& rng,
           ++depth;
           need_comma.push_back(false);
         } else if (e.kind == nested_node_kind::json) {
-          // Nested JSON string member, sized to the json shape (~640 chars).
+          // This leaf contains serialized JSON inside a JSON string.
           row += "\"{\\\"sourceRole\\\":\\\"";
           row += segs[d];
           row += "\\\",\\\"eventIdentity\\\":\\\"";

@@ -23,9 +23,8 @@
 #include <unordered_map>
 #include <utility>
 
-// Process-global gen-once input cache shared by every get_json_object benchmark in this binary:
-// each input is generated and uploaded once, however many cells read it (nvbench runs
-// invocations serially, so the map needs no locking).
+// Callers of get_or_generate_input share one process-wide cache; each key is generated once.
+// Benchmark invocations are serial, so the map needs no locking.
 namespace spark_rapids_jni {
 namespace bench {
 

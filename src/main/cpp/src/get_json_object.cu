@@ -66,7 +66,6 @@ struct path_instruction {
 
   cudf::string_view name;  // used when type is named type
   int index{-1};           // used when type is index
-
   path_instruction_type type;
 };
 
@@ -75,7 +74,7 @@ class json_generator {
  public:
   __device__ json_generator(int _offset = 0) : offset(_offset), output_len(0) {}
 
-  // The child shares the output buffer and starts at the parent's current end.
+  // The child writes after this generator in the shared output buffer.
   __device__ json_generator new_child_generator() const
   {
     return json_generator(offset + output_len);
@@ -138,16 +137,9 @@ class json_generator {
   }
 
   /**
-   * Writes a child generator's buffer into this one, inserting a comma if
-   * needed and optionally wrapping the child in outer array tokens:
-   *
-   *   write_outer_array_tokens = false, need_comma = true:
-   *     [1,2,3]1,2,3  ->  [1,2,3],1,2,3
-   *   write_outer_array_tokens = true, need_comma = true:
-   *     [12,3,4       ->  [1,[2,3,4]
-   *
-   * `write_outer_array_tokens` pairs with
-   * `write_first_start_array_without_output`.
+   * Child bytes are already at the parent's end; make room for the deferred comma and brackets.
+   * With a comma: parent prefix [1 and child 2,3,4 become [1,2,3,4 without wrapping.
+   * With wrapping too, the same prefix and child become [1,[2,3,4].
    */
   __device__ void write_child_raw_value(char* child_block_begin,
                                         int child_block_len,
@@ -195,7 +187,6 @@ class json_generator {
   __device__ inline int get_offset() const { return offset; }
   __device__ inline int get_output_len() const { return output_len; }
 
-  // A failed evaluation leaves stale bytes in the shared buffer; zeroing discards them.
   __device__ inline void set_output_len_zero() { output_len = 0; }
 
   __device__ inline void set_output_len(size_t len) { output_len = len; }
@@ -203,9 +194,7 @@ class json_generator {
  private:
   int offset;  // global buffer offset
   int output_len;
-
   int array_depth = 0;
-
   // Closing an inner array makes its parent non-empty, so one emptiness flag suffices.
   bool is_curr_array_empty;
 };
@@ -250,9 +239,7 @@ __device__ inline cuda::std::tuple<bool, int> path_match_index_wildcard(
   }
 }
 
-// Parent contexts resume according to the case that created their child.
-// Cases mirror Spark's JSONPath evaluation in jsonExpressions.scala#evaluatePath();
-// parents resume per the creating case.
+// Spark JSONPath cases determine how parents resume after a child returns.
 enum class evaluation_case_path : int8_t {
   INVALID                                           = -1,
   START_ARRAY___EMPTY_PATH___FLATTEN_STYLE          = 2,
@@ -266,24 +253,16 @@ enum class evaluation_case_path : int8_t {
 
 struct context {
   json_generator g;
-
   // Saved across returns from children in case 6.
   json_generator child_g;
-
   cudf::device_span<path_instruction const> path;
-
   // Match count for case 6; other wildcard cases clamp successful output to 1.
   int dirty;
-
   evaluation_case_path case_path;
-
   json_token token;
-
   write_style style;
-
   // One-time setup must not repeat when a child returns to this context.
   bool is_first_enter;
-
   bool task_is_done;
 };
 
@@ -558,7 +537,6 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           p_ctx.dirty += ctx.dirty;
           if (p_ctx.dirty > 0) { p_ctx.dirty = 1; }
           p_ctx.g = ctx.g;
-
           break;
         }
 
@@ -575,7 +553,6 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
         case evaluation_case_path::START_ARRAY___MATCHED_WILDCARD___STYLE_NOT_QUOTED: {
           p_ctx.dirty += ctx.dirty;
           p_ctx.child_g = ctx.g;
-
           break;
         }
 
@@ -590,7 +567,6 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           }
           p_ctx.task_is_done = true;
           p_ctx.g            = ctx.g;
-
           break;
         }
 
@@ -660,13 +636,7 @@ struct json_path_processing_data {
   int8_t* has_out_of_bound;
 };
 
-/**
- * Evaluates the JSONPath queries: each active thread owns one (row, path)
- * pair and parses the row's JSON for that path independently. Each row uses
- * `num_threads_per_row` consecutive threads — a whole number of warps, so a
- * warp never mixes rows; slots beyond the path count are idle. Threads
- * beyond the last row return without parsing.
- */
+// Each active thread evaluates one (row, path); extra per-row threads return without parsing.
 template <int block_size, int min_block_per_sm, bool use_last_non_null>
 __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
   void get_json_object_kernel(cudf::column_device_view input,
@@ -711,8 +681,6 @@ __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
       return;
     }
 
-    // The scratch buffer is sized from the input, not the output; a large
-    // extracted value can exceed its slot. Flag it and record the exact size.
     auto const max_size = path.offsets[row_idx + 1] - path.offsets[row_idx];
     if (out_size > max_size) { set_device_flag(path.has_out_of_bound); }
   }
@@ -754,7 +722,6 @@ struct kernel_launcher {
   }
 };
 
-// Keep every returned owner alive until the asynchronous uploads and kernel use finish.
 std::tuple<std::vector<rmm::device_uvector<path_instruction>>,
            std::unique_ptr<std::vector<std::vector<path_instruction>>>,
            cudf::string_scalar,
@@ -810,7 +777,7 @@ construct_path_commands(
   d_path_commands.reserve(h_path_commands->size());
   for (auto const& path_commands : *h_path_commands) {
     d_path_commands.emplace_back(cudf::detail::make_device_uvector_async(
-      path_commands, stream, rmm::mr::get_current_device_resource_ref()));
+      path_commands, stream, cudf::get_current_device_resource_ref()));
   }
 
   return {std::move(d_path_commands),
@@ -866,7 +833,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
 
   auto const num_outputs = json_paths.size();
 
-  // One size-overflow flag per output, then the shared depth-overflow flag.
+  // Error slots: per-path OOB, then the depth-exceeded marker.
   rmm::device_uvector<int8_t> d_error_check(num_outputs + 1, stream);
   auto const d_max_path_depth_exceeded = d_error_check.data() + num_outputs;
 
@@ -894,7 +861,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
                                                        d_error_check.data() + idx});
   }
   auto d_path_data = cudf::detail::make_device_uvector_async(
-    h_path_data, stream, rmm::mr::get_current_device_resource_ref());
+    h_path_data, stream, cudf::get_current_device_resource_ref());
   thrust::uninitialized_fill(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
     d_error_check.begin(),
@@ -909,16 +876,14 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
     batch_stringviews;
   batch_stringviews.reserve(out_stringviews.size());
 
-  // Common case: every output fit its slot, so the string views are final.
   if (has_no_oob) {
     for (auto const& out_sview : out_stringviews) {
       batch_stringviews.emplace_back(out_sview);
     }
     return cudf::make_strings_column_batch(batch_stringviews, stream, mr);
   }
-  // Retry only oversized outputs; the first pass already recorded exact lengths and validity.
-  // Pass 1 counted each output size while writing (possibly overflowing); the recorded sizes
-  // let the retry allocate exact buffers, so it cannot overflow again.
+  // OOB: relaunch only failing paths with exact-size buffers.
+
   std::vector<std::pair<cuda::device_buffer<cudf::bitmask_type>, cudf::size_type>>
     out_null_masks_and_null_counts;
   std::vector<std::pair<std::unique_ptr<cudf::column>, int64_t>> out_offsets_and_sizes;
@@ -926,12 +891,11 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   std::vector<std::size_t> oob_indices;
   std::vector<std::size_t> no_oob_indices;
 
-  // Validity comes from pass 1: a row with valid output has a non-null char
-  // pointer; oversized rows are still valid, only relocated.
   auto const validator = [] __device__(cuda::std::pair<char const*, cudf::size_type> const item) {
     return item.first != nullptr;
   };
 
+  // Rebuild the data only for paths that had out of bound write.
   h_path_data.clear();
   for (std::size_t idx = 0; idx < num_outputs; ++idx) {
     auto const& out_sview = out_stringviews[idx];
@@ -942,6 +906,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
       out_null_masks_and_null_counts.emplace_back(
         cudf::detail::valid_if(out_sview.begin(), out_sview.end(), validator, stream, mr));
 
+      // Retry allocations use the first pass's measured output sizes.
       auto const size_it = spark_rapids_jni::util::make_counting_transform_iterator(
         0,
         cuda::proclaim_return_type<cudf::size_type>(
@@ -976,10 +941,9 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   scratch_buffers.clear();
   out_stringviews.clear();
 
-  // Second pass: only the oversized paths are relaunched, writing into the
-  // exact-sized buffers allocated above.
+  // Push data to the GPU and launch the kernel again.
   d_path_data = cudf::detail::make_device_uvector_async(
-    h_path_data, stream, rmm::mr::get_current_device_resource_ref());
+    h_path_data, stream, cudf::get_current_device_resource_ref());
   thrust::uninitialized_fill(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
     d_error_check.begin(),
@@ -989,7 +953,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   h_error_check = cudf::detail::make_host_vector(d_error_check, stream);
   has_no_oob    = check_error(h_error_check);
 
-  // Identical input and paths must reproduce the recorded lengths.
+  // An exact-size retry must not overflow again.
   CUDF_EXPECTS(has_no_oob, "Unexpected out-of-bound write in get_json_object kernel.");
 
   for (std::size_t idx = 0; idx < oob_indices.size(); ++idx) {

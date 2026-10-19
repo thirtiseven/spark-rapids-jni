@@ -101,7 +101,7 @@ void BM_get_json_object_multiple_paths(nvbench::state& state)
                                                        -1,
                                                        -1,
                                                        cudf::get_default_stream(),
-                                                       rmm::mr::get_current_device_resource_ref());
+                                                       cudf::get_current_device_resource_ref());
   });
 }
 
