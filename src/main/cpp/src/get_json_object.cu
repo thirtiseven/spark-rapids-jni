@@ -83,6 +83,7 @@ class json_generator {
   __device__ void write_start_array(char* out_begin)
   {
     try_write_comma(out_begin);
+    // Starting an array after `[[1,2,3]` yields `[[1,2,3],[`.
 
     out_begin[offset + output_len] = '[';
     output_len++;
@@ -140,6 +141,8 @@ class json_generator {
    * Child bytes are already at the parent's end; make room for the deferred comma and brackets.
    * With a comma: parent prefix [1 and child 2,3,4 become [1,2,3,4 without wrapping.
    * With wrapping too, the same prefix and child become [1,[2,3,4].
+   * write_outer_array_tokens completes the brackets deferred by
+   * write_first_start_array_without_output; a single wildcard match stays unwrapped.
    */
   __device__ void write_child_raw_value(char* child_block_begin,
                                         int child_block_len,
@@ -174,6 +177,7 @@ class json_generator {
   }
 
   // Copy backward so shifting an overlapping block cannot overwrite unread bytes.
+  // Moving two bytes of 1 2 0 0 by one yields 1 1 2 0; by two yields 1 2 1 2.
   static __device__ void move_forward(char* begin, size_t len, int forward)
   {
     char* pos = begin + len + forward - 1;
@@ -187,6 +191,7 @@ class json_generator {
   __device__ inline int get_offset() const { return offset; }
   __device__ inline int get_output_len() const { return output_len; }
 
+  // Discard failed output logically; stale bytes in the shared buffer are not erased.
   __device__ inline void set_output_len_zero() { output_len = 0; }
 
   __device__ inline void set_output_len(size_t len) { output_len = len; }
@@ -266,7 +271,11 @@ struct context {
   bool task_is_done;
 };
 
-// Depth errors are deferred to the host; ordinary evaluation failure returns a zero size.
+/**
+ * Evaluates one path with an explicit stack, so child results can resume their parent case.
+ * Returns {matched, output bytes}; failed matches discard partial output by returning zero bytes.
+ * Path-depth overflow sets the shared flag for the host to reject the batch.
+ */
 __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
   json_parser& p,
   cudf::device_span<path_instruction const> path_commands,
@@ -387,7 +396,7 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
       else if (json_token::START_ARRAY == ctx.token &&
                path_match_elements(
                  ctx.path, path_instruction_type::WILDCARD, path_instruction_type::WILDCARD)) {
-        // Consecutive wildcards flatten terminal arrays instead of preserving their nesting.
+        // Consecutive wildcards flatten terminal arrays to match Hive rather than preserve nesting.
         if (ctx.is_first_enter) {
           ctx.is_first_enter = false;
           ctx.g.write_start_array(out_buf);
@@ -416,7 +425,7 @@ __device__ cuda::std::pair<bool, cudf::size_type> evaluate_path(
           case write_style::QUOTED: next_style = write_style::QUOTED;  // unreachable
         }
 
-        // Delay brackets until the number of successful matches is known.
+        // Hive leaves one wildcard match unwrapped; multiple matches need outer brackets.
         json_generator child_g;
         if (ctx.is_first_enter) {
           ctx.is_first_enter = false;
@@ -628,6 +637,7 @@ __device__ named_path_selection select_last_non_null(json_parser& p,
   }
 }
 
+// One path's borrowed instructions, row-slot offsets, output views, scratch and retry marker.
 struct json_path_processing_data {
   cudf::device_span<path_instruction const> path_commands;
   cudf::detail::input_offsetalator offsets;
@@ -636,7 +646,18 @@ struct json_path_processing_data {
   int8_t* has_out_of_bound;
 };
 
-// Each active thread evaluates one (row, path); extra per-row threads return without parsing.
+/**
+ * Evaluates one (row, path) per active thread; padded path slots and rows return without parsing.
+ * Each row uses ceil(num_paths / warp_size) whole warps, so no warp mixes rows.
+ *
+ * Keep both __launch_bounds__ arguments: NVCC's default register heuristic caused costly spilling
+ * in this parser. Specifying min_block_per_sm lets it use more registers within the launch limit
+ * to reduce instructions; it is a compiler target, not a guarantee of measured residency.
+ *
+ * path_data borrows its storage through kernel completion. A null out_stringviews denotes a retry
+ * that writes into new buffers while preserving first-pass lengths and validity.
+ * The host checks the shared depth flag before consuming output or deciding on a size retry.
+ */
 template <int block_size, int min_block_per_sm, bool use_last_non_null>
 __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
   void get_json_object_kernel(cudf::column_device_view input,
@@ -681,6 +702,7 @@ __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
       return;
     }
 
+    // Input-sized row slots can be smaller than serialized output; retain lengths for a size retry.
     auto const max_size = path.offsets[row_idx + 1] - path.offsets[row_idx];
     if (out_size > max_size) { set_device_flag(path.has_out_of_bound); }
   }
@@ -722,6 +744,11 @@ struct kernel_launcher {
   }
 };
 
+/**
+ * Uploads all path instructions and packs their names without synchronizing between paths.
+ * The returned host commands and names back asynchronous copies; retain every returned owner
+ * through the batch's ordering synchronization, and device owners through their kernel use.
+ */
 std::tuple<std::vector<rmm::device_uvector<path_instruction>>,
            std::unique_ptr<std::vector<std::vector<path_instruction>>>,
            cudf::string_scalar,
@@ -786,6 +813,7 @@ construct_path_commands(
           std::move(h_inst_names)};
 }
 
+// Reserve input bytes plus ten longest-row lengths as slack for speculative output expansion.
 int64_t calc_scratch_size(cudf::strings_column_view const& input,
                           cudf::detail::input_offsetalator const& in_offsets,
                           cuda::stream_ref stream)
@@ -807,7 +835,7 @@ int64_t calc_scratch_size(cudf::strings_column_view const& input,
   return scratch_size;
 }
 
-// Depth errors must throw before deciding whether oversized output needs a retry.
+// The last marker is depth overflow: throw first; otherwise true means every size marker is zero.
 bool check_error(cudf::detail::host_vector<int8_t> const& error_check)
 {
   CUDF_EXPECTS(error_check.back() == 0,
@@ -876,13 +904,14 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
     batch_stringviews;
   batch_stringviews.reserve(out_stringviews.size());
 
+  // Only unflagged scratch may be gathered; successful string views already carry final validity.
   if (has_no_oob) {
     for (auto const& out_sview : out_stringviews) {
       batch_stringviews.emplace_back(out_sview);
     }
     return cudf::make_strings_column_batch(batch_stringviews, stream, mr);
   }
-  // OOB: relaunch only failing paths with exact-size buffers.
+  // Retry flagged paths using the first pass's lengths; unflagged paths keep their existing views.
 
   std::vector<std::pair<cuda::device_buffer<cudf::bitmask_type>, cudf::size_type>>
     out_null_masks_and_null_counts;
@@ -891,11 +920,12 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   std::vector<std::size_t> oob_indices;
   std::vector<std::size_t> no_oob_indices;
 
+  // Non-null pointers mean valid output even when its input-sized slot was too small.
   auto const validator = [] __device__(cuda::std::pair<char const*, cudf::size_type> const item) {
     return item.first != nullptr;
   };
 
-  // Rebuild the data only for paths that had out of bound write.
+  // Failed paths keep first-pass validity but receive new offsets and buffers.
   h_path_data.clear();
   for (std::size_t idx = 0; idx < num_outputs; ++idx) {
     auto const& out_sview = out_stringviews[idx];
@@ -941,7 +971,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   scratch_buffers.clear();
   out_stringviews.clear();
 
-  // Push data to the GPU and launch the kernel again.
+  // Relaunch only flagged paths; null out_stringviews keeps first-pass validity and lengths intact.
   d_path_data = cudf::detail::make_device_uvector_async(
     h_path_data, stream, cudf::get_current_device_resource_ref());
   thrust::uninitialized_fill(
@@ -953,7 +983,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   h_error_check = cudf::detail::make_host_vector(d_error_check, stream);
   has_no_oob    = check_error(h_error_check);
 
-  // An exact-size retry must not overflow again.
+  // Identical input and paths must reproduce measured lengths; still check the retry for overflow.
   CUDF_EXPECTS(has_no_oob, "Unexpected out-of-bound write in get_json_object kernel.");
 
   for (std::size_t idx = 0; idx < oob_indices.size(); ++idx) {

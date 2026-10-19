@@ -29,7 +29,7 @@ namespace spark_rapids_jni {
 enum class escape_style {
   // Omits quotes and decodes escapes, e.g. \r becomes one carriage-return byte.
   UNESCAPED,
-  // Adds quotes and re-escapes content; Unicode escapes stay decoded.
+  // Adds quotes and re-escapes: a lone double quote becomes four bytes; Unicode stays decoded.
   ESCAPED
 };
 
@@ -56,7 +56,7 @@ enum class json_token : int8_t {
   VALUE_NULL
 };
 
-// Lengths and positions count bytes, not UTF-8 characters.
+// Borrowed bytes, not UTF-8 characters; callers retain storage and bound each index and slice.
 class char_range {
  public:
   __device__ inline char_range(char const* const start, cudf::size_type const len)
@@ -69,7 +69,7 @@ class char_range {
   {
   }
 
-  // Keep member initialization explicit rather than calling this factory.
+  // CUDA member-initialization workaround: use explicit construction, not this static factory.
   __device__ inline static char_range null() { return char_range(nullptr, 0); }
 
   __device__ inline char_range(char_range const&)            = default;
@@ -99,6 +99,7 @@ class char_range {
   cudf::size_type _len;
 };
 
+// Consumes a borrowed range by moving its begin pointer; it neither owns nor validates bytes.
 class char_range_reader : public char_range {
  public:
   __device__ inline explicit char_range_reader(char_range range)
@@ -115,7 +116,13 @@ class char_range_reader : public char_range {
   __device__ inline char current_char() const { return _data[0]; }
 };
 
-// Strings accept single quotes and raw controls; only space, tab, '\r' and '\n' are whitespace.
+/**
+ * Token-by-token parser with Spark/Jackson's relaxed strings: single quotes and raw controls are
+ * accepted, but whitespace is only space, tab, CR or LF. Scans do not validate UTF-8.
+ * Numbers accept -0 and 1e01, but reject 01, +1, 1., 1e and 1e+.
+ * Success covers the first root value; trailing bytes are ignored. Malformed input reports ERROR,
+ * and nesting overflow also sets max_nesting_depth_exceeded for the caller's error policy.
+ */
 class json_parser {
  public:
   __device__ inline explicit json_parser(char_range _chars)
@@ -330,7 +337,12 @@ class json_parser {
     }
   }
 
-  // Re-reads a validated quoted token to decode escapes; writing does not report parse errors.
+  /**
+   * Decodes a previously validated quoted token and consumes its closing quote in the local reader.
+   * A null destination only counts bytes. UNESCAPED omits quotes; ESCAPED emits double quotes and
+   * re-escapes controls and simple escapes. Unicode escapes decode in either style.
+   * Invalid input can return a partial byte count; callers must validate before using this writer.
+   */
   static __device__ inline int write_string(char_range_reader& str,
                                             char* copy_destination,
                                             escape_style w_style)
@@ -457,7 +469,7 @@ class json_parser {
     }
   }
 
-  // Starts after a backslash; escaped apostrophes are accepted too.
+  // Starts after a backslash; accepts escaped apostrophes/slashes and advances past the escape.
   static __device__ inline bool try_skip_escape_part(char_range_reader& str,
                                                      char_range_reader& to_match,
                                                      char*& copy_dest,
@@ -608,6 +620,7 @@ class json_parser {
            static_cast<cudf::size_type>((character & 0xFF00'0000u) > 0);
   }
 
+  // Packs UTF-8 bytes, not a Unicode code-point value; from_char_utf8 emits them in byte order.
   static __device__ cudf::char_utf8 codepoint_to_utf8(uint32_t unchr)
   {
     cudf::char_utf8 utf8 = 0;
@@ -685,6 +698,7 @@ class json_parser {
     }
 
     auto utf_char = codepoint_to_utf8(code_point);
+    // One decoded code point, including a combined surrogate pair, needs at most four UTF-8 bytes.
     char buff[4];
     cudf::size_type const bytes = from_char_utf8(utf_char, buff);
     output_size_bytes += bytes;
@@ -855,7 +869,7 @@ class json_parser {
     }
   }
 
-  // Separator flags only become true; the match output is set only for FIELD_NAME.
+  // Inspecting callers zero separator flags; this only sets them true. Matching is FIELD_NAME-only.
   __device__ inline void parse_next_token_and_set_current(
     bool& has_comma_before_token,
     bool& has_colon_before_token,
@@ -944,7 +958,7 @@ class json_parser {
   }
 
  public:
-  // ERROR and SUCCESS can precede the end of input.
+  // ERROR and SUCCESS end the token stream even before input ends; SUCCESS ignores trailing bytes.
   __device__ json_token next_token()
   {
     // These write-only outputs are ignored.
@@ -1036,7 +1050,9 @@ class json_parser {
         return number_token_len;
       case json_token::VALUE_NUMBER_FLOAT: {
         // Floats can expand: 1E308 becomes 1.0E308; 0.003 stays 0.003, but 0.0003 becomes 3.0E-4.
-        // Overflow is quoted even in raw output: 1.0E309 becomes "Infinity".
+        // Trailing zeros drop: 351.980 becomes 351.98; 0.0000000000003 becomes 3.0E-13.
+        // Large finite values also normalize: 12345678900000000000.0 becomes 1.23456789E19.
+        // Even raw output quotes overflow: 1.0E309 becomes "Infinity", -1E309 becomes "-Infinity".
         double d_value =
           cudf::strings::detail::stod(chars.slice_sv(current_token_start_pos, number_token_len));
         return spark_rapids_jni::ftos_converter::double_normalization(d_value, destination);
@@ -1091,7 +1107,11 @@ class json_parser {
 
   __device__ cudf::size_type compute_escaped_len() const { return write_escaped_text(nullptr); }
 
-  // A null destination only counts bytes; numeric normalization matches unescaped output.
+  /**
+   * A null destination only counts bytes; numbers normalize exactly as in unescaped output.
+   * A lone double quote becomes four bytes (quote, backslash, quote, quote).
+   * \u4E2D\u56FD becomes eight bytes: two quotes around E4 B8 AD E5 9B BD.
+   */
   __device__ cudf::size_type write_escaped_text(char* destination) const
   {
     switch (current_token) {
@@ -1165,7 +1185,11 @@ class json_parser {
     return 0;
   }
 
-  // A null destination counts bytes; both modes advance containers to their matching end token.
+  /**
+   * Serializes one value with normalized tokens and separators, not a verbatim source copy.
+   * A null destination counts bytes; containers advance to their matching close token.
+   * Returns {false, 0} for invalid tokens or malformed children; partial writes are invalid.
+   */
   __device__ cuda::std::pair<bool, size_t> copy_current_structure(char* copy_to)
   {
     switch (current_token) {
