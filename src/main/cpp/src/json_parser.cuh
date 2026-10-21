@@ -1188,7 +1188,9 @@ class json_parser {
   /**
    * Serializes one value with normalized tokens and separators, not a verbatim source copy.
    * A null destination counts bytes; containers advance to their matching close token.
-   * Returns {false, 0} for invalid tokens or malformed children; partial writes are invalid.
+   * Returns {false, sum_copy_len} when the copy itself fails midway through a container — the
+   * count covers the bytes written before the error and must reach the out-of-bound check —
+   * and {false, 0} for invalid tokens or malformed children; partial writes are invalid.
    */
   __device__ cuda::std::pair<bool, size_t> copy_current_structure(char* copy_to)
   {

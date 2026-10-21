@@ -304,3 +304,4 @@ TEST_F(GetJsonObjectTest, RejectsInvalidNamedFieldMatchContracts)
       input, nested_paths, -1, -1, spark_rapids_jni::named_field_match_policy::LAST_NON_NULL),
     cudf::logic_error);
 }
+
