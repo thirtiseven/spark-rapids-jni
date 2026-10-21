@@ -1234,7 +1234,11 @@ class json_parser {
           parse_next_token_and_set_current(
             has_comma_before_token, has_colon_before_token, matched_field_name);
 
-          if (current_token == json_token::ERROR) { return {false, 0}; }
+          // check the JSON format
+          if (current_token == json_token::ERROR) {
+            // The bytes copied before the error are real; report them.
+            return {false, sum_copy_len};
+          }
 
           if (nullptr != copy_to) {
             if (has_comma_before_token) {
