@@ -629,7 +629,8 @@ __device__ cuda::std::tuple<bool, cudf::size_type, cudf::size_type> evaluate_pat
         case evaluation_case_path::START_ARRAY___MATCHED_WILDCARD___STYLE_NOT_QUOTED: {
           p_ctx.dirty += ctx.dirty;
           p_ctx.child_g = ctx.g;
-          max_footprint = cuda::std::max(max_footprint, ctx.g.get_offset() + ctx.g.get_output_len());
+          max_footprint =
+            cuda::std::max(max_footprint, ctx.g.get_offset() + ctx.g.get_output_len());
           break;
         }
 
@@ -727,8 +728,8 @@ struct json_path_processing_data {
  * in this parser. Specifying min_block_per_sm lets it use more registers within the launch limit
  * to reduce instructions; it is a compiler target, not a guarantee of measured residency.
  *
- * path_data borrows its storage through kernel completion. A null out_stringviews denotes a retry
- * that writes into new buffers; validity comes from the rebuilt column, not the first pass.
+ * path_data borrows its storage through kernel completion. Retries write into new buffers and
+ * overwrite the output pairs; rebuilt columns use the retry's lengths and validity.
  * The host checks the shared depth flag before consuming output or deciding on a size retry.
  */
 template <int block_size, int min_block_per_sm, bool use_last_non_null>
@@ -746,6 +747,10 @@ __launch_bounds__(block_size, min_block_per_sm) CUDF_KERNEL
   if (path_idx >= path_data.size()) { return; }
 
   auto const& path = path_data[path_idx];
+  if (input.is_null(row_idx)) {
+    if (path.out_stringviews) { path.out_stringviews[row_idx] = {nullptr, 0}; }
+    return;
+  }
 
   char* const dst                 = path.out_buf + path.offsets[row_idx];
   auto const max_size             = path.offsets[row_idx + 1] - path.offsets[row_idx];
@@ -1040,8 +1045,8 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   // The first-pass scratch buffers are unreferenced by the retry descriptors.
   scratch_buffers.clear();
 
-  // Relaunch only flagged paths; null out_stringviews discards the first-pass output, and the
-  // rebuilt columns take their lengths and validity from the retry's pairs.
+  // The retry overwrites flagged paths' output pairs; rebuilt columns use those lengths and
+  // validity.
   d_path_data = cudf::detail::make_device_uvector_async(
     h_path_data, stream, cudf::get_current_device_resource_ref());
   thrust::uninitialized_fill(
@@ -1060,7 +1065,7 @@ std::vector<std::unique_ptr<cudf::column>> get_json_object_batch(
   // pair/column mismatch with interleaved valid and malformed rows in the reported failure, and
   // the per-column path keeps each column's assembly independent.
   for (std::size_t i = 0; i < oob_indices.size(); ++i) {
-    auto const out_idx = oob_indices[i];
+    auto const out_idx   = oob_indices[i];
     auto const out_sview = cudf::device_span<cuda::std::pair<char const*, cudf::size_type> const>{
       out_stringviews[out_idx].data(), static_cast<std::size_t>(input.size())};
     // Rebuild from the retry's committed pairs: the pre-retry offsets only size the scratch
