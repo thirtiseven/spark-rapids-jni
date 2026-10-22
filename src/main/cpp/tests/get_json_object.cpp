@@ -1726,3 +1726,32 @@ TEST_F(GetJsonObjectTest, NonEmptyNullsMergedRetry)
     }
   }
 }
+
+TEST_F(GetJsonObjectTest, MergedRetryRowRejectedAfterMatch)
+{
+  auto const bomb      = std::string(30, '"');
+  auto const expanding = R"({"k":{"a":')" + bomb + R"('},"u":{"v":"U"}})";        // 58 B; $.k -> 68 B
+  auto const malformed = R"({"k":{"a":')" + bomb + R"('},"u":{"v":"U"},"z":x})";  // 64 B; fails after $.k
+  ASSERT_EQ(malformed.size(), 64u);
+  std::vector<std::string> rows(33, R"({"k":"s","u":{"v":"U"}})");
+  rows[0]  = expanding;  // overflows its slot, so $.k is retried
+  rows[32] = malformed;  // last row: its retry slot ends the exact-size retry buffer
+
+  // 16 NAMED paths with a depth-2 member and >= 32 rows admit the merged first pass.
+  std::vector<std::vector<path_spec>> paths{{named_path("k")}, {named_path("u"), named_path("v")}};
+  for (int i = 2; i < 16; ++i) {
+    paths.push_back({named_path("missing" + std::to_string(i))});
+  }
+  cudf::test::strings_column_wrapper input(rows.begin(), rows.end());
+
+  std::vector<std::string> k_values(rows.size(), "s");
+  std::vector<bool> k_valid(rows.size(), true);
+  k_values[0]  = quote_bomb_value(30);
+  k_values[32] = "";
+  k_valid[32]  = false;
+  cudf::test::strings_column_wrapper k_expected(k_values.begin(), k_values.end(), k_valid.begin());
+
+  auto const out = spark_rapids_jni::get_json_object_multiple_paths(
+    cudf::strings_column_view{input}, paths, -1, -1);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(k_expected, *out[0]);
+}
