@@ -1727,7 +1727,10 @@ TEST_F(GetJsonObjectTest, NonEmptyNullsMergedRetry)
   }
 }
 
-TEST_F(GetJsonObjectTest, MergedRetryRowRejectedAfterMatch)
+namespace {
+
+// parallel_override == 1 puts each path in its own batch, so every path takes the general route.
+void run_retry_row_rejected_after_match(int32_t parallel_override)
 {
   auto const bomb      = std::string(30, '"');
   auto const expanding = R"({"k":{"a":')" + bomb + R"('},"u":{"v":"U"}})";        // 58 B; $.k -> 68 B
@@ -1752,6 +1755,18 @@ TEST_F(GetJsonObjectTest, MergedRetryRowRejectedAfterMatch)
   cudf::test::strings_column_wrapper k_expected(k_values.begin(), k_values.end(), k_valid.begin());
 
   auto const out = spark_rapids_jni::get_json_object_multiple_paths(
-    cudf::strings_column_view{input}, paths, -1, -1);
+    cudf::strings_column_view{input}, paths, -1, parallel_override);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(k_expected, *out[0]);
+}
+
+}  // namespace
+
+TEST_F(GetJsonObjectTest, MergedRetryRowRejectedAfterMatch)
+{
+  run_retry_row_rejected_after_match(-1);
+}
+
+TEST_F(GetJsonObjectTest, MergedRetryRowRejectedAfterMatchGeneralControl)
+{
+  run_retry_row_rejected_after_match(1);
 }
