@@ -332,6 +332,53 @@ public class RmmSparkTest {
   }
 
   @Test
+  public void testGpuMemoryLedgerFollowsAllocations() throws Exception {
+    Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 512 * 1024 * 1024);
+    RmmSpark.setEventHandler(new BaseRmmEventHandler(), "stderr");
+    long t1 = getNextTid();
+    long t2 = getNextTid();
+    long[] resident = new long[2];
+    long base = RmmSpark.getGpuMemoryLedger(new long[]{t1, t2}, resident);
+    assertEquals(0, resident[0]);
+    assertEquals(0, resident[1]);
+    RmmSpark.currentThreadIsDedicatedToTask(t1);
+    try {
+      DeviceMemoryBuffer b1 = DeviceMemoryBuffer.allocate(8 * 1024 * 1024);
+      DeviceMemoryBuffer b2 = DeviceMemoryBuffer.allocate(4 * 1024 * 1024);
+      long total = RmmSpark.getGpuMemoryLedger(new long[]{t1, t2}, resident);
+      assertEquals(12 * 1024 * 1024, resident[0]);
+      assertEquals(0, resident[1]);
+      assertEquals(base + 12 * 1024 * 1024, total);
+      // Frees from other threads are charged back to the owning task.
+      Thread unrelated = new Thread(b1::close);
+      unrelated.start();
+      unrelated.join();
+      long[] fromOther = new long[2];
+      Thread other = new Thread(() -> {
+        RmmSpark.currentThreadIsDedicatedToTask(t2);
+        try (DeviceMemoryBuffer b3 = DeviceMemoryBuffer.allocate(2 * 1024 * 1024)) {
+          b2.close();
+          RmmSpark.getGpuMemoryLedger(new long[]{t1, t2}, fromOther);
+        } finally {
+          RmmSpark.removeCurrentDedicatedThreadAssociation(t2);
+        }
+      });
+      other.start();
+      other.join();
+      assertEquals(0, fromOther[0]);
+      assertEquals(2 * 1024 * 1024, fromOther[1]);
+      total = RmmSpark.getGpuMemoryLedger(new long[]{t1, t2}, resident);
+      assertEquals(0, resident[0]);
+      assertEquals(0, resident[1]);
+      assertEquals(base, total);
+    } finally {
+      RmmSpark.removeCurrentDedicatedThreadAssociation(t1);
+      RmmSpark.taskDone(t1);
+      RmmSpark.taskDone(t2);
+    }
+  }
+
+  @Test
   public void testInsertOOMsGpu() {
     Rmm.initialize(RmmAllocationMode.CUDA_DEFAULT, null, 512 * 1024 * 1024);
     RmmSpark.setEventHandler(new BaseRmmEventHandler(), "stderr");

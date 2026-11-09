@@ -45,6 +45,8 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -1214,6 +1216,71 @@ class spark_resource_adaptor_impl {
   std::map<long, std::set<long>> task_to_threads;
   long gpu_memory_allocated_bytes = 0;
 
+  // Live GPU allocation ledger. Every outstanding allocation made through this adaptor is
+  // recorded with its owner (the task the allocating thread works for, or -1 when that is not
+  // exactly one task) and its size. The bytes a task still has resident on the device are then
+  // exact no matter which thread later frees them (spill threads, other tasks, cleanup), unlike
+  // the per-thread footprint metrics above. Guarded by state_mutex.
+  std::unordered_map<void*, std::pair<long, std::size_t>> live_gpu_allocations;
+  std::unordered_map<long, long> task_resident_gpu_bytes;
+  long ledger_total_gpu_bytes = 0;
+
+  long ledger_owner_for_thread(long const thread_id) const
+  {
+    auto const thread = threads.find(thread_id);
+    if (thread == threads.end()) { return -1; }
+    if (thread->second.task_id >= 0) { return thread->second.task_id; }
+    if (thread->second.pool_task_ids.size() == 1) { return *thread->second.pool_task_ids.begin(); }
+    return -1;
+  }
+
+  void ledger_record_alloc(long const thread_id, void* ptr, std::size_t const num_bytes)
+  {
+    long const owner = ledger_owner_for_thread(thread_id);
+    auto const [it, inserted] = live_gpu_allocations.try_emplace(ptr, owner, num_bytes);
+    if (!inserted) {
+      // Should not happen (the pointer was never freed through us); drop the stale record.
+      auto const old = it->second;
+      task_resident_gpu_bytes[old.first] -= static_cast<long>(old.second);
+      ledger_total_gpu_bytes -= static_cast<long>(old.second);
+      it->second = std::make_pair(owner, num_bytes);
+    }
+    task_resident_gpu_bytes[owner] += static_cast<long>(num_bytes);
+    ledger_total_gpu_bytes += static_cast<long>(num_bytes);
+  }
+
+  void ledger_record_free(void* ptr)
+  {
+    auto const it = live_gpu_allocations.find(ptr);
+    if (it == live_gpu_allocations.end()) { return; }
+    auto const [owner, num_bytes] = it->second;
+    live_gpu_allocations.erase(it);
+    ledger_total_gpu_bytes -= static_cast<long>(num_bytes);
+    auto const owner_at = task_resident_gpu_bytes.find(owner);
+    if (owner_at != task_resident_gpu_bytes.end()) {
+      owner_at->second -= static_cast<long>(num_bytes);
+      if (owner_at->second <= 0) { task_resident_gpu_bytes.erase(owner_at); }
+    }
+  }
+
+ public:
+  /**
+   * Snapshot of the live GPU allocation ledger: fills resident_out[i] with the bytes currently
+   * allocated on behalf of task_ids[i] and returns the total bytes currently allocated through
+   * this adaptor by any thread.
+   */
+  long get_gpu_memory_ledger(long const* task_ids, long* resident_out, std::size_t const n)
+  {
+    std::unique_lock<std::mutex> lock(state_mutex);
+    for (std::size_t i = 0; i < n; i++) {
+      auto const at   = task_resident_gpu_bytes.find(task_ids[i]);
+      resident_out[i] = at == task_resident_gpu_bytes.end() ? 0 : at->second;
+    }
+    return ledger_total_gpu_bytes;
+  }
+
+ private:
+
   // Metrics are a little complicated. Spark reports metrics at a task level
   // but we track and collect them at a thread level. The life time of a thread
   // and a task are not tied to each other, and a thread can work on things for
@@ -1639,9 +1706,11 @@ class spark_resource_adaptor_impl {
    */
   void post_alloc_success(long const thread_id,
                           bool const likely_spill,
-                          std::size_t const num_bytes)
+                          std::size_t const num_bytes,
+                          void* ptr = nullptr)
   {
     std::unique_lock<std::mutex> lock(state_mutex);
+    if (ptr != nullptr && num_bytes > 0) { ledger_record_alloc(thread_id, ptr, num_bytes); }
     post_alloc_success_core(thread_id, false, likely_spill, num_bytes, lock);
   }
 
@@ -2121,7 +2190,7 @@ class spark_resource_adaptor_impl {
       bool const likely_spill = pre_alloc(tid);
       try {
         void* ret = resource.allocate(stream, num_bytes, alignment);
-        post_alloc_success(tid, likely_spill, num_bytes);
+        post_alloc_success(tid, likely_spill, num_bytes, ret);
         return ret;
       } catch (rmm::out_of_memory const& e) {
         // rmm::out_of_memory is what is thrown when an allocation failed
@@ -2243,6 +2312,7 @@ class spark_resource_adaptor_impl {
       // deallocate success
       if (size > 0) {
         std::unique_lock<std::mutex> lock(state_mutex);
+        ledger_record_free(p);
         dealloc_core(false, lock, size);
       }
     } catch (...) {
@@ -2684,6 +2754,31 @@ Java_com_nvidia_spark_rapids_jni_SparkResourceAdaptor_getAndResetGpuMaxMemoryAll
   {
     auto mr = get_spark_adaptor(ptr);
     return mr->get_and_reset_gpu_max_memory_allocated(task_id);
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_SparkResourceAdaptor_getGpuMemoryLedger(
+  JNIEnv* env, jclass, jlong ptr, jlongArray task_ids, jlongArray resident_out)
+{
+  JNI_NULL_CHECK(env, ptr, "resource_adaptor is null", 0);
+  JNI_TRY
+  {
+    auto mr       = get_spark_adaptor(ptr);
+    jsize const n = task_ids == nullptr ? 0 : env->GetArrayLength(task_ids);
+    if (n > 0 && (resident_out == nullptr || env->GetArrayLength(resident_out) < n)) {
+      throw std::invalid_argument("resident_out must be at least as long as task_ids");
+    }
+    std::vector<jlong> ids(n);
+    if (n > 0) { env->GetLongArrayRegion(task_ids, 0, n, ids.data()); }
+    std::vector<long> ids_long(ids.begin(), ids.end());
+    std::vector<long> out(n, 0);
+    long const total = mr->get_gpu_memory_ledger(ids_long.data(), out.data(), n);
+    if (n > 0) {
+      std::vector<jlong> out_j(out.begin(), out.end());
+      env->SetLongArrayRegion(resident_out, 0, n, out_j.data());
+    }
+    return total;
   }
   JNI_CATCH(env, 0);
 }

@@ -764,6 +764,28 @@ public class RmmSpark {
     }
   }
 
+  /**
+   * Snapshot of the live GPU allocation ledger: the bytes each task currently has allocated on
+   * the GPU (exact per allocation, regardless of which thread frees it) and the total.
+   * @param taskIds tasks to report on
+   * @param residentOut filled with the resident bytes of each task (0 if unknown)
+   * @return the total bytes currently allocated through the adaptor, or -1 if RmmSpark is not
+   *         set up (residentOut is then zero filled)
+   */
+  public static long getGpuMemoryLedger(long[] taskIds, long[] residentOut) {
+    Rmm.readLock.lock();
+    try {
+      if (sra != null && sra.isOpen()) {
+        return sra.getGpuMemoryLedger(taskIds, residentOut);
+      } else {
+        java.util.Arrays.fill(residentOut, 0L);
+        return -1;
+      }
+    } finally {
+      Rmm.readLock.unlock();
+    }
+  }
+
   public static long getMaxGpuTaskMemory(long taskId) {
     Rmm.readLock.lock();
     try {

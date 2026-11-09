@@ -281,6 +281,17 @@ public class SparkResourceAdaptor
     return getMaxGpuTaskMemory(getHandle(), taskId);
   }
 
+  /**
+   * Snapshot of the live GPU allocation ledger.
+   * @param taskIds tasks to report on
+   * @param residentOut filled with the bytes currently allocated on behalf of each task,
+   *                    no matter which thread will free them
+   * @return the total bytes currently allocated through this adaptor
+   */
+  public long getGpuMemoryLedger(long[] taskIds, long[] residentOut) {
+    return getGpuMemoryLedger(getHandle(), taskIds, residentOut);
+  }
+
   public long getTotalBlockedOrLostTime(long taskId) {
     return getTotalBlockedOrLostTime(getHandle(), taskId);
   }
@@ -390,6 +401,7 @@ public class SparkResourceAdaptor
   private static native long getAndResetComputeTimeLostToRetry(long handle, long taskId);
   private static native long getAndResetGpuMaxMemoryAllocated(long handle, long taskId);
   private static native long getMaxGpuTaskMemory(long handle, long taskId);
+  private static native long getGpuMemoryLedger(long handle, long[] taskIds, long[] residentOut);
   private static native long getTotalBlockedOrLostTime(long handle, long taskId);
   private static native void startRetryBlock(long handle, long threadId);
   private static native void endRetryBlock(long handle, long threadId);
