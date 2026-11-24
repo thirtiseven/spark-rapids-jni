@@ -233,6 +233,7 @@ add_library(
   src/HyperLogLogPlusPlusHostUDFJni.cpp
   src/JSONUtilsJni.cpp
   src/KudoGpuSerializerJni.cpp
+  src/LencJni.cpp
   src/ListSliceJni.cpp
   src/MapJni.cpp
   src/MapUtilsJni.cpp
@@ -289,6 +290,7 @@ add_library(
   src/iceberg/iceberg_truncate.cu
   src/json_utils.cu
   src/join_primitives.cu
+  src/lenc.cu
   src/list_slice.cu
   src/like.cu
   src/map.cu
