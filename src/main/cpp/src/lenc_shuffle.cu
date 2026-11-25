@@ -218,17 +218,19 @@ __global__ void scatter_for256_slices_kernel(uint8_t* __restrict__ d_out,
   size_t const off_cwo  = align8(off_bw + nc * sizeof(uint8_t));
   size_t const off_pack = align8(off_cwo + nc * sizeof(uint32_t));
 
-  uint8_t* d_mins  = dst + off_min;
-  uint8_t* d_bws   = dst + off_bw;
-  uint8_t* d_cwo   = dst + off_cwo;
-  uint8_t* d_words = dst + off_pack;
+  uint8_t* d_mins       = dst + off_min;
+  uint8_t* d_bws        = dst + off_bw;
+  uint8_t* d_cwo        = dst + off_cwo;
+  uint8_t* d_words      = dst + off_pack;
+  uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.y * blockDim.x;
 
-  for (uint32_t i = threadIdx.x; i < nc; i += blockDim.x) {
+  for (uint32_t i = tid; i < nc; i += stride) {
     st_u64_u(d_mins + static_cast<size_t>(i) * 8u, static_cast<uint64_t>(all_mins[b0 + i]));
     d_bws[i] = all_bws[b0 + i];
     st_u32_u(d_cwo + static_cast<size_t>(i) * 4u, all_word_offs[b0 + i] - wbase);
   }
-  for (uint32_t i = threadIdx.x; i < nwords; i += blockDim.x) {
+  for (uint32_t i = tid; i < nwords; i += stride) {
     st_u64_u(d_words + static_cast<size_t>(i) * 8u, all_words[wbase + i]);
   }
 }
@@ -262,15 +264,17 @@ __global__ void scatter_lz4_slices_kernel(uint8_t const* __restrict__ comp_base,
   if (p >= num_parts) { return; }
   uint32_t const len = part_row_len[p];
   if (len == 0u) { return; }
-  uint64_t const csz = lz4_comp_szs[p];
-  uint8_t* d         = d_out + dst_payload_offs[p];
+  uint64_t const csz    = lz4_comp_szs[p];
+  uint8_t* d            = d_out + dst_payload_offs[p];
+  uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.y * blockDim.x;
   if (csz > 0ULL) {
     uint8_t const* s = comp_base + lz4_src_offs[p];
-    for (uint64_t i = threadIdx.x; i < csz; i += blockDim.x) { d[i] = s[i]; }
+    for (uint64_t i = tid; i < csz; i += stride) { d[i] = s[i]; }
   } else {
     size_t const nb  = static_cast<size_t>(len) * elem_size;
     uint8_t const* s = raw_base + static_cast<size_t>(part_row_start[p]) * elem_size;
-    for (size_t i = threadIdx.x; i < nb; i += blockDim.x) { d[i] = s[i]; }
+    for (size_t i = tid; i < nb; i += stride) { d[i] = s[i]; }
   }
 }
 
@@ -452,13 +456,17 @@ __global__ void scatter_raw_fixed_kernel(uint8_t const* __restrict__ src,
   size_t const nb  = static_cast<size_t>(len) * elem_size;
   // Vectorized 4-byte chunk copy when pointers are 4B-aligned (4x higher HBM bandwidth!)
   if (((reinterpret_cast<uintptr_t>(s) | reinterpret_cast<uintptr_t>(d)) & 3u) == 0u) {
-    size_t const n4 = nb >> 2;
-    auto const* s4  = reinterpret_cast<uint32_t const*>(s);
-    auto* d4        = reinterpret_cast<uint32_t*>(d);
-    for (size_t i = threadIdx.x; i < n4; i += blockDim.x) { d4[i] = s4[i]; }
-    for (size_t i = (n4 << 2) + threadIdx.x; i < nb; i += blockDim.x) { d[i] = s[i]; }
+    size_t const n4       = nb >> 2;
+    auto const* s4        = reinterpret_cast<uint32_t const*>(s);
+    auto* d4              = reinterpret_cast<uint32_t*>(d);
+    uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+    uint32_t const stride = gridDim.y * blockDim.x;
+    for (size_t i = tid; i < n4; i += stride) { d4[i] = s4[i]; }
+    for (size_t i = (n4 << 2) + tid; i < nb; i += stride) { d[i] = s[i]; }
   } else {
-    for (size_t i = threadIdx.x; i < nb; i += blockDim.x) { d[i] = s[i]; }
+    uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+    uint32_t const stride = gridDim.y * blockDim.x;
+    for (size_t i = tid; i < nb; i += stride) { d[i] = s[i]; }
   }
 }
 
@@ -506,12 +514,14 @@ __global__ void scatter_raw_string_kernel(int32_t const* __restrict__ in_offs,
   int32_t const end_ch = in_offs[r0 + len];
   uint32_t const nch   = static_cast<uint32_t>(end_ch - base);
 
-  uint8_t* dst  = d_out + dst_payload_offs[p];
-  auto* d_chars = reinterpret_cast<char*>(dst + (len + 1u) * sizeof(int32_t));
-  for (uint32_t i = threadIdx.x; i <= len; i += blockDim.x) {
+  uint8_t* dst          = d_out + dst_payload_offs[p];
+  auto* d_chars         = reinterpret_cast<char*>(dst + (len + 1u) * sizeof(int32_t));
+  uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.y * blockDim.x;
+  for (uint32_t i = tid; i <= len; i += stride) {
     st_u32_u(dst + static_cast<size_t>(i) * 4u, static_cast<uint32_t>(in_offs[r0 + i] - base));
   }
-  for (uint32_t i = threadIdx.x; i < nch; i += blockDim.x) { d_chars[i] = in_chars[base + i]; }
+  for (uint32_t i = tid; i < nch; i += stride) { d_chars[i] = in_chars[base + i]; }
 }
 
 // ---------------- Zero-Sync Batched Coalescing GPU Decoder (Reduce Side!) ----------------
@@ -1413,7 +1423,9 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       static_cast<uint32_t>(n_parts));
   }
 
-  // Launch ONE GPU scatter kernel per column across ALL 200 partitions in parallel!
+  // Launch ONE GPU scatter kernel per column across ALL partitions (with 2D-grid SM saturation when n_parts < 64)!
+  uint32_t const y_sc = (n_parts < 64u) ? 256u : 1u;
+  dim3 const sc_grid(static_cast<uint32_t>(n_parts), y_sc);
   rmm::device_uvector<uint64_t> d_dst_offs(n_parts, stream, mr);
   for (uint32_t c = 0; c < ncols; ++c) {
     ColWork& w    = works[c];
@@ -1426,7 +1438,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
                                     n_parts * sizeof(uint64_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
-      scatter_for256_slices_kernel<<<static_cast<uint32_t>(n_parts), 256, 0, stream.get()>>>(
+      scatter_for256_slices_kernel<<<sc_grid, 256, 0, stream.get()>>>(
         d_base,
         d_dst_offs.data(),
         d_part_blk_start.data(),
@@ -1454,7 +1466,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
                                     n_parts * sizeof(uint64_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
-      scatter_for256_slices_kernel<<<static_cast<uint32_t>(n_parts), 256, 0, stream.get()>>>(
+      scatter_for256_slices_kernel<<<sc_grid, 256, 0, stream.get()>>>(
         d_base,
         d_dst_offs.data(),
         d_part_blk_start.data(),
@@ -1473,7 +1485,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         d_src_offs.data(), w.h_lz4_src_offs.data(), n_parts * sizeof(uint64_t), cudaMemcpyHostToDevice, stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(
         d_comp_szs.data(), w.h_lz4_comp_szs.data(), n_parts * sizeof(uint64_t), cudaMemcpyHostToDevice, stream.get()));
-      scatter_lz4_slices_kernel<<<static_cast<uint32_t>(n_parts), 256, 0, stream.get()>>>(
+      scatter_lz4_slices_kernel<<<sc_grid, 256, 0, stream.get()>>>(
         static_cast<uint8_t const*>(d_all_lz4_comp.data()),
         static_cast<uint8_t const*>(cv.head()) + static_cast<size_t>(cv.offset()) * w.elem_size,
         d_base,
@@ -1490,7 +1502,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
                                     n_parts * sizeof(uint64_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
-      scatter_raw_fixed_kernel<<<static_cast<uint32_t>(n_parts), 256, 0, stream.get()>>>(
+      scatter_raw_fixed_kernel<<<sc_grid, 256, 0, stream.get()>>>(
         static_cast<uint8_t const*>(cv.head()) + static_cast<size_t>(cv.offset()) * w.elem_size,
         d_base,
         d_dst_offs.data(),
@@ -1502,8 +1514,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       cudf::strings_column_view const scv(cv);
       CUDF_CUDA_TRY(cudaMemcpyAsync(
         d_dst_offs.data(), col_dst_pay[c].data(), n_parts * sizeof(uint64_t), cudaMemcpyHostToDevice, stream.get()));
-      uint32_t const y_tiles = (n_parts < 64u) ? 256u : 1u;
-      scatter_bigram_string_kernel<<<dim3(static_cast<uint32_t>(n_parts), y_tiles), 256, 0, stream.get()>>>(
+      scatter_bigram_string_kernel<<<sc_grid, 256, 0, stream.get()>>>(
         scv.offsets().data<int32_t>(),
         scv.chars_begin(stream),
         w.d_bigram_offs.data(),
@@ -1544,7 +1555,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
                                     n_parts * sizeof(uint64_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
-      scatter_raw_string_kernel<<<static_cast<uint32_t>(n_parts), 256, 0, stream.get()>>>(
+      scatter_raw_string_kernel<<<sc_grid, 256, 0, stream.get()>>>(
         scv.offsets().data<int32_t>(),
         scv.chars_begin(stream),
         static_cast<uint32_t>(cv.offset()),
