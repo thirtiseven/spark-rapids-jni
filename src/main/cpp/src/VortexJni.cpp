@@ -33,13 +33,17 @@
 #include <cuda_runtime_api.h>
 #include <dlfcn.h>
 
+#include <atomic>
 #include <bit>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef ARROW_C_DATA_INTERFACE
@@ -368,11 +372,86 @@ struct ZeroCopyArrowOwner {
 
   ~ZeroCopyArrowOwner()
   {
-    // Ensure any queued GPU kernels consuming these buffers finish before returning them to Vortex!
-    cudaStreamSynchronize(cudf::get_default_stream().get());
     decoded_dict_cols.clear();
     holder.reset();
     raw.release();
+  }
+};
+
+// Non-blocking background reaper: records a CUDA event on the hot stream and releases
+// ZeroCopyArrowOwner off the Spark task thread once the event completes (eliminates
+// per-batch cudaStreamSynchronize stalls on Q01's 200 small zero-copy batches!).
+struct ArrowOwnerReaper {
+  struct Pending {
+    cudaEvent_t ev;
+    ZeroCopyArrowOwner* owner;
+  };
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::deque<Pending> queue;
+  bool stop{false};
+  int dev{0};
+  std::thread worker;
+
+  ArrowOwnerReaper()
+  {
+    cudaGetDevice(&dev);
+    worker = std::thread([this]() {
+      cudaSetDevice(dev);
+      while (true) {
+        Pending p{nullptr, nullptr};
+        {
+          std::unique_lock<std::mutex> lk(mtx);
+          cv.wait(lk, [&]() { return !queue.empty() || stop; });
+          if (queue.empty() && stop) { break; }
+          p = queue.front();
+          queue.pop_front();
+        }
+        if (p.ev != nullptr) {
+          cudaEventSynchronize(p.ev);
+          cudaEventDestroy(p.ev);
+        }
+        delete p.owner;
+      }
+    });
+  }
+
+  void enqueue(ZeroCopyArrowOwner* owner, cudaStream_t stream)
+  {
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess &&
+        cudaEventRecord(ev, stream) == cudaSuccess) {
+      {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (!stop) {
+          queue.push_back(Pending{ev, owner});
+          cv.notify_one();
+          return;
+        }
+      }
+      cudaEventSynchronize(ev);
+      cudaEventDestroy(ev);
+    } else {
+      if (ev != nullptr) { cudaEventDestroy(ev); }
+      cudaStreamSynchronize(stream);
+    }
+    delete owner;
+  }
+
+  ~ArrowOwnerReaper()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      stop = true;
+    }
+    cv.notify_all();
+    if (worker.joinable()) { worker.join(); }
+  }
+
+  static ArrowOwnerReaper& get()
+  {
+    static ArrowOwnerReaper inst;
+    return inst;
   }
 };
 
@@ -761,7 +840,9 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_releaseArro
   JNI_TRY
   {
     auto* owner = std::bit_cast<ZeroCopyArrowOwner*>(j_owner);
-    delete owner;
+    if (owner != nullptr) {
+      ArrowOwnerReaper::get().enqueue(owner, cudf::get_default_stream().get());
+    }
   }
   JNI_CATCH(env, );
 }

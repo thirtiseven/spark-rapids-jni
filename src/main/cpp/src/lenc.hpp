@@ -66,6 +66,16 @@ std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
   cuda::stream_ref stream                          = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr                = cudf::get_current_device_resource_ref());
 
+// Column-pruned GPU decode for LightweightCachedBatchSerializer:
+// copies ONLY the selected columns' compressed byte slices H2D and decodes ONLY those columns!
+std::unique_ptr<cudf::table> decode_cached_lshf_projected(
+  uint8_t const* h_lshf,
+  size_t lshf_bytes,
+  std::vector<int32_t> const& selected_cols,
+  std::vector<cudf::data_type> const& selected_dtypes,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 // ---------------- Generic Compiler-Level NVRTC Reduce & Conditional GroupBy ----------------
 
 struct JitReduceProgram;

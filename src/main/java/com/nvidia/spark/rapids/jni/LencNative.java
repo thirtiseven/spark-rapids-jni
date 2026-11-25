@@ -118,6 +118,18 @@ public final class LencNative {
         hostOffsets, typeIds, scales, dictAsDictionary32));
   }
 
+  /** Column-pruned GPU decode for LightweightCachedBatchSerializer (only H2D-copies selected cols!). */
+  public static Table decodeCachedLshfProjected(
+      byte[] lshfBytes, int[] selectedCols, DType[] selectedDTypes) {
+    int[] typeIds = new int[selectedDTypes.length];
+    int[] scales = new int[selectedDTypes.length];
+    for (int i = 0; i < selectedDTypes.length; i++) {
+      typeIds[i] = selectedDTypes[i].getTypeId().getNativeId();
+      scales[i] = selectedDTypes[i].getScale();
+    }
+    return new Table(decodeCachedLshfProjectedNative(lshfBytes, selectedCols, typeIds, scales));
+  }
+
   private static native long decodeDictionaryNative(long colView);
 
   private static native long remapDictionaryToCanonicalNative(long colView, String[] literals);
@@ -127,6 +139,9 @@ public final class LencNative {
   private static native long[] assembleAndDecodeShuffleNative(
       long hostAddr, long dataDevAddr, long dataDevLen, long[] hostOffsets,
       int[] typeIds, int[] scales, byte[] dict32);
+
+  private static native long[] decodeCachedLshfProjectedNative(
+      byte[] lshfBytes, int[] selectedCols, int[] typeIds, int[] scales);
 
   private static native long compileJitReduceNative(String cudaSrc, String kernelName);
 

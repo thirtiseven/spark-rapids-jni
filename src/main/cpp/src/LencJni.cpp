@@ -163,6 +163,41 @@ Java_com_nvidia_spark_rapids_jni_LencNative_assembleAndDecodeShuffleNative(JNIEn
   JNI_CATCH(env, nullptr);
 }
 
+JNIEXPORT jlongArray JNICALL
+Java_com_nvidia_spark_rapids_jni_LencNative_decodeCachedLshfProjectedNative(JNIEnv* env,
+                                                                            jclass,
+                                                                            jbyteArray j_lshf_bytes,
+                                                                            jintArray j_sel_cols,
+                                                                            jintArray j_type_ids,
+                                                                            jintArray j_scales)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    cudf::jni::native_jbyteArray nb(env, j_lshf_bytes);
+    cudf::jni::native_jintArray sc(env, j_sel_cols);
+    cudf::jni::native_jintArray tids(env, j_type_ids);
+    cudf::jni::native_jintArray scs(env, j_scales);
+
+    std::vector<int32_t> sel_cols(sc.data(), sc.data() + sc.size());
+    std::vector<cudf::data_type> dtypes;
+    dtypes.reserve(static_cast<size_t>(tids.size()));
+    for (int i = 0; i < tids.size(); ++i) {
+      auto tid = static_cast<cudf::type_id>(tids[i]);
+      if (tid == cudf::type_id::DECIMAL32 || tid == cudf::type_id::DECIMAL64 ||
+          tid == cudf::type_id::DECIMAL128) {
+        dtypes.emplace_back(tid, scs[i]);
+      } else {
+        dtypes.emplace_back(tid);
+      }
+    }
+    auto tbl = rapids::jni::lenc::decode_cached_lshf_projected(
+      reinterpret_cast<uint8_t const*>(nb.data()), static_cast<size_t>(nb.size()), sel_cols, dtypes);
+    return cudf::jni::convert_table_for_return(env, std::move(tbl));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
 JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_compileJitReduceNative(
   JNIEnv* env, jclass, jstring j_cuda_src, jstring j_kernel_name)
 {

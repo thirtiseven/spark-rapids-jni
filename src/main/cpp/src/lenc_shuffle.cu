@@ -19,6 +19,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
@@ -334,22 +335,26 @@ __global__ void scatter_bigram_string_kernel(int32_t const* __restrict__ in_offs
   if (len == 0u) { return; }
   uint32_t const p_start = part_row_start[p];
   uint8_t* dst           = d_out + dst_payload_offs[p];
+  uint32_t const tid     = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride  = gridDim.y * blockDim.x;
 
-  // Write 256-byte symbol table at start of payload
-  for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) {
-    uint16_t const v = sym_table[i];
-    dst[i * 2u]      = static_cast<uint8_t>(v & 0xFFu);
-    dst[i * 2u + 1u] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+  // Write 256-byte symbol table at start of payload (only blockIdx.y == 0)
+  if (blockIdx.y == 0u) {
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) {
+      uint16_t const v = sym_table[i];
+      dst[i * 2u]      = static_cast<uint8_t>(v & 0xFFu);
+      dst[i * 2u + 1u] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+    }
   }
   uint8_t* offs_dst = dst + 256u;
   int32_t const cb0 = comp_offs[p_start];
-  for (uint32_t i = threadIdx.x; i <= len; i += blockDim.x) {
+  for (uint32_t i = tid; i <= len; i += stride) {
     st_u32_u(offs_dst + static_cast<size_t>(i) * 4u, static_cast<uint32_t>(comp_offs[p_start + i] - cb0));
   }
   uint8_t* ch_dst = offs_dst + static_cast<size_t>(len + 1u) * sizeof(int32_t);
 
-  // Compress every string row in parallel directly into ch_dst!
-  for (uint32_t r = threadIdx.x; r < len; r += blockDim.x) {
+  // Compress every string row in parallel across all SMs directly into ch_dst!
+  for (uint32_t r = tid; r < len; r += stride) {
     uint32_t const gr = p_start + r;
     int32_t const s   = in_offs[src_col_off + gr];
     int32_t const e   = in_offs[src_col_off + gr + 1u];
@@ -533,8 +538,10 @@ __global__ void batched_decode_fixed_kernel(uint8_t const* __restrict__ d_data,
   DecodeSliceTask const tk = tasks[t];
   uint32_t const n         = tk.num_rows;
   if (n == 0u) { return; }
-  uint8_t const* d_pay = d_data + tk.payload_off;
-  OutT* dst            = out_col + tk.out_row_off;
+  uint8_t const* d_pay  = d_data + tk.payload_off;
+  OutT* dst             = out_col + tk.out_row_off;
+  uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.y * blockDim.x;
 
   if (tk.encoding == static_cast<uint8_t>(ShufEnc::FOR_BITPACK)) {
     uint32_t const nc     = (n + kShufBlkSize - 1u) / kShufBlkSize;
@@ -546,7 +553,7 @@ __global__ void batched_decode_fixed_kernel(uint8_t const* __restrict__ d_data,
     auto const* bws       = d_pay + off_bw;
     auto const* cwo       = reinterpret_cast<uint32_t const*>(d_pay + off_cwo);
     auto const* words     = reinterpret_cast<uint64_t const*>(d_pay + off_pack);
-    for (uint32_t idx = threadIdx.x; idx < n; idx += blockDim.x) {
+    for (uint32_t idx = tid; idx < n; idx += stride) {
       uint32_t const c   = idx >> 8;
       uint32_t const bw  = bws[c];
       int64_t const base = mins[c];
@@ -565,7 +572,7 @@ __global__ void batched_decode_fixed_kernel(uint8_t const* __restrict__ d_data,
     }
   } else {
     auto const* src = reinterpret_cast<OutT const*>(d_pay);
-    for (uint32_t idx = threadIdx.x; idx < n; idx += blockDim.x) { dst[idx] = src[idx]; }
+    for (uint32_t idx = tid; idx < n; idx += stride) { dst[idx] = src[idx]; }
   }
 }
 
@@ -647,13 +654,15 @@ __global__ void batched_decode_str_lens_kernel(uint8_t const* __restrict__ d_dat
   uint8_t const* d_pay     = d_data + tk.payload_off;
   cudf::bitmask_type const* sm =
     tk.has_nulls ? reinterpret_cast<cudf::bitmask_type const*>(d_data + tk.null_off) : nullptr;
-  int32_t* dst = out_lens + tk.out_row_off;
+  int32_t* dst          = out_lens + tk.out_row_off;
+  uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.y * blockDim.x;
 
   if (tk.encoding == static_cast<uint8_t>(ShufEnc::DICT_BITPACK)) {
     auto const* dh          = reinterpret_cast<DictPayloadHeader const*>(d_pay);
     auto const* d_doffs     = reinterpret_cast<int32_t const*>(d_pay + sizeof(DictPayloadHeader));
     auto const* d_codes_pay = d_pay + dh->codes_offset;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    for (uint32_t i = tid; i < n; i += stride) {
       if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) {
         dst[i] = 0;
       } else {
@@ -664,7 +673,7 @@ __global__ void batched_decode_str_lens_kernel(uint8_t const* __restrict__ d_dat
   } else if (tk.encoding == static_cast<uint8_t>(ShufEnc::STRING_BIGRAM)) {
     auto const* comp_offs = reinterpret_cast<int32_t const*>(d_pay + 256u);
     uint8_t const* ch_ptr = d_pay + 256u + static_cast<size_t>(n + 1u) * sizeof(int32_t);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    for (uint32_t i = tid; i < n; i += stride) {
       if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) {
         dst[i] = 0;
       } else {
@@ -690,7 +699,7 @@ __global__ void batched_decode_str_lens_kernel(uint8_t const* __restrict__ d_dat
     }
   } else {
     auto const* s_offs = reinterpret_cast<int32_t const*>(d_pay);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    for (uint32_t i = tid; i < n; i += stride) {
       if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) {
         dst[i] = 0;
       } else {
@@ -698,7 +707,7 @@ __global__ void batched_decode_str_lens_kernel(uint8_t const* __restrict__ d_dat
       }
     }
   }
-  if (t == 0u && threadIdx.x == 0u) { out_lens[total_rows] = 0; }
+  if (t == 0u && tid == 0u) { out_lens[total_rows] = 0; }
 }
 
 __global__ void batched_decode_str_copy_kernel(uint8_t const* __restrict__ d_data,
@@ -714,6 +723,8 @@ __global__ void batched_decode_str_copy_kernel(uint8_t const* __restrict__ d_dat
   uint8_t const* d_pay     = d_data + tk.payload_off;
   cudf::bitmask_type const* sm =
     tk.has_nulls ? reinterpret_cast<cudf::bitmask_type const*>(d_data + tk.null_off) : nullptr;
+  uint32_t const tid    = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.y * blockDim.x;
 
   if (tk.encoding == static_cast<uint8_t>(ShufEnc::DICT_BITPACK)) {
     auto const* dh      = reinterpret_cast<DictPayloadHeader const*>(d_pay);
@@ -721,7 +732,7 @@ __global__ void batched_decode_str_copy_kernel(uint8_t const* __restrict__ d_dat
     auto const* d_dch   = reinterpret_cast<char const*>(
       d_pay + sizeof(DictPayloadHeader) + (dh->dict_size + 1u) * sizeof(int32_t));
     auto const* d_codes_pay = d_pay + dh->codes_offset;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    for (uint32_t i = tid; i < n; i += stride) {
       if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) { continue; }
       uint32_t const grow = tk.out_row_off + i;
       int32_t const dst   = out_offs[grow];
@@ -740,7 +751,7 @@ __global__ void batched_decode_str_copy_kernel(uint8_t const* __restrict__ d_dat
     __syncthreads();
     auto const* comp_offs = reinterpret_cast<int32_t const*>(d_pay + 256u);
     uint8_t const* ch_ptr = d_pay + 256u + static_cast<size_t>(n + 1u) * sizeof(int32_t);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    for (uint32_t i = tid; i < n; i += stride) {
       if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) { continue; }
       uint32_t const grow = tk.out_row_off + i;
       int32_t const cs    = comp_offs[i];
@@ -766,7 +777,7 @@ __global__ void batched_decode_str_copy_kernel(uint8_t const* __restrict__ d_dat
   } else {
     auto const* s_offs  = reinterpret_cast<int32_t const*>(d_pay);
     auto const* s_chars = reinterpret_cast<char const*>(d_pay + (n + 1u) * sizeof(int32_t));
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    for (uint32_t i = tid; i < n; i += stride) {
       if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) { continue; }
       uint32_t const grow = tk.out_row_off + i;
       int32_t const dst   = out_offs[grow];
@@ -1018,10 +1029,21 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     } else if (w.tid == cudf::type_id::STRING) {
       bool used_dict = false;
       if (nrows >= 256) {
-        auto dc = cudf::dictionary::encode(cv, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-        cudf::dictionary_column_view const dcv(dc->view());
-        uint32_t const ds = static_cast<uint32_t>(dcv.keys_size());
-        if (ds > 0 && ds <= 1024) {
+        // Fast 2048-row cardinality probe: skips wasted full-column GPU sort/hash on
+        // high-cardinality strings (c_name/c_address/c_phone/c_comment/l_comment)!
+        bool try_full_dict = true;
+        if (nrows > 4096u) {
+          auto samp = cudf::slice(cv, {0, 2048}, stream)[0];
+          auto sdc  = cudf::dictionary::encode(samp, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+          uint32_t const sds =
+            static_cast<uint32_t>(cudf::dictionary_column_view(sdc->view()).keys_size());
+          if (sds > 512u) { try_full_dict = false; }
+        }
+        if (try_full_dict) {
+          auto dc = cudf::dictionary::encode(cv, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+          cudf::dictionary_column_view const dcv(dc->view());
+          uint32_t const ds = static_cast<uint32_t>(dcv.keys_size());
+          if (ds > 0 && ds <= 1024) {
           cudf::strings_column_view const ksv(dcv.keys());
           int32_t kb = 0;
           CUDF_CUDA_TRY(cudaMemcpyAsync(
@@ -1063,6 +1085,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
               w.part_payload_sz[p] = o_cd + o_pk + static_cast<size_t>(nw) * sizeof(uint64_t);
             }
           }
+        }
         }
       }
       if (!used_dict) {
@@ -1479,7 +1502,8 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       cudf::strings_column_view const scv(cv);
       CUDF_CUDA_TRY(cudaMemcpyAsync(
         d_dst_offs.data(), col_dst_pay[c].data(), n_parts * sizeof(uint64_t), cudaMemcpyHostToDevice, stream.get()));
-      scatter_bigram_string_kernel<<<static_cast<uint32_t>(n_parts), 256, 0, stream.get()>>>(
+      uint32_t const y_tiles = (n_parts < 64u) ? 256u : 1u;
+      scatter_bigram_string_kernel<<<dim3(static_cast<uint32_t>(n_parts), y_tiles), 256, 0, stream.get()>>>(
         scv.offsets().data<int32_t>(),
         scv.chars_begin(stream),
         w.d_bigram_offs.data(),
@@ -1636,7 +1660,8 @@ std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
                                                 stream,
                                                 mr);
       auto* d_oo    = out_offs->mutable_view().data<int32_t>();
-      batched_decode_str_lens_kernel<<<ntk, 256, 0, stream.get()>>>(
+      uint32_t const y_tiles = (ntk < 64u) ? 256u : 1u;
+      batched_decode_str_lens_kernel<<<dim3(ntk, y_tiles), 256, 0, stream.get()>>>(
         d_data, d_tasks.data(), ntk, d_oo, total_rows);
       thrust::exclusive_scan(rmm::exec_policy_nosync(stream), d_oo, d_oo + total_rows + 1u, d_oo);
       int32_t total_ch = 0;
@@ -1735,7 +1760,7 @@ std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
               d_data, d_t2.data(), n2, d_oo, static_cast<char*>(out_ch.data()));
           }
         } else {
-          batched_decode_str_copy_kernel<<<ntk, 256, 0, stream.get()>>>(
+          batched_decode_str_copy_kernel<<<dim3(ntk, y_tiles), 256, 0, stream.get()>>>(
             d_data, d_tasks.data(), ntk, d_oo, static_cast<char*>(out_ch.data()));
         }
       }
@@ -1816,17 +1841,18 @@ std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
         rmm::device_uvector<DecodeSliceTask> d_t2(n2, stream, mr);
         CUDF_CUDA_TRY(cudaMemcpyAsync(
           d_t2.data(), non_lz4.data(), n2 * sizeof(DecodeSliceTask), cudaMemcpyHostToDevice, stream.get()));
+        uint32_t const y2 = (n2 < 64u) ? 256u : 1u;
         if (esz == 8) {
-          batched_decode_fixed_kernel<int64_t><<<n2, 256, 0, stream.get()>>>(
+          batched_decode_fixed_kernel<int64_t><<<dim3(n2, y2), 256, 0, stream.get()>>>(
             d_data, d_t2.data(), n2, static_cast<int64_t*>(col->mutable_view().head()));
         } else if (esz == 4) {
-          batched_decode_fixed_kernel<int32_t><<<n2, 256, 0, stream.get()>>>(
+          batched_decode_fixed_kernel<int32_t><<<dim3(n2, y2), 256, 0, stream.get()>>>(
             d_data, d_t2.data(), n2, static_cast<int32_t*>(col->mutable_view().head()));
         } else if (esz == 2) {
-          batched_decode_fixed_kernel<int16_t><<<n2, 256, 0, stream.get()>>>(
+          batched_decode_fixed_kernel<int16_t><<<dim3(n2, y2), 256, 0, stream.get()>>>(
             d_data, d_t2.data(), n2, static_cast<int16_t*>(col->mutable_view().head()));
         } else {
-          batched_decode_fixed_kernel<int8_t><<<n2, 256, 0, stream.get()>>>(
+          batched_decode_fixed_kernel<int8_t><<<dim3(n2, y2), 256, 0, stream.get()>>>(
             d_data, d_t2.data(), n2, static_cast<int8_t*>(col->mutable_view().head()));
         }
       }
@@ -1836,6 +1862,72 @@ std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
 
   stream.sync();
   return std::make_unique<cudf::table>(std::move(out_cols));
+}
+
+// Column-pruned GPU decode for LightweightCachedBatchSerializer:
+// parses the LSHF header on CPU, repacks ONLY the selected columns' compressed bytes into a
+// tiny compact frame, H2D-copies ONLY those bytes, and decodes ONLY the selected columns!
+std::unique_ptr<cudf::table> decode_cached_lshf_projected(
+  uint8_t const* h_lshf,
+  size_t lshf_bytes,
+  std::vector<int32_t> const& selected_cols,
+  std::vector<cudf::data_type> const& selected_dtypes,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(lshf_bytes >= sizeof(LshfHeader), "decode_cached_lshf_projected: truncated header");
+  LshfHeader lh{};
+  std::memcpy(&lh, h_lshf, sizeof(lh));
+  CUDF_EXPECTS(lh.magic == kLshfMagic, "decode_cached_lshf_projected: bad LSHF magic");
+
+  auto const* src_metas = reinterpret_cast<ShufColMeta const*>(h_lshf + sizeof(lh));
+  uint32_t const nsel   = static_cast<uint32_t>(selected_cols.size());
+  size_t const hdr_sz   = align8(sizeof(LshfHeader) + static_cast<size_t>(nsel) * sizeof(ShufColMeta));
+
+  // Compute exact compact size of ONLY the selected columns
+  size_t cur = hdr_sz;
+  std::vector<ShufColMeta> dst_metas(nsel);
+  for (uint32_t i = 0; i < nsel; ++i) {
+    int32_t const sc = selected_cols[i];
+    CUDF_EXPECTS(sc >= 0 && static_cast<uint32_t>(sc) < lh.num_cols,
+                 "decode_cached_lshf_projected: column index out of range");
+    ShufColMeta const& sm = src_metas[sc];
+    ShufColMeta dm        = sm;
+    dm.payload_offset     = cur;
+    cur                   = align8(cur + sm.payload_size);
+    if (sm.has_nulls) {
+      dm.null_offset = cur;
+      cur            = align8(cur + sm.null_size);
+    } else {
+      dm.null_offset = 0;
+    }
+    dst_metas[i] = dm;
+  }
+
+  // Pack ONLY selected columns' compressed slices into compact host buffer & single H2D copy!
+  std::vector<uint8_t> compact(cur, 0);
+  LshfHeader new_lh = lh;
+  new_lh.num_cols   = nsel;
+  std::memcpy(compact.data(), &new_lh, sizeof(new_lh));
+  std::memcpy(compact.data() + sizeof(new_lh), dst_metas.data(), nsel * sizeof(ShufColMeta));
+  for (uint32_t i = 0; i < nsel; ++i) {
+    ShufColMeta const& sm = src_metas[selected_cols[i]];
+    ShufColMeta const& dm = dst_metas[i];
+    if (sm.payload_size > 0) {
+      std::memcpy(compact.data() + dm.payload_offset, h_lshf + sm.payload_offset, sm.payload_size);
+    }
+    if (sm.has_nulls && sm.null_size > 0) {
+      std::memcpy(compact.data() + dm.null_offset, h_lshf + sm.null_offset, sm.null_size);
+    }
+  }
+
+  rmm::device_buffer d_compact(compact.data(), compact.size(), stream, mr);
+  int64_t const h_offs[2] = {0, static_cast<int64_t>(compact.size())};
+  auto tbl                = assemble_and_decode_shuffle_from_device(
+    compact.data(), static_cast<uint8_t const*>(d_compact.data()), compact.size(), h_offs, 1u,
+    selected_dtypes, {}, stream, mr);
+  stream.sync();
+  return tbl;
 }
 
 }  // namespace rapids::jni::lenc
