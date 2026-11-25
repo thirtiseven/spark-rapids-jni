@@ -231,7 +231,13 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_compileLtoPr
 }
 
 JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runLtoProgramNative(
-  JNIEnv* env, jclass, jlong j_prog, jlong j_plan, jlong j_host_addr, jobjectArray j_dict_lits)
+  JNIEnv* env,
+  jclass,
+  jlong j_prog,
+  jlong j_plan,
+  jlong j_host_addr,
+  jobjectArray j_dict_lits,
+  jlong j_selected_rows_view)
 {
   JNI_NULL_CHECK(env, j_prog, "lto program is null", nullptr);
   JNI_NULL_CHECK(env, j_plan, "plan is null", nullptr);
@@ -241,6 +247,9 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runLtoP
     auto* prog       = std::bit_cast<cudf::transform_program*>(j_prog);
     auto const* plan = std::bit_cast<rapids::jni::lenc::ReadPlan const*>(j_plan);
     auto const* src  = std::bit_cast<uint8_t const*>(j_host_addr);
+    auto const* sel  = (j_selected_rows_view != 0)
+                         ? reinterpret_cast<cudf::column_view const*>(j_selected_rows_view)
+                         : nullptr;
     std::vector<std::vector<std::string>> dict_lits;
     if (j_dict_lits != nullptr) {
       jsize const n = env->GetArrayLength(j_dict_lits);
@@ -254,7 +263,48 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runLtoP
         }
       }
     }
-    auto tbl = rapids::jni::lenc::run_lto_program(*prog, *plan, src, dict_lits);
+    auto tbl = rapids::jni::lenc::run_lto_program(*prog, *plan, src, dict_lits, sel);
+    return cudf::jni::convert_table_for_return(env, std::move(tbl));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_compactMaskIndicesNative(
+  JNIEnv* env, jclass, jlong j_mask_view)
+{
+  JNI_NULL_CHECK(env, j_mask_view, "mask view is null", 0);
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto const* cv = reinterpret_cast<cudf::column_view const*>(j_mask_view);
+    return cudf::jni::release_as_jlong(rapids::jni::lenc::compact_mask_indices(*cv));
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_decodeFromHostSelectedNative(
+  JNIEnv* env,
+  jclass,
+  jlong j_plan,
+  jlong j_host_addr,
+  jbyteArray j_dict32,
+  jlong j_selected_rows_view)
+{
+  JNI_NULL_CHECK(env, j_plan, "plan is null", nullptr);
+  JNI_NULL_CHECK(env, j_selected_rows_view, "selected rows view is null", nullptr);
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto const* plan = std::bit_cast<rapids::jni::lenc::ReadPlan const*>(j_plan);
+    auto const* src  = std::bit_cast<uint8_t const*>(j_host_addr);
+    auto const* sel  = reinterpret_cast<cudf::column_view const*>(j_selected_rows_view);
+    std::vector<uint8_t> d32;
+    if (j_dict32 != nullptr) {
+      cudf::jni::native_jbyteArray nb(env, j_dict32);
+      d32.resize(static_cast<size_t>(nb.size()));
+      for (size_t i = 0; i < d32.size(); ++i) { d32[i] = static_cast<uint8_t>(nb[i]); }
+    }
+    auto tbl = rapids::jni::lenc::decode_from_host_selected(*plan, src, d32, *sel);
     return cudf::jni::convert_table_for_return(env, std::move(tbl));
   }
   JNI_CATCH(env, nullptr);

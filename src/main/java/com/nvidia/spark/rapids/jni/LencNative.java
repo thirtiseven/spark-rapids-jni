@@ -75,6 +75,13 @@ public final class LencNative {
       return new Table(decodeFromHostNative(handle, addr, dictAsDictionary32));
     }
 
+    public Table decodeFromHostSelected(
+        HostMemoryBuffer src, byte[] dictAsDictionary32, ColumnView selectedRowIds) {
+      long addr = totalPackedBytes() > 0 ? src.getAddress() : 0L;
+      return new Table(decodeFromHostSelectedNative(
+          handle, addr, dictAsDictionary32, selectedRowIds.getNativeView()));
+    }
+
     public Table decodeAndEvalFused(HostMemoryBuffer src, int exprKind, long param0) {
       long addr = totalPackedBytes() > 0 ? src.getAddress() : 0L;
       return new Table(decodeAndEvalFusedNative(handle, addr, exprKind, param0));
@@ -106,8 +113,17 @@ public final class LencNative {
     }
 
     public Table run(ReadPlan plan, HostMemoryBuffer hostSrc, String[][] dictLiteralsPerCol) {
+      return runSelected(plan, hostSrc, dictLiteralsPerCol, null);
+    }
+
+    public Table runSelected(
+        ReadPlan plan,
+        HostMemoryBuffer hostSrc,
+        String[][] dictLiteralsPerCol,
+        ColumnView selectedRowIds) {
       long addr = plan.totalPackedBytes() > 0 ? hostSrc.getAddress() : 0L;
-      return new Table(runLtoProgramNative(handle, plan.nativeHandle(), addr, dictLiteralsPerCol));
+      long selView = selectedRowIds != null ? selectedRowIds.getNativeView() : 0L;
+      return new Table(runLtoProgramNative(handle, plan.nativeHandle(), addr, dictLiteralsPerCol, selView));
     }
 
     @Override
@@ -128,6 +144,10 @@ public final class LencNative {
     return new LtoProgram(compileLtoProgramNative(handles));
   }
 
+  public static ColumnVector compactMaskIndices(ColumnView boolMask) {
+    return new ColumnVector(compactMaskIndicesNative(boolMask.getNativeView()));
+  }
+
   public static ColumnVector decodeDictionary(ColumnView dictCol) {
     return new ColumnVector(decodeDictionaryNative(dictCol.getNativeView()));
   }
@@ -145,13 +165,17 @@ public final class LencNative {
   private static native void readToHostNative(String path, long planHandle, long hostAddr);
   private static native long[] decodeFromHostNative(
       long planHandle, long hostAddr, byte[] dictAsDictionary32);
+  private static native long[] decodeFromHostSelectedNative(
+      long planHandle, long hostAddr, byte[] dictAsDictionary32, long selectedRowsView);
   private static native long[] decodeAndEvalFusedNative(
       long planHandle, long hostAddr, int exprKind, long param0);
   private static native void destroyPlanNative(long planHandle);
   private static native long decodeDictionaryNative(long colViewHandle);
   private static native long remapDictionaryToCanonicalNative(long colViewHandle, String[] literals);
+  private static native long compactMaskIndicesNative(long maskViewHandle);
   private static native long compileLtoProgramNative(long[] compiledAstHandles);
   private static native long[] runLtoProgramNative(
-      long ltoProgHandle, long planHandle, long hostAddr, String[][] dictLiteralsPerCol);
+      long ltoProgHandle, long planHandle, long hostAddr, String[][] dictLiteralsPerCol,
+      long selectedRowsView);
   private static native void destroyLtoProgramNative(long ltoProgHandle);
 }

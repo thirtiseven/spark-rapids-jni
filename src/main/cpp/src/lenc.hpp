@@ -36,21 +36,30 @@ constexpr uint32_t kChunkSize = 1024;
 constexpr char kMagic[8]      = {'L', 'E', 'N', 'C', '0', '0', '0', '1'};
 
 enum class Encoding : uint8_t {
-  FOR_BITPACK      = 0,  // 1024-row mini-blocks: min_val + bit_width + packed uint64 words
-  DICT_BITPACK     = 1,  // STRING: dict_offsets + dict_chars + FOR_BITPACK int32 codes
-  RLE_INT          = 2,  // INT32/INT64/DATE32: chunk_start_run + run_ends + run_vals
-  RAW_FIXED        = 3,  // Raw fixed-width contiguous array (fallback)
-  SCALED_FLOAT_FOR = 4,  // Lossless decimal-scaled FLOAT32/FLOAT64 via FOR_BITPACK
-  RAW_STRING       = 5,  // Raw Arrow string offsets + chars (fallback for >65536 distinct)
+  FOR_BITPACK       = 0,  // 1024-row mini-blocks: min_val + bit_width + packed uint64 words
+  DICT_BITPACK      = 1,  // STRING: dict_offsets + dict_chars + FOR_BITPACK int32 codes
+  RLE_INT           = 2,  // INT32/INT64/DATE32: chunk_start_run + run_ends + run_vals
+  RAW_FIXED         = 3,  // Raw fixed-width contiguous array (fallback)
+  SCALED_FLOAT_FOR  = 4,  // Lossless decimal-scaled FLOAT32/FLOAT64 via FOR_BITPACK
+  RAW_STRING        = 5,  // Raw Arrow string offsets + chars (fallback)
+  DELTA_FOR_BITPACK = 6,  // 1024-row mini-blocks: first_val + min_delta + bit-packed deltas
+  NVCOMP_LZ4_STR    = 7,  // High-cardinality STRING compressed via GPU nvCOMP Batched LZ4
+  NVCOMP_LZ4_FIXED  = 8,  // High-entropy fixed-width compressed via GPU nvCOMP Batched LZ4
 };
 
 enum class ColType : uint8_t {
-  INT32   = 0,
-  INT64   = 1,
-  FLOAT32 = 2,
-  FLOAT64 = 3,
-  DATE32  = 4,
-  STRING  = 5,
+  INT32        = 0,
+  INT64        = 1,
+  FLOAT32      = 2,
+  FLOAT64      = 3,
+  DATE32       = 4,
+  STRING       = 5,
+  BOOL8        = 6,
+  INT8         = 7,
+  INT16        = 8,
+  TIMESTAMP_US = 9,
+  DECIMAL32    = 10,
+  DECIMAL64    = 11,
 };
 
 struct FileHeader {
@@ -86,6 +95,14 @@ struct DictPayloadHeader {
   uint64_t codes_offset;  // relative to payload start, 8-byte aligned
 };
 static_assert(sizeof(DictPayloadHeader) == 16);
+
+struct Lz4PayloadHeader {
+  uint32_t num_chunks;
+  uint32_t chunk_size;
+  uint64_t uncompressed_bytes;
+  uint64_t total_chars;  // for NVCOMP_LZ4_STR; 0 for NVCOMP_LZ4_FIXED
+};
+static_assert(sizeof(Lz4PayloadHeader) == 24);
 
 struct ReadPlan {
   FileHeader header{};
@@ -179,6 +196,26 @@ std::unique_ptr<cudf::table> run_lto_program(
   ReadPlan const& plan,
   uint8_t const* host_src,
   std::vector<std::vector<std::string>> const& dict_literals_per_col,
+  cudf::column_view const* selected_rows = nullptr,
+  cuda::stream_ref stream                = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr      = cudf::get_current_device_resource_ref());
+
+/**
+ * Compact a BOOL8 filter mask into an INT32 column of surviving row indices (non-null && true).
+ */
+std::unique_ptr<cudf::column> compact_mask_indices(
+  cudf::column_view const& bool_mask,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * Late-materialized decode: decode ONLY the surviving `selected_rows` (INT32) from packed .lenc!
+ */
+std::unique_ptr<cudf::table> decode_from_host_selected(
+  ReadPlan const& plan,
+  uint8_t const* host_src,
+  std::vector<uint8_t> const& dict_as_dictionary32,
+  cudf::column_view const& selected_rows,
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
