@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -136,6 +138,47 @@ std::unique_ptr<cudf::table> decode_and_eval_fused(
   uint8_t const* host_src,
   int32_t expr_kind,
   int64_t param0,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * Decode a DICTIONARY32 column into a standard Arrow STRING column on GPU.
+ */
+std::unique_ptr<cudf::column> decode_dictionary(
+  cudf::column_view const& dict_col,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * Remap a DICTIONARY32 string column's per-row indices into canonical query-literal IDs
+ * (0..query_literals.size()-1, or -1 if unmatched) as an INT32 column preserving null_mask.
+ * Copies only the tiny dictionary keys to host; zero string expansion on GPU!
+ */
+std::unique_ptr<cudf::column> remap_dictionary_to_canonical(
+  cudf::column_view const& dict_col,
+  std::vector<std::string> const& query_literals,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * Direction B: Compile a generic dynamic LTO-linked transform_program combining arbitrary Spark
+ * AST-JIT expressions with inlineable .lenc LTO-IR decode-in-register UDFs (aligned with
+ * NVIDIA/cudf#24869).
+ */
+std::unique_ptr<cudf::transform_program> compile_lto_program(
+  std::vector<std::reference_wrapper<cudf::ast::expression const>> const& expressions,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * Direction B: Execute a compiled LTO decode-in-register transform_program directly on a packed
+ * compressed .lenc host buffer without materializing any uncompressed input columns in HBM.
+ */
+std::unique_ptr<cudf::table> run_lto_program(
+  cudf::transform_program& program,
+  ReadPlan const& plan,
+  uint8_t const* host_src,
+  std::vector<std::vector<std::string>> const& dict_literals_per_col,
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 

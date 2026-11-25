@@ -19,9 +19,12 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/udf.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -1173,6 +1176,478 @@ std::unique_ptr<cudf::table> decode_and_eval_fused(ReadPlan const& plan,
 
   stream.sync();
   return std::make_unique<cudf::table>(std::move(out_cols));
+}
+
+namespace {
+
+template <typename IdxT>
+__global__ void dict_remap_kernel(IdxT const* __restrict__ indices,
+                                  int32_t const* __restrict__ remap,
+                                  cudf::bitmask_type const* __restrict__ null_mask,
+                                  int32_t* __restrict__ out,
+                                  uint32_t n,
+                                  uint32_t dict_size)
+{
+  uint32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    if (null_mask != nullptr && !cudf::bit_is_set(null_mask, static_cast<cudf::size_type>(idx))) {
+      out[idx] = -1;
+    } else {
+      uint32_t const k = static_cast<uint32_t>(indices[idx]);
+      out[idx]         = (k < dict_size) ? remap[k] : -1;
+    }
+  }
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::column> decode_dictionary(cudf::column_view const& dict_col,
+                                                cuda::stream_ref stream,
+                                                rmm::device_async_resource_ref mr)
+{
+  cudf::dictionary_column_view const dcv(dict_col);
+  return cudf::dictionary::decode(dcv, stream, mr);
+}
+
+std::unique_ptr<cudf::column> remap_dictionary_to_canonical(
+  cudf::column_view const& dict_col,
+  std::vector<std::string> const& query_literals,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  cudf::dictionary_column_view const dcv(dict_col);
+  uint32_t const num_rows  = static_cast<uint32_t>(dcv.size());
+  cudf::column_view keys_v = dcv.keys();
+  uint32_t const dict_size = static_cast<uint32_t>(keys_v.size());
+  CUDF_EXPECTS(keys_v.type().id() == cudf::type_id::STRING,
+               "remap_dictionary_to_canonical: keys must be STRING");
+
+  std::unordered_map<std::string_view, int32_t> lit_map;
+  lit_map.reserve(query_literals.size() * 2 + 1);
+  for (size_t i = 0; i < query_literals.size(); ++i) {
+    lit_map.emplace(std::string_view{query_literals[i]}, static_cast<int32_t>(i));
+  }
+
+  std::vector<int32_t> h_remap(dict_size, -1);
+  if (dict_size > 0) {
+    cudf::strings_column_view const scv(keys_v);
+    std::vector<int32_t> h_offs(dict_size + 1, 0);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(h_offs.data(),
+                                  scv.offsets().data<int32_t>() + keys_v.offset(),
+                                  (dict_size + 1) * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    int32_t const base_off = h_offs[0];
+    int32_t const total_ch = h_offs[dict_size] - base_off;
+    std::vector<char> h_chars(static_cast<size_t>(total_ch));
+    if (total_ch > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(h_chars.data(),
+                                    scv.chars_begin(stream) + base_off,
+                                    static_cast<size_t>(total_ch),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+    }
+    for (uint32_t k = 0; k < dict_size; ++k) {
+      int32_t const s = h_offs[k] - base_off;
+      int32_t const e = h_offs[k + 1] - base_off;
+      auto it         = lit_map.find(std::string_view(h_chars.data() + s, static_cast<size_t>(e - s)));
+      if (it != lit_map.end()) { h_remap[k] = it->second; }
+    }
+  }
+
+  bool const has_nulls = dict_col.nullable() && dict_col.null_count() > 0;
+  auto null_buf        = has_nulls
+                           ? cudf::copy_bitmask(dict_col, stream, mr)
+                           : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto const null_cnt  = has_nulls ? dict_col.null_count() : 0;
+  auto out_col         = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                           static_cast<cudf::size_type>(num_rows),
+                                           std::move(null_buf),
+                                           null_cnt,
+                                           stream,
+                                           mr);
+
+  if (num_rows > 0) {
+    rmm::device_buffer d_remap(std::max<size_t>(dict_size, 1) * sizeof(int32_t), stream, mr);
+    if (dict_size > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        d_remap.data(), h_remap.data(), dict_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream.get()));
+    }
+    cudf::column_view const idx_col = dcv.indices();
+    auto const* d_null              = has_nulls ? out_col->view().null_mask() : nullptr;
+    auto* d_out                     = out_col->mutable_view().data<int32_t>();
+    auto const* d_rm                = static_cast<int32_t const*>(d_remap.data());
+    constexpr uint32_t kBlock       = 256;
+    uint32_t const grid             = (num_rows + kBlock - 1) / kBlock;
+    auto const off                  = dcv.offset();
+
+    switch (idx_col.type().id()) {
+      case cudf::type_id::INT32:
+        dict_remap_kernel<int32_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<int32_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::UINT32:
+        dict_remap_kernel<uint32_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<uint32_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::INT16:
+        dict_remap_kernel<int16_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<int16_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::UINT16:
+        dict_remap_kernel<uint16_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<uint16_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::INT8:
+        dict_remap_kernel<int8_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<int8_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::UINT8:
+        dict_remap_kernel<uint8_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<uint8_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      default: CUDF_FAIL("remap_dictionary_to_canonical: unsupported dictionary index type");
+    }
+    stream.sync();
+  }
+  return out_col;
+}
+
+// ---------------- Direction B: Generic Dynamic LTO Decode-in-Register ----------------
+
+namespace {
+
+constexpr int kMaxLtoCols = 16;
+
+struct LencLtoColDesc {
+  // FOR+BitPack (also used for SCALED_FLOAT_FOR and DICT_BITPACK codes)
+  int64_t const* min_vals;
+  uint8_t const* bit_widths;
+  uint32_t const* chunk_word_offsets;
+  uint64_t const* packed_words;
+  // RLE
+  uint32_t const* rle_chunk_start;
+  uint32_t const* rle_run_ends;
+  int64_t const* rle_run_vals;
+  uint32_t rle_num_runs;
+  // DICT canonical remap & RAW pointer & optional null mask
+  int32_t const* dict_remap;
+  uint32_t dict_size;
+  uint8_t const* raw_ptr;
+  cudf::bitmask_type const* null_mask;
+  double inv_scale;
+};
+
+struct LencLtoBatchDesc {
+  LencLtoColDesc cols[kMaxLtoCols];
+};
+
+// Device CUDA source compiled ONCE into an LTO-IR module via cudf::compile_cuda_to_lto_ir()
+// and linked into ANY dynamically generated Spark AST-JIT kernel via nvJitLink!
+char const* const kLencLtoDeviceSrc = R"CUDA(
+#include <cudf/errc.hpp>
+#include <cudf/types.hpp>
+#include <cudf/wrappers/timestamps.hpp>
+#include <cstdint>
+
+struct LencLtoColDesc {
+  int64_t const* min_vals;
+  uint8_t const* bit_widths;
+  uint32_t const* chunk_word_offsets;
+  uint64_t const* packed_words;
+  uint32_t const* rle_chunk_start;
+  uint32_t const* rle_run_ends;
+  int64_t const* rle_run_vals;
+  uint32_t rle_num_runs;
+  int32_t const* dict_remap;
+  uint32_t dict_size;
+  uint8_t const* raw_ptr;
+  cudf::bitmask_type const* null_mask;
+  double inv_scale;
+};
+
+struct LencLtoBatchDesc {
+  LencLtoColDesc cols[16];
+};
+
+__device__ __forceinline__ bool lenc_is_null(LencLtoColDesc const& col, uint32_t row)
+{
+  if (col.null_mask == nullptr) { return false; }
+  uint32_t const word = col.null_mask[row >> 5];
+  return ((word >> (row & 31u)) & 1u) == 0u;
+}
+
+__device__ __forceinline__ int64_t lenc_unpack_for(LencLtoColDesc const& col, uint32_t row)
+{
+  uint32_t const c   = row >> 10;
+  uint32_t const b   = col.bit_widths[c];
+  int64_t const base = col.min_vals[c];
+  if (b == 0u) { return base; }
+  uint32_t const local    = row & 1023u;
+  uint32_t const bit_pos  = local * b;
+  uint32_t const word_idx = col.chunk_word_offsets[c] + (bit_pos >> 6);
+  uint32_t const bit_off  = bit_pos & 63u;
+  uint64_t val            = col.packed_words[word_idx] >> bit_off;
+  if (bit_off + b > 64u) { val |= col.packed_words[word_idx + 1] << (64u - bit_off); }
+  uint64_t const mask = (b == 64u) ? ~0ULL : ((1ULL << b) - 1ULL);
+  return base + static_cast<int64_t>(val & mask);
+}
+
+__device__ __forceinline__ int64_t lenc_unpack_rle(LencLtoColDesc const& col, uint32_t row)
+{
+  uint32_t idx = col.rle_chunk_start[row >> 10];
+  while (idx + 1u < col.rle_num_runs && col.rle_run_ends[idx] <= row) { ++idx; }
+  return col.rle_run_vals[idx];
+}
+
+extern "C" __device__ cudf::errc lenc_decode_for_i64(
+  int64_t* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = lenc_unpack_for(col, static_cast<uint32_t>(row));
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_for_i32(
+  int32_t* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = static_cast<int32_t>(lenc_unpack_for(col, static_cast<uint32_t>(row)));
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_for_date32(
+  cudf::timestamp_D* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = cudf::timestamp_D{cudf::duration_D{static_cast<int32_t>(lenc_unpack_for(col, static_cast<uint32_t>(row)))}};
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_scaled_f32(
+  float* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  int64_t const iv = lenc_unpack_for(col, static_cast<uint32_t>(row));
+  *out             = static_cast<float>(static_cast<double>(iv) * col.inv_scale);
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_scaled_f64(
+  double* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  int64_t const iv = lenc_unpack_for(col, static_cast<uint32_t>(row));
+  *out             = static_cast<double>(iv) * col.inv_scale;
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_rle_i64(
+  int64_t* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = lenc_unpack_rle(col, static_cast<uint32_t>(row));
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_rle_i32(
+  int32_t* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = static_cast<int32_t>(lenc_unpack_rle(col, static_cast<uint32_t>(row)));
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_dict_code(
+  int32_t* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  uint32_t const code = static_cast<uint32_t>(lenc_unpack_for(col, static_cast<uint32_t>(row)));
+  *out                = (code < col.dict_size) ? col.dict_remap[code] : -1;
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_raw_i64(
+  int64_t* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = reinterpret_cast<int64_t const*>(col.raw_ptr)[row];
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_raw_i32(
+  int32_t* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = reinterpret_cast<int32_t const*>(col.raw_ptr)[row];
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_raw_f32(
+  float* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = reinterpret_cast<float const*>(col.raw_ptr)[row];
+  return cudf::errc::SUCCESS;
+}
+
+extern "C" __device__ cudf::errc lenc_decode_raw_f64(
+  double* out, void* ud, cudf::size_type row, int32_t slot)
+{
+  auto const& col = static_cast<LencLtoBatchDesc const*>(ud)->cols[slot];
+  if (lenc_is_null(col, static_cast<uint32_t>(row))) { return cudf::errc::USER_RESERVED; }
+  *out = reinterpret_cast<double const*>(col.raw_ptr)[row];
+  return cudf::errc::SUCCESS;
+}
+
+#define LENC_SLOT_WRAPPERS(S) \
+  extern "C" __device__ cudf::errc lenc_decode_for_i64_s##S(int64_t* o, void* u, cudf::size_type r) { return lenc_decode_for_i64(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_for_i32_s##S(int32_t* o, void* u, cudf::size_type r) { return lenc_decode_for_i32(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_for_date32_s##S(cudf::timestamp_D* o, void* u, cudf::size_type r) { return lenc_decode_for_date32(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_scaled_f32_s##S(float* o, void* u, cudf::size_type r) { return lenc_decode_scaled_f32(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_scaled_f64_s##S(double* o, void* u, cudf::size_type r) { return lenc_decode_scaled_f64(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_rle_i64_s##S(int64_t* o, void* u, cudf::size_type r) { return lenc_decode_rle_i64(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_rle_i32_s##S(int32_t* o, void* u, cudf::size_type r) { return lenc_decode_rle_i32(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_dict_code_s##S(int32_t* o, void* u, cudf::size_type r) { return lenc_decode_dict_code(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_raw_i64_s##S(int64_t* o, void* u, cudf::size_type r) { return lenc_decode_raw_i64(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_raw_i32_s##S(int32_t* o, void* u, cudf::size_type r) { return lenc_decode_raw_i32(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_raw_f32_s##S(float* o, void* u, cudf::size_type r) { return lenc_decode_raw_f32(o, u, r, S); } \
+  extern "C" __device__ cudf::errc lenc_decode_raw_f64_s##S(double* o, void* u, cudf::size_type r) { return lenc_decode_raw_f64(o, u, r, S); }
+
+LENC_SLOT_WRAPPERS(0)  LENC_SLOT_WRAPPERS(1)  LENC_SLOT_WRAPPERS(2)  LENC_SLOT_WRAPPERS(3)
+LENC_SLOT_WRAPPERS(4)  LENC_SLOT_WRAPPERS(5)  LENC_SLOT_WRAPPERS(6)  LENC_SLOT_WRAPPERS(7)
+LENC_SLOT_WRAPPERS(8)  LENC_SLOT_WRAPPERS(9)  LENC_SLOT_WRAPPERS(10) LENC_SLOT_WRAPPERS(11)
+LENC_SLOT_WRAPPERS(12) LENC_SLOT_WRAPPERS(13) LENC_SLOT_WRAPPERS(14) LENC_SLOT_WRAPPERS(15)
+)CUDA";
+
+cudf::compiled_fragment const& get_lenc_lto_fragment()
+{
+  static cudf::compiled_fragment const frag =
+    cudf::compile_cuda_to_lto_ir(kLencLtoDeviceSrc, {}, {}, {}, false);
+  return frag;
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::transform_program> compile_lto_program(
+  std::vector<std::reference_wrapper<cudf::ast::expression const>> const& expressions,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const& frag          = get_lenc_lto_fragment();
+  cudf::lto_fragment view[] = {frag.view()};
+  cudf::table_view empty_table{};
+  return std::make_unique<cudf::transform_program>(
+    empty_table, expressions, cudf::lto_fragments{view}, stream, mr);
+}
+
+std::unique_ptr<cudf::table> run_lto_program(
+  cudf::transform_program& program,
+  ReadPlan const& plan,
+  uint8_t const* host_src,
+  std::vector<std::vector<std::string>> const& dict_literals_per_col,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  uint32_t const num_rows = plan.header.num_rows;
+  size_t const ncols      = plan.metas.size();
+  CUDF_EXPECTS(ncols <= static_cast<size_t>(kMaxLtoCols), "lenc LTO: max 16 projected cols");
+
+  rmm::device_buffer d_packed(plan.total_packed_bytes, stream, mr);
+  if (plan.total_packed_bytes > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      d_packed.data(), host_src, plan.total_packed_bytes, cudaMemcpyHostToDevice, stream.get()));
+  }
+  auto const* d_base = static_cast<uint8_t const*>(d_packed.data());
+
+  LencLtoBatchDesc h_desc{};
+  std::vector<rmm::device_buffer> d_remaps;
+
+  for (size_t i = 0; i < ncols; ++i) {
+    ColumnMeta const& m = plan.metas[i];
+    auto const* d_pay   = d_base + plan.packed_payload_offsets[i];
+    auto const enc      = static_cast<Encoding>(m.encoding);
+    LencLtoColDesc& cd  = h_desc.cols[i];
+    if (m.has_nulls && m.null_mask_size > 0) {
+      cd.null_mask = reinterpret_cast<cudf::bitmask_type const*>(d_base + plan.packed_null_offsets[i]);
+    }
+    if (enc == Encoding::FOR_BITPACK || enc == Encoding::SCALED_FLOAT_FOR) {
+      auto fv               = make_for_view(d_pay, num_rows);
+      cd.min_vals           = fv.min_vals;
+      cd.bit_widths         = fv.bit_widths;
+      cd.chunk_word_offsets = fv.chunk_word_offsets;
+      cd.packed_words       = fv.packed_words;
+      cd.inv_scale =
+        (m.scale_exp10 == 0) ? 1.0 : ((m.scale_exp10 == 2) ? 0.01 : 0.0001);
+    } else if (enc == Encoding::RLE_INT) {
+      auto rv            = make_rle_view(d_pay, num_rows, m.extra);
+      cd.rle_chunk_start = rv.chunk_start_run;
+      cd.rle_run_ends    = rv.run_ends;
+      cd.rle_run_vals    = rv.run_vals;
+      cd.rle_num_runs    = rv.num_runs;
+    } else if (enc == Encoding::DICT_BITPACK) {
+      DictPayloadHeader dh{};
+      uint8_t const* h_pay = host_src + plan.packed_payload_offsets[i];
+      std::memcpy(&dh, h_pay, sizeof(dh));
+      auto fv               = make_for_view(d_pay + dh.codes_offset, num_rows);
+      cd.min_vals           = fv.min_vals;
+      cd.bit_widths         = fv.bit_widths;
+      cd.chunk_word_offsets = fv.chunk_word_offsets;
+      cd.packed_words       = fv.packed_words;
+      cd.dict_size          = dh.dict_size;
+
+      // Resolve dictionary keys -> canonical query literal IDs on host (~2 us!)
+      std::vector<int32_t> h_remap(dh.dict_size, -1);
+      if (i < dict_literals_per_col.size() && !dict_literals_per_col[i].empty()) {
+        std::unordered_map<std::string_view, int32_t> lit_map;
+        auto const& lits = dict_literals_per_col[i];
+        lit_map.reserve(lits.size() * 2 + 1);
+        for (size_t l = 0; l < lits.size(); ++l) {
+          lit_map.emplace(std::string_view{lits[l]}, static_cast<int32_t>(l));
+        }
+        auto const* dict_offs = reinterpret_cast<int32_t const*>(h_pay + sizeof(dh));
+        auto const* dict_ch   = reinterpret_cast<char const*>(
+          h_pay + sizeof(dh) + (dh.dict_size + 1) * sizeof(int32_t));
+        for (uint32_t k = 0; k < dh.dict_size; ++k) {
+          int32_t const s = dict_offs[k];
+          int32_t const e = dict_offs[k + 1];
+          auto it         = lit_map.find(std::string_view(dict_ch + s, static_cast<size_t>(e - s)));
+          if (it != lit_map.end()) { h_remap[k] = it->second; }
+        }
+      }
+      rmm::device_buffer d_rm(std::max<size_t>(dh.dict_size, 1) * sizeof(int32_t), stream, mr);
+      if (dh.dict_size > 0) {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_rm.data(), h_remap.data(), dh.dict_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream.get()));
+      }
+      cd.dict_remap = static_cast<int32_t const*>(d_rm.data());
+      d_remaps.push_back(std::move(d_rm));
+    } else if (enc == Encoding::RAW_FIXED) {
+      cd.raw_ptr = d_pay;
+    }
+  }
+
+  rmm::device_buffer d_desc(sizeof(LencLtoBatchDesc), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    d_desc.data(), &h_desc, sizeof(LencLtoBatchDesc), cudaMemcpyHostToDevice, stream.get()));
+
+  auto result = program.run_with_user_data(
+    d_desc.data(), static_cast<cudf::size_type>(num_rows), stream, mr);
+  stream.sync();
+  return result;
 }
 
 }  // namespace rapids::jni::lenc

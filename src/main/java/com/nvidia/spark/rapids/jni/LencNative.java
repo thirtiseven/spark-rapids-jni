@@ -16,9 +16,12 @@
 
 package com.nvidia.spark.rapids.jni;
 
+import ai.rapids.cudf.ColumnVector;
+import ai.rapids.cudf.ColumnView;
 import ai.rapids.cudf.HostMemoryBuffer;
 import ai.rapids.cudf.NativeDepsLoader;
 import ai.rapids.cudf.Table;
+import ai.rapids.cudf.ast.CompiledExpression;
 
 /**
  * JNI wrapper for the lightweight GPU columnar format (.lenc):
@@ -42,6 +45,18 @@ public final class LencNative {
 
     public int numRows() {
       return planNumRowsNative(handle);
+    }
+
+    public byte[] columnEncodings() {
+      return planColumnEncodingsNative(handle);
+    }
+
+    public byte[] columnTypes() {
+      return planColumnTypesNative(handle);
+    }
+
+    long nativeHandle() {
+      return handle;
     }
 
     public void readToHost(String path, HostMemoryBuffer dst) {
@@ -83,14 +98,60 @@ public final class LencNative {
     return new ReadPlan(planReadNative(path, colIndices));
   }
 
+  public static final class LtoProgram implements AutoCloseable {
+    private long handle;
+
+    private LtoProgram(long handle) {
+      this.handle = handle;
+    }
+
+    public Table run(ReadPlan plan, HostMemoryBuffer hostSrc, String[][] dictLiteralsPerCol) {
+      long addr = plan.totalPackedBytes() > 0 ? hostSrc.getAddress() : 0L;
+      return new Table(runLtoProgramNative(handle, plan.nativeHandle(), addr, dictLiteralsPerCol));
+    }
+
+    @Override
+    public void close() {
+      if (handle != 0L) {
+        long h = handle;
+        handle = 0L;
+        destroyLtoProgramNative(h);
+      }
+    }
+  }
+
+  public static LtoProgram compileLtoProgram(CompiledExpression... exprs) {
+    long[] handles = new long[exprs.length];
+    for (int i = 0; i < exprs.length; i++) {
+      handles[i] = exprs[i].getJitNativeHandle();
+    }
+    return new LtoProgram(compileLtoProgramNative(handles));
+  }
+
+  public static ColumnVector decodeDictionary(ColumnView dictCol) {
+    return new ColumnVector(decodeDictionaryNative(dictCol.getNativeView()));
+  }
+
+  public static ColumnVector remapDictionaryToCanonical(ColumnView dictCol, String[] queryLiterals) {
+    return new ColumnVector(remapDictionaryToCanonicalNative(dictCol.getNativeView(), queryLiterals));
+  }
+
   private static native void writeTableNative(long tableViewHandle, String path);
   private static native long planReadNative(String path, int[] colIndices);
   private static native long planTotalBytesNative(long planHandle);
   private static native int planNumRowsNative(long planHandle);
+  private static native byte[] planColumnEncodingsNative(long planHandle);
+  private static native byte[] planColumnTypesNative(long planHandle);
   private static native void readToHostNative(String path, long planHandle, long hostAddr);
   private static native long[] decodeFromHostNative(
       long planHandle, long hostAddr, byte[] dictAsDictionary32);
   private static native long[] decodeAndEvalFusedNative(
       long planHandle, long hostAddr, int exprKind, long param0);
   private static native void destroyPlanNative(long planHandle);
+  private static native long decodeDictionaryNative(long colViewHandle);
+  private static native long remapDictionaryToCanonicalNative(long colViewHandle, String[] literals);
+  private static native long compileLtoProgramNative(long[] compiledAstHandles);
+  private static native long[] runLtoProgramNative(
+      long ltoProgHandle, long planHandle, long hostAddr, String[][] dictLiteralsPerCol);
+  private static native void destroyLtoProgramNative(long ltoProgHandle);
 }
