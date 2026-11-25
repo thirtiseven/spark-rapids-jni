@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -358,6 +359,23 @@ struct VortexMultiFileScanState {
   }
 };
 
+// True Zero-Copy ArrowDeviceArray Owner: keeps Vortex's GPU buffers & cuDF table_view holder
+// alive across all ColumnVectors in the batch until the last GpuColumnVector is closed!
+struct ZeroCopyArrowOwner {
+  RawArrowBatch raw;
+  std::optional<cudf::unique_table_view_t> holder;
+  std::vector<std::unique_ptr<cudf::column>> decoded_dict_cols;
+
+  ~ZeroCopyArrowOwner()
+  {
+    // Ensure any queued GPU kernels consuming these buffers finish before returning them to Vortex!
+    cudaStreamSynchronize(cudf::get_default_stream().get());
+    decoded_dict_cols.clear();
+    holder.reset();
+    raw.release();
+  }
+};
+
 }  // namespace
 
 extern "C" {
@@ -663,6 +681,89 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_maskT
     return ret.get_jArray();
   }
   JNI_CATCH(env, nullptr);
+}
+
+// True Zero-Copy: returns [ownerPtr, approxBytes, colViewHandle_0, ..., colViewHandle_{nc-1}]
+// ZERO GPU D2D copy and ZERO CPU stream.sync() on the hot read path!
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZeroCopyBatchNative(
+  JNIEnv* env, jclass, jlong j_handle, jbyteArray j_dict32_mask)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* st    = std::bit_cast<VortexMultiFileScanState*>(j_handle);
+    auto stream = cudf::get_default_stream();
+    auto mr     = cudf::get_current_device_resource_ref();
+
+    std::vector<uint8_t> keep_dict32;
+    if (j_dict32_mask != nullptr) {
+      cudf::jni::native_jbyteArray nb(env, j_dict32_mask);
+      keep_dict32.resize(static_cast<size_t>(nb.size()));
+      for (size_t i = 0; i < keep_dict32.size(); ++i) {
+        keep_dict32[i] = static_cast<uint8_t>(nb[i]);
+      }
+    }
+
+    auto owner = std::make_unique<ZeroCopyArrowOwner>();
+    if (!st->pop_next(owner->raw)) { return nullptr; }
+
+    // Zero-copy Arrow C Device import (automatically calls cudaStreamWaitEvent on stream!)
+    owner->holder.emplace(cudf::from_arrow_device(&owner->raw.schema, &owner->raw.dev_arr, stream, mr));
+    auto tv       = **owner->holder;
+    auto const nc = tv.num_columns();
+
+    cudf::jni::native_jlongArray ret(env, static_cast<jsize>(2 + nc));
+    size_t approx_bytes = 0;
+    std::vector<cudf::column_view*> allocated_views;
+    allocated_views.reserve(static_cast<size_t>(nc));
+    try {
+      for (cudf::size_type c = 0; c < nc; ++c) {
+        auto cv = tv.column(c);
+        bool const want_d32 =
+          (static_cast<size_t>(c) < keep_dict32.size() && keep_dict32[static_cast<size_t>(c)] != 0);
+        if (cv.type().id() == cudf::type_id::DICTIONARY32 && !want_d32) {
+          auto dec = cudf::dictionary::decode(cudf::dictionary_column_view(cv), stream, mr);
+          auto* v  = new cudf::column_view(dec->view());
+          allocated_views.push_back(v);
+          owner->decoded_dict_cols.push_back(std::move(dec));
+          approx_bytes += static_cast<size_t>(tv.num_rows()) * 16u;
+        } else {
+          auto* v = new cudf::column_view(cv);
+          allocated_views.push_back(v);
+          auto id = cv.type().id();
+          if (id == cudf::type_id::STRING) {
+            approx_bytes += static_cast<size_t>(cv.size()) * 16u;
+          } else if (id == cudf::type_id::DICTIONARY32) {
+            approx_bytes += static_cast<size_t>(cv.size()) * 4u;
+          } else {
+            approx_bytes += static_cast<size_t>(cv.size()) * cudf::size_of(cv.type());
+          }
+        }
+      }
+    } catch (...) {
+      for (auto* v : allocated_views) { delete v; }
+      throw;
+    }
+
+    ret[0] = std::bit_cast<jlong>(owner.release());
+    ret[1] = static_cast<jlong>(std::max<size_t>(approx_bytes, 64u));
+    for (cudf::size_type c = 0; c < nc; ++c) {
+      ret[2 + c] = std::bit_cast<jlong>(allocated_views[static_cast<size_t>(c)]);
+    }
+    return ret.get_jArray();
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_releaseArrowOwnerNative(
+  JNIEnv* env, jclass, jlong j_owner)
+{
+  JNI_TRY
+  {
+    auto* owner = std::bit_cast<ZeroCopyArrowOwner*>(j_owner);
+    delete owner;
+  }
+  JNI_CATCH(env, );
 }
 
 }  // extern "C"

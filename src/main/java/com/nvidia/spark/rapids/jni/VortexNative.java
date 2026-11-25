@@ -16,13 +16,18 @@
 
 package com.nvidia.spark.rapids.jni;
 
+import ai.rapids.cudf.ColumnVector;
 import ai.rapids.cudf.ColumnView;
+import ai.rapids.cudf.DeviceMemoryBuffer;
+import ai.rapids.cudf.MemoryBuffer;
 import ai.rapids.cudf.NativeDepsLoader;
 import ai.rapids.cudf.Table;
 
 /**
- * JNI bridge for Tier 1 Standard Vortex GPU scanning & writing via official vortex-cuda-ffi
- * with single-pass zero-double-copy coalescing and GPU 2-Phase Late Materialization.
+ * JNI bridge for Tier 1+ Standard Vortex GPU scanning & writing via official vortex-cuda-ffi:
+ *   - True Zero-Copy ArrowDeviceArray -> ColumnVector (zero GPU D2D copy, zero read-path sync!)
+ *   - Single-pass zero-double-copy coalescing fallback
+ *   - GPU 2-Phase Late Materialization via vx_cuda_scan_path_device_batches_with_rows
  */
 public final class VortexNative {
   static {
@@ -35,11 +40,73 @@ public final class VortexNative {
     writeTableNative(table.getNativeView(), colNames, path);
   }
 
+  private static final class ArrowOwnerCleaner extends MemoryBuffer.MemoryBufferCleaner {
+    private long ownerHandle;
+
+    ArrowOwnerCleaner(long ownerHandle) {
+      this.ownerHandle = ownerHandle;
+    }
+
+    @Override
+    protected synchronized boolean cleanImpl(boolean logErrorIfNotClean) {
+      if (ownerHandle != 0L) {
+        long h = ownerHandle;
+        ownerHandle = 0L;
+        releaseArrowOwnerNative(h);
+        return true;
+      }
+      return false;
+    }
+
+    @Override
+    public boolean isClean() {
+      return ownerHandle == 0L;
+    }
+  }
+
   public static final class MultiFileScan implements AutoCloseable {
     private long handle;
 
     private MultiFileScan(long handle) {
       this.handle = handle;
+    }
+
+    /**
+     * True Zero-Copy ArrowDeviceArray -> ColumnVector[]:
+     * Zero GPU D2D copy and zero read-path stream.sync(). All columns share one ref-counted
+     * DeviceMemoryBuffer whose cleaner releases the ArrowDeviceArray when the last column closes.
+     */
+    public ColumnVector[] nextZeroCopyBatch(byte[] dict32Mask) {
+      if (handle == 0L) {
+        return null;
+      }
+      long[] res = nextZeroCopyBatchNative(handle, dict32Mask);
+      if (res == null) {
+        return null;
+      }
+      long ownerPtr = res[0];
+      long approxBytes = res[1];
+      int ncols = res.length - 2;
+      ColumnVector[] cvs = new ColumnVector[ncols];
+      boolean ok = false;
+      DeviceMemoryBuffer ownerBuf = DeviceMemoryBuffer.fromExternalCleaner(
+          0L, approxBytes, new ArrowOwnerCleaner(ownerPtr));
+      try {
+        for (int i = 0; i < ncols; i++) {
+          cvs[i] = ColumnVector.fromViewWithContiguousAllocation(res[2 + i], ownerBuf);
+        }
+        ok = true;
+        return cvs;
+      } finally {
+        ownerBuf.close();
+        if (!ok) {
+          for (ColumnVector cv : cvs) {
+            if (cv != null) {
+              cv.close();
+            }
+          }
+        }
+      }
     }
 
     public Table nextCoalescedBatch(byte[] dict32Mask, long coalesceTargetBytes) {
@@ -65,14 +132,12 @@ public final class VortexNative {
     return new MultiFileScan(openMultiScanNative(filePaths, colNames, batchRows, prefetchCap));
   }
 
-  /** Opt V2: Scan a single Vortex file projecting colNames (optionally taking ONLY rowIndices!). */
   public static Table scanFileWithRows(
       String path, String[] colNames, long[] rowIndices, byte[] dict32Mask) {
     long[] cols = scanFileWithRowsNative(path, colNames, rowIndices, dict32Mask);
     return cols == null ? null : new Table(cols);
   }
 
-  /** Opt V2: Compact a BOOL8 GPU mask column into strictly-sorted surviving row indices. */
   public static long[] maskToRowIndices(ColumnView maskCol) {
     return maskToRowIndicesNative(maskCol.getNativeView());
   }
@@ -81,6 +146,10 @@ public final class VortexNative {
 
   private static native long openMultiScanNative(
       String[] filePaths, String[] colNames, long batchRows, int prefetchCap);
+
+  private static native long[] nextZeroCopyBatchNative(long handle, byte[] dict32Mask);
+
+  private static native void releaseArrowOwnerNative(long ownerPtr);
 
   private static native long[] nextCoalescedBatchNative(
       long handle, byte[] dict32Mask, long coalesceTargetBytes);
