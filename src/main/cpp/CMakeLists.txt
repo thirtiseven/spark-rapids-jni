@@ -291,7 +291,6 @@ add_library(
   src/iceberg/iceberg_truncate.cu
   src/json_utils.cu
   src/join_primitives.cu
-  src/lenc.cu
   src/lenc_shuffle.cu
   src/lenc_reduce.cu
   src/list_slice.cu

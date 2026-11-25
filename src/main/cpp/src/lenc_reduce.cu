@@ -128,68 +128,6 @@ struct CudaDriverApi {
   }
 };
 
-__host__ __device__ constexpr uint64_t align8_jr(uint64_t v) { return (v + 7ULL) & ~7ULL; }
-
-struct ForViewJR {
-  int64_t const* min_vals;
-  uint8_t const* bit_widths;
-  uint32_t const* chunk_word_offsets;
-  uint64_t const* packed_words;
-};
-
-ForViewJR make_for_view_jr(uint8_t const* base, uint32_t n)
-{
-  uint32_t const nc = (n + kChunkSize - 1u) / kChunkSize;
-  size_t const o_m  = 0;
-  size_t const o_b  = o_m + nc * sizeof(int64_t);
-  size_t const o_c  = ((o_b + nc * sizeof(uint8_t)) + 3ULL) & ~3ULL;
-  size_t const o_p  = align8_jr(o_c + nc * sizeof(uint32_t));
-  return ForViewJR{reinterpret_cast<int64_t const*>(base + o_m),
-                   base + o_b,
-                   reinterpret_cast<uint32_t const*>(base + o_c),
-                   reinterpret_cast<uint64_t const*>(base + o_p)};
-}
-
-__global__ void jr_chunk_prune_kernel(int64_t const* __restrict__ min_vals,
-                                      uint8_t const* __restrict__ bit_widths,
-                                      uint32_t num_chunks,
-                                      int32_t op,
-                                      uint8_t is_float,
-                                      double inv_scale,
-                                      int64_t int_bound,
-                                      double double_bound,
-                                      uint32_t* __restrict__ chunk_active)
-{
-  uint32_t const c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= num_chunks || chunk_active[c] == 0u) { return; }
-  uint8_t const bw = bit_widths[c];
-  if (bw >= 63u) { return; }
-  int64_t const lo   = min_vals[c];
-  uint64_t const rng = (bw == 0u) ? 0ULL : ((1ULL << bw) - 1ULL);
-  if (lo > 0 && static_cast<uint64_t>(lo) + rng > static_cast<uint64_t>(INT64_MAX)) { return; }
-  int64_t const hi = lo + static_cast<int64_t>(rng);
-  bool skip        = false;
-  if (is_float) {
-    double const fmin = static_cast<double>(lo) * inv_scale;
-    double const fmax = static_cast<double>(hi) * inv_scale;
-    double const b    = double_bound;
-    double const eps  = 1e-6 * ((fabs(b) > 1.0) ? fabs(b) : 1.0);
-    if (op == 0) skip = (fmin >= b + eps);
-    else if (op == 1) skip = (fmin > b + eps);
-    else if (op == 2) skip = (fmax <= b - eps);
-    else if (op == 3) skip = (fmax < b - eps);
-    else if (op == 4) skip = (b < fmin - eps || b > fmax + eps);
-  } else {
-    int64_t const b = int_bound;
-    if (op == 0) skip = (lo >= b);
-    else if (op == 1) skip = (lo > b);
-    else if (op == 2) skip = (hi <= b);
-    else if (op == 3) skip = (hi < b);
-    else if (op == 4) skip = (b < lo || b > hi);
-  }
-  if (skip) { chunk_active[c] = 0u; }
-}
-
 __global__ void jr_bool_to_bitmask_kernel(
   uint8_t const* __restrict__ valid_bytes, cudf::bitmask_type* __restrict__ mask, uint32_t n)
 {
@@ -366,7 +304,140 @@ static std::unique_ptr<cudf::table> finalize_lowcard_output(
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+template <typename IdxT>
+__global__ void dict_remap_kernel(IdxT const* __restrict__ indices,
+                                  int32_t const* __restrict__ remap,
+                                  cudf::bitmask_type const* __restrict__ null_mask,
+                                  int32_t* __restrict__ out,
+                                  uint32_t n,
+                                  uint32_t dict_size)
+{
+  uint32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    if (null_mask != nullptr && !cudf::bit_is_set(null_mask, static_cast<cudf::size_type>(idx))) {
+      out[idx] = -1;
+    } else {
+      uint32_t const k = static_cast<uint32_t>(indices[idx]);
+      out[idx]         = (k < dict_size) ? remap[k] : -1;
+    }
+  }
+}
+
 }  // namespace
+
+std::unique_ptr<cudf::column> decode_dictionary(cudf::column_view const& dict_col,
+                                                cuda::stream_ref stream,
+                                                rmm::device_async_resource_ref mr)
+{
+  cudf::dictionary_column_view const dcv(dict_col);
+  return cudf::dictionary::decode(dcv, stream, mr);
+}
+
+std::unique_ptr<cudf::column> remap_dictionary_to_canonical(
+  cudf::column_view const& dict_col,
+  std::vector<std::string> const& query_literals,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  cudf::dictionary_column_view const dcv(dict_col);
+  uint32_t const num_rows  = static_cast<uint32_t>(dcv.size());
+  cudf::column_view keys_v = dcv.keys();
+  uint32_t const dict_size = static_cast<uint32_t>(keys_v.size());
+  CUDF_EXPECTS(keys_v.type().id() == cudf::type_id::STRING,
+               "remap_dictionary_to_canonical: keys must be STRING");
+
+  std::unordered_map<std::string_view, int32_t> lit_map;
+  lit_map.reserve(query_literals.size() * 2 + 1);
+  for (size_t i = 0; i < query_literals.size(); ++i) {
+    lit_map.emplace(std::string_view{query_literals[i]}, static_cast<int32_t>(i));
+  }
+
+  std::vector<int32_t> h_remap(dict_size, -1);
+  if (dict_size > 0) {
+    cudf::strings_column_view const scv(keys_v);
+    std::vector<int32_t> h_offs(dict_size + 1, 0);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(h_offs.data(),
+                                  scv.offsets().data<int32_t>() + keys_v.offset(),
+                                  (dict_size + 1) * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    int32_t const base_off = h_offs[0];
+    int32_t const total_ch = h_offs[dict_size] - base_off;
+    std::vector<char> h_chars(static_cast<size_t>(total_ch));
+    if (total_ch > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(h_chars.data(),
+                                    scv.chars_begin(stream) + base_off,
+                                    static_cast<size_t>(total_ch),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+    }
+    for (uint32_t k = 0; k < dict_size; ++k) {
+      int32_t const s = h_offs[k] - base_off;
+      int32_t const e = h_offs[k + 1] - base_off;
+      auto it         = lit_map.find(std::string_view(h_chars.data() + s, static_cast<size_t>(e - s)));
+      if (it != lit_map.end()) { h_remap[k] = it->second; }
+    }
+  }
+
+  bool const has_nulls = dict_col.nullable() && dict_col.null_count() > 0;
+  auto null_buf        = has_nulls
+                           ? cudf::copy_bitmask(dict_col, stream, mr)
+                           : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto const null_cnt  = has_nulls ? dict_col.null_count() : 0;
+  auto out_col         = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                           static_cast<cudf::size_type>(num_rows),
+                                           std::move(null_buf),
+                                           null_cnt,
+                                           stream,
+                                           mr);
+
+  if (num_rows > 0) {
+    rmm::device_buffer d_remap(std::max<size_t>(dict_size, 1) * sizeof(int32_t), stream, mr);
+    if (dict_size > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        d_remap.data(), h_remap.data(), dict_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream.get()));
+    }
+    cudf::column_view const idx_col = dcv.indices();
+    auto const* d_null              = has_nulls ? out_col->view().null_mask() : nullptr;
+    auto* d_out                     = out_col->mutable_view().data<int32_t>();
+    auto const* d_rm                = static_cast<int32_t const*>(d_remap.data());
+    constexpr uint32_t kBlock       = 256;
+    uint32_t const grid             = (num_rows + kBlock - 1) / kBlock;
+    auto const off                  = dcv.offset();
+
+    switch (idx_col.type().id()) {
+      case cudf::type_id::INT32:
+        dict_remap_kernel<int32_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<int32_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::UINT32:
+        dict_remap_kernel<uint32_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<uint32_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::INT16:
+        dict_remap_kernel<int16_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<int16_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::UINT16:
+        dict_remap_kernel<uint16_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<uint16_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::INT8:
+        dict_remap_kernel<int8_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<int8_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      case cudf::type_id::UINT8:
+        dict_remap_kernel<uint8_t><<<grid, kBlock, 0, stream.get()>>>(
+          idx_col.data<uint8_t>() + off, d_rm, d_null, d_out, num_rows, dict_size);
+        break;
+      default: CUDF_FAIL("remap_dictionary_to_canonical: unsupported dictionary index type");
+    }
+    stream.sync();
+  }
+  return out_col;
+}
 
 struct JitReduceProgram {
   CUmodule mod{nullptr};
@@ -424,259 +495,6 @@ void destroy_jit_reduce_program(JitReduceProgram* prog)
     if (prog->mod != nullptr) { CudaDriverApi::get().mod_unload(prog->mod); }
     delete prog;
   }
-}
-
-std::unique_ptr<cudf::table> run_jit_reduce_lenc(JitReduceProgram& prog,
-                                                 ReadPlan const& plan,
-                                                 uint8_t const* host_src,
-                                                 std::vector<std::vector<std::string>> const& dict_lits,
-                                                 std::vector<int32_t> const& group_key_slots,
-                                                 int32_t max_groups,
-                                                 std::vector<uint8_t> const& agg_kinds,
-                                                 std::vector<ChunkRangePred> const& chunk_preds,
-                                                 cuda::stream_ref stream,
-                                                 rmm::device_async_resource_ref mr)
-{
-  uint32_t const n = plan.header.num_rows;
-  size_t const na  = agg_kinds.size();
-  CUDF_EXPECTS(plan.metas.size() <= static_cast<size_t>(kMaxJitCols), "jit_reduce: max 16 cols");
-  CUDF_EXPECTS(na <= static_cast<size_t>(kMaxJitAggs), "jit_reduce: max 64 aggs");
-
-  rmm::device_buffer d_packed(std::max<size_t>(plan.total_packed_bytes, 8), stream, mr);
-  if (plan.total_packed_bytes > 0) {
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-      d_packed.data(), host_src, plan.total_packed_bytes, cudaMemcpyHostToDevice, stream.get()));
-  }
-  auto const* d_base = static_cast<uint8_t const*>(d_packed.data());
-
-  JitReduceArgs args{};
-  args.num_rows   = n;
-  args.max_groups = max_groups;
-  args.num_aggs   = static_cast<int32_t>(na);
-
-  std::vector<rmm::device_buffer> d_temps;
-  std::vector<std::vector<std::string>> col_dicts(plan.metas.size());
-
-  for (size_t s = 0; s < plan.metas.size(); ++s) {
-    ColumnMeta const& m = plan.metas[s];
-    auto const* d_pay   = d_base + plan.packed_payload_offsets[s];
-    auto const enc      = static_cast<Encoding>(m.encoding);
-    JitColDesc& cd      = args.cols[s];
-    cd.has_nulls        = m.has_nulls;
-    if (m.has_nulls && m.null_mask_size > 0) {
-      cd.null_mask = reinterpret_cast<uint32_t const*>(d_base + plan.packed_null_offsets[s]);
-    }
-    if (enc == Encoding::FOR_BITPACK || enc == Encoding::SCALED_FLOAT_FOR) {
-      auto fv            = make_for_view_jr(d_pay, n);
-      cd.mode            = 1;
-      cd.min_vals        = fv.min_vals;
-      cd.bit_widths      = fv.bit_widths;
-      cd.chunk_word_offs = fv.chunk_word_offsets;
-      cd.packed_words    = fv.packed_words;
-      cd.inv_scale       = (m.scale_exp10 == 0) ? 1.0 : ((m.scale_exp10 == 2) ? 0.01 : 0.0001);
-    } else if (enc == Encoding::RLE_INT) {
-      uint32_t const nc   = (n + kChunkSize - 1u) / kChunkSize;
-      uint32_t const nr   = m.extra;
-      size_t const o_re   = nc * sizeof(uint32_t);
-      size_t const o_rv   = align8_jr(o_re + nr * sizeof(uint32_t));
-      cd.mode             = 2;
-      cd.rle_chunk_start  = reinterpret_cast<uint32_t const*>(d_pay);
-      cd.rle_run_ends     = reinterpret_cast<uint32_t const*>(d_pay + o_re);
-      cd.rle_run_vals     = reinterpret_cast<int64_t const*>(d_pay + o_rv);
-      cd.rle_num_runs     = nr;
-    } else if (enc == Encoding::DICT_BITPACK) {
-      DictPayloadHeader dh{};
-      uint8_t const* h_pay = host_src + plan.packed_payload_offsets[s];
-      std::memcpy(&dh, h_pay, sizeof(dh));
-      auto fv            = make_for_view_jr(d_pay + dh.codes_offset, n);
-      cd.mode            = 3;
-      cd.min_vals        = fv.min_vals;
-      cd.bit_widths      = fv.bit_widths;
-      cd.chunk_word_offs = fv.chunk_word_offsets;
-      cd.packed_words    = fv.packed_words;
-      cd.dict_size       = dh.dict_size;
-
-      auto const* dict_offs = reinterpret_cast<int32_t const*>(h_pay + sizeof(dh));
-      auto const* dict_ch =
-        reinterpret_cast<char const*>(h_pay + sizeof(dh) + (dh.dict_size + 1u) * sizeof(int32_t));
-      col_dicts[s].resize(dh.dict_size);
-      for (uint32_t k = 0; k < dh.dict_size; ++k) {
-        col_dicts[s][k].assign(dict_ch + dict_offs[k],
-                               static_cast<size_t>(dict_offs[k + 1] - dict_offs[k]));
-      }
-      if (s < dict_lits.size() && !dict_lits[s].empty()) {
-        std::unordered_map<std::string_view, int32_t> lmap;
-        for (size_t l = 0; l < dict_lits[s].size(); ++l) {
-          lmap.emplace(std::string_view{dict_lits[s][l]}, static_cast<int32_t>(l));
-        }
-        std::vector<int32_t> h_rm(dh.dict_size, -1);
-        for (uint32_t k = 0; k < dh.dict_size; ++k) {
-          auto it = lmap.find(col_dicts[s][k]);
-          if (it != lmap.end()) { h_rm[k] = it->second; }
-        }
-        rmm::device_buffer d_rm(std::max<size_t>(dh.dict_size, 1) * sizeof(int32_t), stream, mr);
-        if (dh.dict_size > 0) {
-          CUDF_CUDA_TRY(cudaMemcpyAsync(
-            d_rm.data(), h_rm.data(), dh.dict_size * sizeof(int32_t), cudaMemcpyHostToDevice, stream.get()));
-        }
-        cd.dict_remap = static_cast<int32_t const*>(d_rm.data());
-        d_temps.push_back(std::move(d_rm));
-      }
-    } else {
-      cd.mode    = 0;
-      cd.raw_ptr = d_pay;
-    }
-  }
-
-  // Compute group-key dictionaries & strides for Mode 1 (Low-Card GroupBy)
-  std::vector<std::vector<std::string>> gk_dicts;
-  std::vector<int32_t> gk_strides;
-  int32_t eff_max_groups = 1;
-  if (!group_key_slots.empty()) {
-    gk_dicts.resize(group_key_slots.size());
-    gk_strides.resize(group_key_slots.size(), 1);
-    for (int i = static_cast<int>(group_key_slots.size()) - 1; i >= 0; --i) {
-      int32_t const s = group_key_slots[static_cast<size_t>(i)];
-      gk_dicts[static_cast<size_t>(i)]   = col_dicts[static_cast<size_t>(s)];
-      gk_strides[static_cast<size_t>(i)] = eff_max_groups;
-      eff_max_groups *= std::max<int32_t>(static_cast<int32_t>(gk_dicts[static_cast<size_t>(i)].size()), 1);
-    }
-    CUDF_EXPECTS(eff_max_groups <= max_groups, "jit_reduce_lenc: dict product exceeds max_groups");
-    args.max_groups = eff_max_groups;
-  }
-
-  // Item 5: Optional 1,024-row chunk Min-Max pruning directly on d_packed (zero overhead if unsorted!)
-  rmm::device_uvector<uint32_t> d_chunk_active(0, stream, mr);
-  if (!chunk_preds.empty() && n >= 2048) {
-    // Only engage GPU chunk-pruning mask when at least one predicate's file-level min/max
-    // indicates non-trivial chunk variation (skips 9,910 no-op kernel launches on random unsorted data!)
-    bool any_for_pred = false;
-    for (auto const& pr : chunk_preds) {
-      if (pr.col_slot >= 0 && static_cast<size_t>(pr.col_slot) < plan.metas.size()) {
-        auto const& cd = args.cols[static_cast<size_t>(pr.col_slot)];
-        if (cd.mode == 1 && !cd.has_nulls) { any_for_pred = true; }
-      }
-    }
-    if (any_for_pred) {
-      uint32_t const nc = (n + kChunkSize - 1u) / kChunkSize;
-      // Check first & last chunk bit_width / min_vals on host_src in O(1) — zero GPU sync!
-      bool likely_clustered = false;
-      for (auto const& pr : chunk_preds) {
-        if (pr.col_slot < 0 || static_cast<size_t>(pr.col_slot) >= plan.metas.size()) continue;
-        auto const& m = plan.metas[static_cast<size_t>(pr.col_slot)];
-        auto const enc = static_cast<Encoding>(m.encoding);
-        if (!m.has_nulls && (enc == Encoding::FOR_BITPACK || enc == Encoding::SCALED_FLOAT_FOR)) {
-          auto const* h_pay = host_src + plan.packed_payload_offsets[static_cast<size_t>(pr.col_slot)];
-          auto const* h_mins = reinterpret_cast<int64_t const*>(h_pay);
-          auto const* h_bws  = h_pay + nc * sizeof(int64_t);
-          // Sample 3 chunks (0, nc/2, nc-1): if any chunk is prunable, enable GPU chunk mask!
-          double const inv = (m.scale_exp10 == 0) ? 1.0 : ((m.scale_exp10 == 2) ? 0.01 : 0.0001);
-          uint32_t const idxs[3] = {0u, nc / 2u, nc - 1u};
-          for (uint32_t ci : idxs) {
-            uint8_t const bw = h_bws[ci];
-            if (bw >= 63u) continue;
-            int64_t const lo = h_mins[ci];
-            uint64_t const rng = (bw == 0u) ? 0ULL : ((1ULL << bw) - 1ULL);
-            int64_t const hi = lo + static_cast<int64_t>(rng);
-            bool skip = false;
-            if (pr.is_float) {
-              double fmin = static_cast<double>(lo) * inv, fmax = static_cast<double>(hi) * inv;
-              double b = pr.double_bound, eps = 1e-6 * ((std::fabs(b) > 1.0) ? std::fabs(b) : 1.0);
-              if (pr.op == 0) skip = (fmin >= b + eps);
-              else if (pr.op == 1) skip = (fmin > b + eps);
-              else if (pr.op == 2) skip = (fmax <= b - eps);
-              else if (pr.op == 3) skip = (fmax < b - eps);
-              else if (pr.op == 4) skip = (b < fmin - eps || b > fmax + eps);
-            } else {
-              int64_t b = pr.int_bound;
-              if (pr.op == 0) skip = (lo >= b);
-              else if (pr.op == 1) skip = (lo > b);
-              else if (pr.op == 2) skip = (hi <= b);
-              else if (pr.op == 3) skip = (hi < b);
-              else if (pr.op == 4) skip = (b < lo || b > hi);
-            }
-            if (skip) { likely_clustered = true; break; }
-          }
-          if (likely_clustered) break;
-        }
-      }
-      if (likely_clustered) {
-        d_chunk_active.resize(nc, stream);
-        CUDF_CUDA_TRY(cudaMemsetAsync(d_chunk_active.data(), 1, nc * sizeof(uint32_t), stream.get()));
-        for (auto const& pr : chunk_preds) {
-          if (pr.col_slot >= 0 && static_cast<size_t>(pr.col_slot) < plan.metas.size()) {
-            auto const& cd = args.cols[static_cast<size_t>(pr.col_slot)];
-            if (cd.mode == 1 && !cd.has_nulls) {
-              jr_chunk_prune_kernel<<<(nc + 255u) / 256u, 256, 0, stream.get()>>>(
-                cd.min_vals, cd.bit_widths, nc, pr.op, pr.is_float, cd.inv_scale,
-                pr.int_bound, pr.double_bound, d_chunk_active.data());
-            }
-          }
-        }
-        args.active_chunk_mask = d_chunk_active.data();
-      }
-    }
-  }
-
-  size_t const total_slots = static_cast<size_t>(args.max_groups) * na;
-  bool need_minmax_init    = false;
-  for (uint8_t k : agg_kinds) {
-    if (k >= 3) { need_minmax_init = true; }
-  }
-  rmm::device_uvector<double> d_f64(total_slots, stream, mr);
-  rmm::device_uvector<long long> d_i64(total_slots, stream, mr);
-  rmm::device_uvector<unsigned long long> d_cnt(total_slots, stream, mr);
-  if (!need_minmax_init) {
-    CUDF_CUDA_TRY(cudaMemsetAsync(d_f64.data(), 0, total_slots * sizeof(double), stream.get()));
-    CUDF_CUDA_TRY(cudaMemsetAsync(d_i64.data(), 0, total_slots * sizeof(long long), stream.get()));
-  } else {
-    std::vector<double> init_f64(total_slots, 0.0);
-    std::vector<long long> init_i64(total_slots, 0LL);
-    for (int32_t g = 0; g < args.max_groups; ++g) {
-      for (size_t a = 0; a < na; ++a) {
-        size_t const off = static_cast<size_t>(g) * na + a;
-        if (agg_kinds[a] == 3) init_f64[off] = std::numeric_limits<double>::infinity();
-        else if (agg_kinds[a] == 4) init_f64[off] = -std::numeric_limits<double>::infinity();
-        else if (agg_kinds[a] == 5) init_i64[off] = std::numeric_limits<long long>::max();
-        else if (agg_kinds[a] == 6) init_i64[off] = std::numeric_limits<long long>::min();
-      }
-    }
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-      d_f64.data(), init_f64.data(), total_slots * sizeof(double), cudaMemcpyHostToDevice, stream.get()));
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-      d_i64.data(), init_i64.data(), total_slots * sizeof(long long), cudaMemcpyHostToDevice, stream.get()));
-  }
-  CUDF_CUDA_TRY(cudaMemsetAsync(d_cnt.data(), 0, total_slots * sizeof(unsigned long long), stream.get()));
-
-  args.out_f64 = d_f64.data();
-  args.out_i64 = d_i64.data();
-  args.out_cnt = d_cnt.data();
-
-  if (n > 0) {
-    rmm::device_buffer d_args(sizeof(JitReduceArgs), stream, mr);
-    CUDF_CUDA_TRY(
-      cudaMemcpyAsync(d_args.data(), &args, sizeof(JitReduceArgs), cudaMemcpyHostToDevice, stream.get()));
-    void* arg_ptr  = d_args.data();
-    void* kparams[] = {&arg_ptr};
-    uint32_t const blocks = std::min<uint32_t>((n + 255u) / 256u, 2048u);
-    CUresult cr = CudaDriverApi::get().launch(
-      prog.func, blocks, 1, 1, 256, 1, 1, 0, static_cast<CUstream>(stream.get()), kparams, nullptr);
-    CUDF_EXPECTS(cr == CUDA_SUCCESS, "cuLaunchKernel failed in run_jit_reduce_lenc");
-  }
-
-  std::vector<double> h_f64(total_slots);
-  std::vector<long long> h_i64(total_slots);
-  std::vector<unsigned long long> h_cnt(total_slots);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    h_f64.data(), d_f64.data(), total_slots * sizeof(double), cudaMemcpyDeviceToHost, stream.get()));
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    h_i64.data(), d_i64.data(), total_slots * sizeof(long long), cudaMemcpyDeviceToHost, stream.get()));
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    h_cnt.data(), d_cnt.data(), total_slots * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream.get()));
-  stream.sync();
-
-  return finalize_lowcard_output(
-    gk_dicts, gk_strides, args.max_groups, agg_kinds, h_f64, h_i64, h_cnt, stream, mr);
 }
 
 std::unique_ptr<cudf::table> run_jit_reduce_table(

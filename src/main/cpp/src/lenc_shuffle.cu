@@ -47,6 +47,12 @@ constexpr uint32_t kKudoMagic   = 0x4B554430u;  // "KUD0"
 constexpr uint32_t kLshfMagic   = 0x4648534Cu;  // "LSHF"
 constexpr uint32_t kShufBlkSize = 256;
 
+struct DictPayloadHeader {
+  uint32_t dict_size;
+  uint32_t key_bytes;
+  uint64_t codes_offset;
+};
+
 __host__ __device__ constexpr uint64_t align8(uint64_t v) { return (v + 7ULL) & ~7ULL; }
 
 enum class ShufEnc : uint8_t {
