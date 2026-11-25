@@ -234,6 +234,7 @@ add_library(
   src/JSONUtilsJni.cpp
   src/KudoGpuSerializerJni.cpp
   src/LencJni.cpp
+  src/VortexJni.cpp
   src/ListSliceJni.cpp
   src/MapJni.cpp
   src/MapUtilsJni.cpp
