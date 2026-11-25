@@ -32,6 +32,7 @@
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda_runtime_api.h>
+#include <nvcomp/lz4.h>
 #include <thrust/scan.h>
 
 #include <algorithm>
@@ -53,6 +54,7 @@ enum class ShufEnc : uint8_t {
   FOR_BITPACK  = 1,
   DICT_BITPACK = 2,
   RAW_STRING   = 3,
+  NVCOMP_LZ4   = 4,  // Item 3: GPU nvCOMP Batched LZ4 for FLOAT/DOUBLE (sparse/zero/null) & large strings!
 };
 
 struct ShufColMeta {
@@ -219,6 +221,33 @@ __global__ void scatter_for256_slices_kernel(uint8_t* __restrict__ d_out,
   }
   for (uint32_t i = threadIdx.x; i < nwords; i += blockDim.x) {
     st_u64_u(d_words + static_cast<size_t>(i) * 8u, all_words[wbase + i]);
+  }
+}
+
+__global__ void scatter_lz4_slices_kernel(uint8_t const* __restrict__ comp_base,
+                                          uint8_t const* __restrict__ raw_base,
+                                          uint8_t* __restrict__ d_out,
+                                          uint64_t const* __restrict__ dst_payload_offs,
+                                          uint64_t const* __restrict__ lz4_src_offs,
+                                          uint64_t const* __restrict__ lz4_comp_szs,
+                                          uint32_t const* __restrict__ part_row_start,
+                                          uint32_t const* __restrict__ part_row_len,
+                                          uint32_t elem_size,
+                                          uint32_t num_parts)
+{
+  uint32_t const p = blockIdx.x;
+  if (p >= num_parts) { return; }
+  uint32_t const len = part_row_len[p];
+  if (len == 0u) { return; }
+  uint64_t const csz = lz4_comp_szs[p];
+  uint8_t* d         = d_out + dst_payload_offs[p];
+  if (csz > 0ULL) {
+    uint8_t const* s = comp_base + lz4_src_offs[p];
+    for (uint64_t i = threadIdx.x; i < csz; i += blockDim.x) { d[i] = s[i]; }
+  } else {
+    size_t const nb  = static_cast<size_t>(len) * elem_size;
+    uint8_t const* s = raw_base + static_cast<size_t>(part_row_start[p]) * elem_size;
+    for (size_t i = threadIdx.x; i < nb; i += blockDim.x) { d[i] = s[i]; }
   }
 }
 
@@ -592,6 +621,10 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     std::vector<uint8_t> h_dict_blob;  // DictPayloadHeader + dict_offs + dict_chars
     // RAW_STRING offsets on host for sizing
     std::vector<int32_t> h_str_part_chars;
+    // Item 3: Batched GPU nvCOMP LZ4 buffers for FLOAT/DOUBLE columns
+    rmm::device_buffer d_lz4_comp;
+    std::vector<uint64_t> h_lz4_src_offs;
+    std::vector<uint64_t> h_lz4_comp_szs;
     std::vector<uint64_t> part_payload_sz;
     std::vector<uint32_t> part_null_sz;
     ColWork(cuda::stream_ref s, rmm::device_async_resource_ref m)
@@ -722,8 +755,10 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         w.part_payload_sz[p] = o_pk + static_cast<size_t>(nw) * sizeof(uint64_t);
       }
     } else if (w.tid == cudf::type_id::FLOAT32 || w.tid == cudf::type_id::FLOAT64) {
-      w.enc       = ShufEnc::RAW_FIXED;
       w.elem_size = static_cast<uint32_t>(cudf::size_of(cv.type()));
+      // Temporarily mark as RAW_FIXED; all FLOAT/DOUBLE columns are batch-LZ4-compressed TOGETHER
+      // in ONE single nvcompBatchedLZ4CompressAsync call below (1 GPU sync instead of N_cols syncs!).
+      w.enc = ShufEnc::RAW_FIXED;
       for (size_t p = 0; p < n_parts; ++p) {
         w.part_payload_sz[p] = static_cast<size_t>(h_part_len[p]) * w.elem_size;
       }
@@ -801,6 +836,101 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     }
   }
 
+  // Item 3: ONE SINGLE batched nvCOMP LZ4 call across ALL FLOAT32/FLOAT64 columns & partitions
+  // combined (1 GPU sync per batch instead of 36 syncs on wide tables like NF_J0048!)
+  rmm::device_buffer d_all_lz4_comp;
+  {
+    struct Lz4Job {
+      uint32_t c;
+      size_t p;
+    };
+    std::vector<Lz4Job> jobs;
+    std::vector<void const*> h_in_ptrs;
+    std::vector<size_t> h_in_szs;
+    size_t max_chunk_b = 0;
+    size_t total_raw_b = 0;
+    for (uint32_t c = 0; c < ncols; ++c) {
+      auto& w = works[c];
+      if (w.tid != cudf::type_id::FLOAT32 && w.tid != cudf::type_id::FLOAT64) continue;
+      auto const cv        = table.column(static_cast<cudf::size_type>(c));
+      auto const* col_base =
+        static_cast<uint8_t const*>(cv.head()) + static_cast<size_t>(cv.offset()) * w.elem_size;
+      for (size_t p = 0; p < n_parts; ++p) {
+        size_t const rb = static_cast<size_t>(h_part_len[p]) * w.elem_size;
+        if (rb >= 256) {
+          jobs.push_back(Lz4Job{c, p});
+          h_in_ptrs.push_back(col_base + static_cast<size_t>(h_part_start[p]) * w.elem_size);
+          h_in_szs.push_back(rb);
+          max_chunk_b = std::max(max_chunk_b, rb);
+          total_raw_b += rb;
+        }
+      }
+    }
+    if (!jobs.empty() && total_raw_b >= 65536 && max_chunk_b <= (16u << 20)) {
+      size_t const bn                     = jobs.size();
+      nvcompBatchedLZ4CompressOpts_t opts = nvcompBatchedLZ4CompressDefaultOpts;
+      size_t temp_b = 0, max_out_b = 0;
+      if (nvcompBatchedLZ4CompressGetTempSize(bn, max_chunk_b, opts, &temp_b, total_raw_b, stream.get()) ==
+            nvcompSuccess &&
+          nvcompBatchedLZ4CompressGetMaxOutputChunkSize(max_chunk_b, opts, &max_out_b) ==
+            nvcompSuccess) {
+        d_all_lz4_comp  = rmm::device_buffer(bn * max_out_b, stream, mr);
+        auto* comp_base = static_cast<uint8_t*>(d_all_lz4_comp.data());
+        std::vector<void*> h_out_ptrs(bn);
+        for (size_t i = 0; i < bn; ++i) { h_out_ptrs[i] = comp_base + i * max_out_b; }
+        rmm::device_uvector<void const*> d_ip(bn, stream, mr);
+        rmm::device_uvector<size_t> d_is(bn, stream, mr);
+        rmm::device_uvector<void*> d_op(bn, stream, mr);
+        rmm::device_uvector<size_t> d_os(bn, stream, mr);
+        rmm::device_uvector<nvcompStatus_t> d_st(bn, stream, mr);
+        rmm::device_buffer d_tmp(std::max<size_t>(temp_b, 64), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_ip.data(), h_in_ptrs.data(), bn * sizeof(void*), cudaMemcpyHostToDevice, stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_is.data(), h_in_szs.data(), bn * sizeof(size_t), cudaMemcpyHostToDevice, stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_op.data(), h_out_ptrs.data(), bn * sizeof(void*), cudaMemcpyHostToDevice, stream.get()));
+        if (nvcompBatchedLZ4CompressAsync(d_ip.data(),
+                                          d_is.data(),
+                                          max_chunk_b,
+                                          bn,
+                                          d_tmp.data(),
+                                          temp_b,
+                                          d_op.data(),
+                                          d_os.data(),
+                                          opts,
+                                          d_st.data(),
+                                          stream.get()) == nvcompSuccess) {
+          std::vector<size_t> h_os(bn);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(
+            h_os.data(), d_os.data(), bn * sizeof(size_t), cudaMemcpyDeviceToHost, stream.get()));
+          stream.sync();
+          // Decide per-column whether LZ4 won (>=15% smaller)
+          std::vector<size_t> col_raw(ncols, 0), col_comp(ncols, 0);
+          for (size_t i = 0; i < bn; ++i) {
+            col_raw[jobs[i].c] += h_in_szs[i];
+            col_comp[jobs[i].c] += h_os[i];
+          }
+          for (uint32_t c = 0; c < ncols; ++c) {
+            if (col_raw[c] > 0 && col_comp[c] * 100 < col_raw[c] * 85) {
+              works[c].enc = ShufEnc::NVCOMP_LZ4;
+              works[c].h_lz4_src_offs.assign(n_parts, 0);
+              works[c].h_lz4_comp_szs.assign(n_parts, 0);
+            }
+          }
+          for (size_t i = 0; i < bn; ++i) {
+            auto& w = works[jobs[i].c];
+            if (w.enc == ShufEnc::NVCOMP_LZ4) {
+              w.h_lz4_src_offs[jobs[i].p]  = i * max_out_b;
+              w.h_lz4_comp_szs[jobs[i].p]  = h_os[i];
+              w.part_payload_sz[jobs[i].p] = h_os[i];
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Compute final contiguous d_data layout for ALL partitions on CPU (zero syncs!)
   std::vector<int64_t> h_part_offsets(n_parts + 1, 0);
   std::vector<std::vector<uint64_t>> col_dst_pay(ncols, std::vector<uint64_t>(n_parts, 0));
@@ -853,12 +983,17 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       m.null_offset    = works[c].has_nulls ? (col_dst_null[c][p] - lshf_base) : 0ULL;
       m.null_size      = works[c].part_null_sz[p];
       m.null_count     = 0;  // computed at reduce if needed
-      m.extra          = (works[c].enc == ShufEnc::DICT_BITPACK)
-                           ? works[c].dict_size
-                           : ((works[c].enc == ShufEnc::RAW_STRING)
-                                ? static_cast<uint32_t>(works[c].h_str_part_chars[p])
-                                : 0u);
-      m.encoding       = static_cast<uint8_t>(works[c].enc);
+      m.extra = (works[c].enc == ShufEnc::DICT_BITPACK)
+                  ? works[c].dict_size
+                  : ((works[c].enc == ShufEnc::RAW_STRING)
+                       ? static_cast<uint32_t>(works[c].h_str_part_chars[p])
+                       : ((works[c].enc == ShufEnc::NVCOMP_LZ4)
+                            ? static_cast<uint32_t>(works[c].h_lz4_comp_szs[p])
+                            : 0u));
+      m.encoding =
+        (works[c].enc == ShufEnc::NVCOMP_LZ4 && works[c].h_lz4_comp_szs[p] == 0)
+          ? static_cast<uint8_t>(ShufEnc::RAW_FIXED)
+          : static_cast<uint8_t>(works[c].enc);
       m.has_nulls      = works[c].has_nulls ? 1 : 0;
       m.scale          = works[c].scale;
       m.type_id        = static_cast<uint8_t>(works[c].tid);
@@ -918,6 +1053,26 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         w.d_bws.data(),
         w.d_word_offs.data(),
         w.d_words.data(),
+        static_cast<uint32_t>(n_parts));
+    } else if (w.enc == ShufEnc::NVCOMP_LZ4) {
+      rmm::device_uvector<uint64_t> d_src_offs(n_parts, stream, mr);
+      rmm::device_uvector<uint64_t> d_comp_szs(n_parts, stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        d_dst_offs.data(), col_dst_pay[c].data(), n_parts * sizeof(uint64_t), cudaMemcpyHostToDevice, stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        d_src_offs.data(), w.h_lz4_src_offs.data(), n_parts * sizeof(uint64_t), cudaMemcpyHostToDevice, stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        d_comp_szs.data(), w.h_lz4_comp_szs.data(), n_parts * sizeof(uint64_t), cudaMemcpyHostToDevice, stream.get()));
+      scatter_lz4_slices_kernel<<<static_cast<uint32_t>(n_parts), 256, 0, stream.get()>>>(
+        static_cast<uint8_t const*>(d_all_lz4_comp.data()),
+        static_cast<uint8_t const*>(cv.head()) + static_cast<size_t>(cv.offset()) * w.elem_size,
+        d_base,
+        d_dst_offs.data(),
+        d_src_offs.data(),
+        d_comp_szs.data(),
+        d_part_start.data(),
+        d_part_len.data(),
+        w.elem_size,
         static_cast<uint32_t>(n_parts));
     } else if (w.enc == ShufEnc::RAW_FIXED) {
       CUDF_CUDA_TRY(cudaMemcpyAsync(d_dst_offs.data(),
@@ -1087,18 +1242,83 @@ std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
       auto col           = cudf::make_fixed_width_column(
         dtype, static_cast<cudf::size_type>(total_rows), std::move(nbuf), nc, stream, mr);
       size_t const esz = cudf::size_of(dtype);
-      if (esz == 8) {
-        batched_decode_fixed_kernel<int64_t><<<ntk, 256, 0, stream.get()>>>(
-          d_data, d_tasks.data(), ntk, static_cast<int64_t*>(col->mutable_view().head()));
-      } else if (esz == 4) {
-        batched_decode_fixed_kernel<int32_t><<<ntk, 256, 0, stream.get()>>>(
-          d_data, d_tasks.data(), ntk, static_cast<int32_t*>(col->mutable_view().head()));
-      } else if (esz == 2) {
-        batched_decode_fixed_kernel<int16_t><<<ntk, 256, 0, stream.get()>>>(
-          d_data, d_tasks.data(), ntk, static_cast<int16_t*>(col->mutable_view().head()));
-      } else {
-        batched_decode_fixed_kernel<int8_t><<<ntk, 256, 0, stream.get()>>>(
-          d_data, d_tasks.data(), ntk, static_cast<int8_t*>(col->mutable_view().head()));
+      // Separate NVCOMP_LZ4 tasks (batch decompress in ONE nvCOMP call) from FOR/RAW tasks
+      std::vector<DecodeSliceTask> non_lz4;
+      std::vector<void const*> h_in_ptrs;
+      std::vector<size_t> h_in_szs;
+      std::vector<void*> h_out_ptrs;
+      std::vector<size_t> h_out_szs;
+      size_t max_uncomp_b = 0;
+      size_t tot_uncomp_b = 0;
+      auto* col_out_base  = static_cast<uint8_t*>(col->mutable_view().head());
+      for (size_t i = 0; i < col_tasks[c].size(); ++i) {
+        auto const& tk = col_tasks[c][i];
+        if (tk.encoding == static_cast<uint8_t>(ShufEnc::NVCOMP_LZ4)) {
+          size_t const ub = static_cast<size_t>(tk.num_rows) * esz;
+          h_in_ptrs.push_back(d_data + tk.payload_off);
+          h_in_szs.push_back(tk.extra);  // payload_size stored in extra for LZ4 decode
+          h_out_ptrs.push_back(col_out_base + static_cast<size_t>(tk.out_row_off) * esz);
+          h_out_szs.push_back(ub);
+          max_uncomp_b = std::max(max_uncomp_b, ub);
+          tot_uncomp_b += ub;
+        } else {
+          non_lz4.push_back(tk);
+        }
+      }
+      if (!h_in_ptrs.empty()) {
+        size_t const bn = h_in_ptrs.size();
+        size_t temp_b   = 0;
+        nvcompBatchedLZ4DecompressOpts_t dopts = nvcompBatchedLZ4DecompressDefaultOpts;
+        CUDF_EXPECTS(nvcompBatchedLZ4DecompressGetTempSize(
+                       bn, max_uncomp_b, dopts, &temp_b, tot_uncomp_b, stream.get()) ==
+                       nvcompSuccess,
+                     "lenc_shuffle: nvCOMP LZ4 decompress GetTempSize failed");
+        rmm::device_uvector<void const*> d_ip(bn, stream, mr);
+        rmm::device_uvector<size_t> d_is(bn, stream, mr);
+        rmm::device_uvector<void*> d_op(bn, stream, mr);
+        rmm::device_uvector<size_t> d_os(bn, stream, mr);
+        rmm::device_uvector<size_t> d_act(bn, stream, mr);
+        rmm::device_uvector<nvcompStatus_t> d_st(bn, stream, mr);
+        rmm::device_buffer d_tmp(std::max<size_t>(temp_b, 64), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_ip.data(), h_in_ptrs.data(), bn * sizeof(void*), cudaMemcpyHostToDevice, stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_is.data(), h_in_szs.data(), bn * sizeof(size_t), cudaMemcpyHostToDevice, stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_op.data(), h_out_ptrs.data(), bn * sizeof(void*), cudaMemcpyHostToDevice, stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_os.data(), h_out_szs.data(), bn * sizeof(size_t), cudaMemcpyHostToDevice, stream.get()));
+        CUDF_EXPECTS(nvcompBatchedLZ4DecompressAsync(d_ip.data(),
+                                                     d_is.data(),
+                                                     d_os.data(),
+                                                     d_act.data(),
+                                                     bn,
+                                                     d_tmp.data(),
+                                                     temp_b,
+                                                     d_op.data(),
+                                                     dopts,
+                                                     d_st.data(),
+                                                     stream.get()) == nvcompSuccess,
+                     "lenc_shuffle: nvCOMP LZ4 decompress failed");
+      }
+      if (!non_lz4.empty()) {
+        uint32_t const n2 = static_cast<uint32_t>(non_lz4.size());
+        rmm::device_uvector<DecodeSliceTask> d_t2(n2, stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_t2.data(), non_lz4.data(), n2 * sizeof(DecodeSliceTask), cudaMemcpyHostToDevice, stream.get()));
+        if (esz == 8) {
+          batched_decode_fixed_kernel<int64_t><<<n2, 256, 0, stream.get()>>>(
+            d_data, d_t2.data(), n2, static_cast<int64_t*>(col->mutable_view().head()));
+        } else if (esz == 4) {
+          batched_decode_fixed_kernel<int32_t><<<n2, 256, 0, stream.get()>>>(
+            d_data, d_t2.data(), n2, static_cast<int32_t*>(col->mutable_view().head()));
+        } else if (esz == 2) {
+          batched_decode_fixed_kernel<int16_t><<<n2, 256, 0, stream.get()>>>(
+            d_data, d_t2.data(), n2, static_cast<int16_t*>(col->mutable_view().head()));
+        } else {
+          batched_decode_fixed_kernel<int8_t><<<n2, 256, 0, stream.get()>>>(
+            d_data, d_t2.data(), n2, static_cast<int8_t*>(col->mutable_view().head()));
+        }
       }
       out_cols.push_back(std::move(col));
     }

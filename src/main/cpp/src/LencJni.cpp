@@ -402,6 +402,65 @@ static std::vector<std::vector<std::string>> unpack_dict_lits(JNIEnv* env, jobje
   return dlits;
 }
 
+// ---------------- Item 1: S3A/HDFS Distributed Plan-From-Buffers + Read Ranges ----------------
+
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_planReadFromBuffersNative(
+  JNIEnv* env, jclass, jbyteArray j_hdr, jbyteArray j_ftr, jintArray j_col_indices)
+{
+  JNI_TRY
+  {
+    cudf::jni::native_jbyteArray hdr(env, j_hdr);
+    cudf::jni::native_jbyteArray ftr(env, j_ftr);
+    cudf::jni::native_jintArray ci(env, j_col_indices);
+    std::vector<int32_t> cols(ci.data(), ci.data() + ci.size());
+    auto plan = rapids::jni::lenc::plan_read_from_buffers(
+      reinterpret_cast<uint8_t const*>(hdr.data()),
+      static_cast<size_t>(hdr.size()),
+      reinterpret_cast<uint8_t const*>(ftr.data()),
+      static_cast<size_t>(ftr.size()),
+      cols);
+    auto* ptr = new rapids::jni::lenc::ReadPlan(std::move(plan));
+    return std::bit_cast<jlong>(ptr);
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_nvidia_spark_rapids_jni_LencNative_planGetReadRangesNative(JNIEnv* env, jclass, jlong j_plan)
+{
+  JNI_TRY
+  {
+    auto const* plan = std::bit_cast<rapids::jni::lenc::ReadPlan const*>(j_plan);
+    auto ranges      = rapids::jni::lenc::plan_get_read_ranges(*plan);
+    cudf::jni::native_jlongArray out(env, static_cast<jsize>(ranges.size()));
+    for (size_t i = 0; i < ranges.size(); ++i) { out[i] = ranges[i]; }
+    return out.get_jArray();
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+static std::vector<rapids::jni::lenc::ChunkRangePred> unpack_chunk_preds(JNIEnv* env,
+                                                                         jintArray j_slots,
+                                                                         jintArray j_ops,
+                                                                         jbyteArray j_is_f,
+                                                                         jlongArray j_ib,
+                                                                         jdoubleArray j_db)
+{
+  std::vector<rapids::jni::lenc::ChunkRangePred> out;
+  if (j_slots == nullptr) { return out; }
+  cudf::jni::native_jintArray sl(env, j_slots);
+  cudf::jni::native_jintArray op(env, j_ops);
+  cudf::jni::native_jbyteArray isf(env, j_is_f);
+  cudf::jni::native_jlongArray ib(env, j_ib);
+  cudf::jni::native_jdoubleArray db(env, j_db);
+  out.reserve(static_cast<size_t>(sl.size()));
+  for (int i = 0; i < sl.size(); ++i) {
+    out.push_back(rapids::jni::lenc::ChunkRangePred{
+      sl[i], op[i], static_cast<uint8_t>(isf[i]), ib[i], db[i]});
+  }
+  return out;
+}
+
 JNIEXPORT jlongArray JNICALL
 Java_com_nvidia_spark_rapids_jni_LencNative_runLtoFilterAndProjectNative(JNIEnv* env,
                                                                          jclass,
@@ -413,7 +472,12 @@ Java_com_nvidia_spark_rapids_jni_LencNative_runLtoFilterAndProjectNative(JNIEnv*
                                                                          jobjectArray j_filter_dlits,
                                                                          jintArray j_proj_cmap,
                                                                          jobjectArray j_proj_dlits,
-                                                                         jbyteArray j_out_dict32)
+                                                                         jbyteArray j_out_dict32,
+                                                                         jintArray j_cp_slots,
+                                                                         jintArray j_cp_ops,
+                                                                         jbyteArray j_cp_isf,
+                                                                         jlongArray j_cp_ib,
+                                                                         jdoubleArray j_cp_db)
 {
   JNI_TRY
   {
@@ -437,8 +501,9 @@ Java_com_nvidia_spark_rapids_jni_LencNative_runLtoFilterAndProjectNative(JNIEnv*
       d32.resize(static_cast<size_t>(nb.size()));
       for (size_t i = 0; i < d32.size(); ++i) { d32[i] = static_cast<uint8_t>(nb[i]); }
     }
-    auto tbl = rapids::jni::lenc::run_lto_filter_and_project(
-      *fprog, pprog, *plan, src, fcmap, fdlits, pcmap, pdlits, d32);
+    auto cpreds = unpack_chunk_preds(env, j_cp_slots, j_cp_ops, j_cp_isf, j_cp_ib, j_cp_db);
+    auto tbl    = rapids::jni::lenc::run_lto_filter_and_project(
+      *fprog, pprog, *plan, src, fcmap, fdlits, pcmap, pdlits, d32, cpreds);
     if (!tbl) { return nullptr; }
     return cudf::jni::convert_table_for_return(env, std::move(tbl));
   }
@@ -521,80 +586,124 @@ Java_com_nvidia_spark_rapids_jni_LencNative_assembleAndDecodeShuffleNative(JNIEn
   JNI_CATCH(env, nullptr);
 }
 
-// ---------------- Track 4: GPU Fused Conditional Aggregation / Reduce ----------------
+// ---------------- Item 2: Generic Compiler-Level NVRTC/LTO Reduce + Conditional GroupBy ---------
 
-JNIEXPORT jlongArray JNICALL
-Java_com_nvidia_spark_rapids_jni_LencNative_fusedQ1FromLencNative(JNIEnv* env,
-                                                                  jclass,
-                                                                  jlong j_plan,
-                                                                  jlong j_host_addr,
-                                                                  jint j_max_shipdate_days)
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_compileJitReduceNative(
+  JNIEnv* env, jclass, jstring j_cuda_src, jstring j_kernel_name)
 {
   JNI_TRY
   {
     cudf::jni::auto_set_device(env);
+    cudf::jni::native_jstring src(env, j_cuda_src);
+    cudf::jni::native_jstring kname(env, j_kernel_name);
+    auto* prog = rapids::jni::lenc::compile_jit_reduce_program(src.get(), kname.get());
+    return std::bit_cast<jlong>(prog);
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_destroyJitReduceNative(
+  JNIEnv* env, jclass, jlong j_prog)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    rapids::jni::lenc::destroy_jit_reduce_program(
+      std::bit_cast<rapids::jni::lenc::JitReduceProgram*>(j_prog));
+  }
+  JNI_CATCH(env, );
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_nvidia_spark_rapids_jni_LencNative_runJitReduceLencNative(JNIEnv* env,
+                                                                   jclass,
+                                                                   jlong j_prog,
+                                                                   jlong j_plan,
+                                                                   jlong j_host_addr,
+                                                                   jobjectArray j_dlits,
+                                                                   jintArray j_gk_slots,
+                                                                   jint j_max_groups,
+                                                                   jbyteArray j_agg_kinds,
+                                                                   jintArray j_cp_slots,
+                                                                   jintArray j_cp_ops,
+                                                                   jbyteArray j_cp_isf,
+                                                                   jlongArray j_cp_ib,
+                                                                   jdoubleArray j_cp_db)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* prog       = std::bit_cast<rapids::jni::lenc::JitReduceProgram*>(j_prog);
     auto const* plan = std::bit_cast<rapids::jni::lenc::ReadPlan const*>(j_plan);
     auto const* src  = std::bit_cast<uint8_t const*>(j_host_addr);
-    auto tbl         = rapids::jni::lenc::fused_q1_from_lenc(*plan, src, j_max_shipdate_days);
-    return cudf::jni::convert_table_for_return(env, std::move(tbl));
-  }
-  JNI_CATCH(env, nullptr);
-}
-
-JNIEXPORT jlongArray JNICALL
-Java_com_nvidia_spark_rapids_jni_LencNative_fusedQ1FromTableNative(JNIEnv* env,
-                                                                   jclass,
-                                                                   jlong j_table_view,
-                                                                   jint j_max_shipdate_days)
-{
-  JNI_TRY
-  {
-    cudf::jni::auto_set_device(env);
-    auto const* tv = reinterpret_cast<cudf::table_view const*>(j_table_view);
-    auto tbl       = rapids::jni::lenc::fused_q1_from_table(*tv, j_max_shipdate_days);
-    return cudf::jni::convert_table_for_return(env, std::move(tbl));
-  }
-  JNI_CATCH(env, nullptr);
-}
-
-JNIEXPORT jlongArray JNICALL
-Java_com_nvidia_spark_rapids_jni_LencNative_fusedWideDictCaseAggNative(JNIEnv* env,
-                                                                       jclass,
-                                                                       jlong j_group_keys_tv,
-                                                                       jlong j_metric_cv,
-                                                                       jlong j_numer_cv,
-                                                                       jlong j_denom_cv,
-                                                                       jobjectArray j_literals,
-                                                                       jintArray j_out_mids,
-                                                                       jdoubleArray j_out_coeffs,
-                                                                       jbyteArray j_out_denom)
-{
-  JNI_TRY
-  {
-    cudf::jni::auto_set_device(env);
-    auto const* gk  = reinterpret_cast<cudf::table_view const*>(j_group_keys_tv);
-    auto const* mc  = reinterpret_cast<cudf::column_view const*>(j_metric_cv);
-    auto const* nc  = reinterpret_cast<cudf::column_view const*>(j_numer_cv);
-    auto const* dc  = reinterpret_cast<cudf::column_view const*>(j_denom_cv);
-    jsize const nl  = env->GetArrayLength(j_literals);
-    std::vector<std::string> lits;
-    lits.reserve(static_cast<size_t>(nl));
-    for (jsize i = 0; i < nl; ++i) {
-      auto js = static_cast<jstring>(env->GetObjectArrayElement(j_literals, i));
-      cudf::jni::native_jstring ns(env, js);
-      lits.emplace_back(ns.get());
-      env->DeleteLocalRef(js);
+    auto dlits       = unpack_dict_lits(env, j_dlits);
+    std::vector<int32_t> gk_slots;
+    if (j_gk_slots != nullptr) {
+      cudf::jni::native_jintArray gka(env, j_gk_slots);
+      gk_slots.assign(gka.data(), gka.data() + gka.size());
     }
-    cudf::jni::native_jintArray om(env, j_out_mids);
-    cudf::jni::native_jdoubleArray oc(env, j_out_coeffs);
-    cudf::jni::native_jbyteArray od(env, j_out_denom);
-    std::vector<int32_t> mids(om.data(), om.data() + om.size());
-    std::vector<double> coeffs(oc.data(), oc.data() + oc.size());
-    std::vector<uint8_t> use_d(static_cast<size_t>(od.size()));
-    for (size_t i = 0; i < use_d.size(); ++i) { use_d[i] = static_cast<uint8_t>(od[i]); }
+    cudf::jni::native_jbyteArray ak(env, j_agg_kinds);
+    std::vector<uint8_t> agg_kinds(static_cast<size_t>(ak.size()));
+    for (size_t i = 0; i < agg_kinds.size(); ++i) { agg_kinds[i] = static_cast<uint8_t>(ak[i]); }
+    auto cpreds = unpack_chunk_preds(env, j_cp_slots, j_cp_ops, j_cp_isf, j_cp_ib, j_cp_db);
+    auto tbl    = rapids::jni::lenc::run_jit_reduce_lenc(
+      *prog, *plan, src, dlits, gk_slots, j_max_groups, agg_kinds, cpreds);
+    return cudf::jni::convert_table_for_return(env, std::move(tbl));
+  }
+  JNI_CATCH(env, nullptr);
+}
 
-    auto tbl = rapids::jni::lenc::fused_wide_dict_case_agg(
-      *gk, *mc, *nc, *dc, lits, mids, coeffs, use_d);
+JNIEXPORT jlongArray JNICALL
+Java_com_nvidia_spark_rapids_jni_LencNative_runJitReduceTableNative(JNIEnv* env,
+                                                                    jclass,
+                                                                    jlong j_prog,
+                                                                    jlong j_table_view,
+                                                                    jobjectArray j_dlits,
+                                                                    jintArray j_gk_slots,
+                                                                    jint j_max_groups,
+                                                                    jbyteArray j_agg_kinds)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* prog     = std::bit_cast<rapids::jni::lenc::JitReduceProgram*>(j_prog);
+    auto const* tv = reinterpret_cast<cudf::table_view const*>(j_table_view);
+    auto dlits     = unpack_dict_lits(env, j_dlits);
+    std::vector<int32_t> gk_slots;
+    if (j_gk_slots != nullptr) {
+      cudf::jni::native_jintArray gka(env, j_gk_slots);
+      gk_slots.assign(gka.data(), gka.data() + gka.size());
+    }
+    cudf::jni::native_jbyteArray ak(env, j_agg_kinds);
+    std::vector<uint8_t> agg_kinds(static_cast<size_t>(ak.size()));
+    for (size_t i = 0; i < agg_kinds.size(); ++i) { agg_kinds[i] = static_cast<uint8_t>(ak[i]); }
+    auto tbl = rapids::jni::lenc::run_jit_reduce_table(
+      *prog, *tv, dlits, gk_slots, j_max_groups, agg_kinds);
+    return cudf::jni::convert_table_for_return(env, std::move(tbl));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_nvidia_spark_rapids_jni_LencNative_runJitReduceHighCardNative(JNIEnv* env,
+                                                                       jclass,
+                                                                       jlong j_prog,
+                                                                       jlong j_gk_tv,
+                                                                       jlong j_val_tv,
+                                                                       jobjectArray j_dlits,
+                                                                       jbyteArray j_agg_kinds)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* prog     = std::bit_cast<rapids::jni::lenc::JitReduceProgram*>(j_prog);
+    auto const* gk = reinterpret_cast<cudf::table_view const*>(j_gk_tv);
+    auto const* vc = reinterpret_cast<cudf::table_view const*>(j_val_tv);
+    auto dlits     = unpack_dict_lits(env, j_dlits);
+    cudf::jni::native_jbyteArray ak(env, j_agg_kinds);
+    std::vector<uint8_t> agg_kinds(static_cast<size_t>(ak.size()));
+    for (size_t i = 0; i < agg_kinds.size(); ++i) { agg_kinds[i] = static_cast<uint8_t>(ak[i]); }
+    auto tbl = rapids::jni::lenc::run_jit_reduce_highcard_groupby(*prog, *gk, *vc, dlits, agg_kinds);
     return cudf::jni::convert_table_for_return(env, std::move(tbl));
   }
   JNI_CATCH(env, nullptr);

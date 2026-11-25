@@ -1354,6 +1354,72 @@ ReadPlan plan_read(std::string const& path, std::vector<int32_t> const& col_indi
   return plan;
 }
 
+ReadPlan plan_read_from_buffers(uint8_t const* hdr_bytes,
+                                size_t hdr_len,
+                                uint8_t const* ftr_bytes,
+                                size_t ftr_len,
+                                std::vector<int32_t> const& col_indices)
+{
+  CUDF_EXPECTS(hdr_len >= sizeof(FileHeader), "lenc::plan_read_from_buffers: short header");
+  ReadPlan plan{};
+  std::memcpy(&plan.header, hdr_bytes, sizeof(FileHeader));
+  CUDF_EXPECTS(std::memcmp(plan.header.magic, kMagic, 8) == 0,
+               "lenc::plan_read_from_buffers: bad magic");
+  size_t const expected_ftr = plan.header.num_cols * sizeof(ColumnMeta);
+  CUDF_EXPECTS(ftr_len >= expected_ftr, "lenc::plan_read_from_buffers: short footer");
+
+  std::vector<ColumnMeta> all_metas(plan.header.num_cols);
+  if (expected_ftr > 0) { std::memcpy(all_metas.data(), ftr_bytes, expected_ftr); }
+
+  plan.col_indices = col_indices;
+  plan.metas.reserve(col_indices.size());
+  plan.packed_payload_offsets.reserve(col_indices.size());
+  plan.packed_null_offsets.reserve(col_indices.size());
+  plan.col_mins.assign(col_indices.size(), 0);
+  plan.col_maxs.assign(col_indices.size(), 0);
+  plan.col_has_minmax.assign(col_indices.size(), 0);
+
+  uint64_t packed_off = 0;
+  for (int32_t const ci : col_indices) {
+    CUDF_EXPECTS(ci >= 0 && static_cast<uint32_t>(ci) < plan.header.num_cols,
+                 "lenc::plan_read_from_buffers: column index out of range");
+    ColumnMeta const& m = all_metas[static_cast<size_t>(ci)];
+    plan.metas.push_back(m);
+    packed_off = align_up(packed_off, 64);
+    plan.packed_payload_offsets.push_back(packed_off);
+    packed_off += m.payload_size;
+    if (m.has_nulls) {
+      packed_off = align_up(packed_off, 64);
+      plan.packed_null_offsets.push_back(packed_off);
+      packed_off += m.null_mask_size;
+    } else {
+      plan.packed_null_offsets.push_back(0);
+    }
+  }
+  plan.total_packed_bytes = align_up(packed_off, 64);
+  return plan;
+}
+
+std::vector<int64_t> plan_get_read_ranges(ReadPlan const& plan)
+{
+  std::vector<int64_t> ranges;
+  ranges.reserve(plan.metas.size() * 6);
+  for (size_t i = 0; i < plan.metas.size(); ++i) {
+    auto const& m = plan.metas[i];
+    if (m.payload_size > 0) {
+      ranges.push_back(static_cast<int64_t>(m.payload_offset));
+      ranges.push_back(static_cast<int64_t>(m.payload_size));
+      ranges.push_back(static_cast<int64_t>(plan.packed_payload_offsets[i]));
+    }
+    if (m.has_nulls && m.null_mask_size > 0) {
+      ranges.push_back(static_cast<int64_t>(m.null_mask_offset));
+      ranges.push_back(static_cast<int64_t>(m.null_mask_size));
+      ranges.push_back(static_cast<int64_t>(plan.packed_null_offsets[i]));
+    }
+  }
+  return ranges;
+}
+
 void read_to_host(std::string const& path, ReadPlan const& plan, uint8_t* host_dst)
 {
   if (plan.total_packed_bytes == 0 || plan.metas.empty()) { return; }
@@ -2628,7 +2694,73 @@ std::unique_ptr<cudf::table> decode_from_host_selected(
   return std::make_unique<cudf::table>(std::move(out_cols));
 }
 
-// Track 3: Single-H2D Unified Filter + Project / Decode LTO (eliminates Stage 2 re-open & 2nd H2D!)
+// Item 5: 1,024-row Chunk-Level Min-Max Pruning kernel (operates on existing .lenc FOR headers!)
+__global__ void lenc_chunk_minmax_prune_kernel(int64_t const* __restrict__ min_vals,
+                                               uint8_t const* __restrict__ bit_widths,
+                                               uint32_t num_chunks,
+                                               int32_t op,
+                                               uint8_t is_float,
+                                               double inv_scale,
+                                               int64_t int_bound,
+                                               double double_bound,
+                                               uint8_t* __restrict__ chunk_active)
+{
+  uint32_t const c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= num_chunks || chunk_active[c] == 0) { return; }
+  uint8_t const bw = bit_widths[c];
+  if (bw >= 63u) { return; }
+  int64_t const lo = min_vals[c];
+  uint64_t const rng = (bw == 0u) ? 0ULL : ((1ULL << bw) - 1ULL);
+  if (lo > 0 && static_cast<uint64_t>(lo) + rng > static_cast<uint64_t>(INT64_MAX)) { return; }
+  int64_t const hi = lo + static_cast<int64_t>(rng);
+  bool skip        = false;
+  if (is_float) {
+    double const fmin = static_cast<double>(lo) * inv_scale;
+    double const fmax = static_cast<double>(hi) * inv_scale;
+    double const b    = double_bound;
+    double const eps  = 1e-6 * ((fabs(b) > 1.0) ? fabs(b) : 1.0);
+    if (op == 0) skip = (fmin >= b + eps);
+    else if (op == 1) skip = (fmin > b + eps);
+    else if (op == 2) skip = (fmax <= b - eps);
+    else if (op == 3) skip = (fmax < b - eps);
+    else if (op == 4) skip = (b < fmin - eps || b > fmax + eps);
+  } else {
+    int64_t const b = int_bound;
+    if (op == 0) skip = (lo >= b);
+    else if (op == 1) skip = (lo > b);
+    else if (op == 2) skip = (hi <= b);
+    else if (op == 3) skip = (hi < b);
+    else if (op == 4) skip = (b < lo || b > hi);
+  }
+  if (skip) { chunk_active[c] = 0; }
+}
+
+__global__ void expand_active_chunk_rows_kernel(uint8_t const* __restrict__ chunk_active,
+                                                uint32_t const* __restrict__ chunk_out_offs,
+                                                uint32_t num_chunks,
+                                                uint32_t num_rows,
+                                                int32_t* __restrict__ out_row_ids)
+{
+  uint32_t const c = blockIdx.x;
+  if (c >= num_chunks || chunk_active[c] == 0) { return; }
+  uint32_t const r0  = c * kChunkSize;
+  uint32_t const len = min(kChunkSize, num_rows - r0);
+  uint32_t const dst = chunk_out_offs[c];
+  for (uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+    out_row_ids[dst + i] = static_cast<int32_t>(r0 + i);
+  }
+}
+
+__global__ void gather_selected_ids_kernel(int32_t const* __restrict__ cand_ids,
+                                           int32_t const* __restrict__ local_sel,
+                                           int32_t* __restrict__ out_ids,
+                                           uint32_t m)
+{
+  uint32_t const i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < m) { out_ids[i] = cand_ids[local_sel[i]]; }
+}
+
+// Track 3 + Item 5: Single-H2D Unified Filter + Project / Decode LTO with 1,024-row Chunk Pruning!
 std::unique_ptr<cudf::table> run_lto_filter_and_project(
   cudf::transform_program& filter_prog,
   cudf::transform_program* proj_prog,
@@ -2639,6 +2771,7 @@ std::unique_ptr<cudf::table> run_lto_filter_and_project(
   std::vector<int32_t> const& proj_col_map,
   std::vector<std::vector<std::string>> const& proj_dict_lits,
   std::vector<uint8_t> const& out_dict32,
+  std::vector<ChunkRangePred> const& chunk_preds,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
@@ -2655,6 +2788,59 @@ std::unique_ptr<cudf::table> run_lto_filter_and_project(
                                   stream.get()));
   }
   auto const* d_base = static_cast<uint8_t const*>(d_packed.data());
+
+  // Item 5: 1,024-row Chunk-Level Min-Max Pruning directly on d_packed FOR mini-block headers!
+  rmm::device_uvector<int32_t> d_cand_rows(0, stream, mr);
+  uint32_t stage1_nrows = num_rows;
+  int32_t const* stage1_sel_ptr = nullptr;
+  if (!chunk_preds.empty()) {
+    uint32_t const nc = (num_rows + kChunkSize - 1u) / kChunkSize;
+    rmm::device_uvector<uint8_t> d_active(nc, stream, mr);
+    CUDF_CUDA_TRY(cudaMemsetAsync(d_active.data(), 1, nc, stream.get()));
+    bool any_applied = false;
+    for (auto const& pr : chunk_preds) {
+      if (pr.col_slot < 0 || static_cast<size_t>(pr.col_slot) >= union_plan.metas.size()) continue;
+      auto const& m  = union_plan.metas[static_cast<size_t>(pr.col_slot)];
+      auto const enc = static_cast<Encoding>(m.encoding);
+      if (!m.has_nulls && (enc == Encoding::FOR_BITPACK || enc == Encoding::SCALED_FLOAT_FOR)) {
+        auto fv = make_for_view(d_base + union_plan.packed_payload_offsets[static_cast<size_t>(pr.col_slot)],
+                                num_rows);
+        double const inv = (m.scale_exp10 == 0) ? 1.0 : ((m.scale_exp10 == 2) ? 0.01 : 0.0001);
+        uint32_t const g = (nc + 255u) / 256u;
+        lenc_chunk_minmax_prune_kernel<<<g, 256, 0, stream.get()>>>(
+          fv.min_vals, fv.bit_widths, nc, pr.op, pr.is_float, inv, pr.int_bound, pr.double_bound,
+          d_active.data());
+        any_applied = true;
+      }
+    }
+    if (any_applied) {
+      std::vector<uint8_t> h_act(nc);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(h_act.data(), d_active.data(), nc, cudaMemcpyDeviceToHost, stream.get()));
+      stream.sync();
+      std::vector<uint32_t> h_offs(nc, 0);
+      uint32_t active_rows = 0;
+      uint32_t active_chunks = 0;
+      for (uint32_t c = 0; c < nc; ++c) {
+        h_offs[c] = active_rows;
+        if (h_act[c]) {
+          active_rows += std::min<uint32_t>(kChunkSize, num_rows - c * kChunkSize);
+          ++active_chunks;
+        }
+      }
+      if (active_rows == 0) { return nullptr; }
+      // Only materialize candidate row IDs if pruning skipped >= 10% of chunks!
+      if (active_chunks * 10u < nc * 9u) {
+        d_cand_rows.resize(active_rows, stream);
+        rmm::device_uvector<uint32_t> d_offs(nc, stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          d_offs.data(), h_offs.data(), nc * sizeof(uint32_t), cudaMemcpyHostToDevice, stream.get()));
+        expand_active_chunk_rows_kernel<<<nc, 256, 0, stream.get()>>>(
+          d_active.data(), d_offs.data(), nc, num_rows, d_cand_rows.data());
+        stage1_nrows   = active_rows;
+        stage1_sel_ptr = d_cand_rows.data();
+      }
+    }
+  }
 
   auto populate_desc = [&](std::vector<int32_t> const& cmap,
                            std::vector<std::vector<std::string>> const& dlits,
@@ -2752,18 +2938,31 @@ std::unique_ptr<cudf::table> run_lto_filter_and_project(
     return desc;
   };
 
-  // Stage 1: Filter LTO in registers on already-resident d_packed
+  // Stage 1: Filter LTO in registers on already-resident d_packed (only active chunks if pruned!)
   std::vector<rmm::device_buffer> d_temps;
-  auto f_desc = populate_desc(filter_col_map, filter_dict_lits, nullptr, d_temps);
+  auto f_desc = populate_desc(filter_col_map, filter_dict_lits, stage1_sel_ptr, d_temps);
   rmm::device_buffer d_fdesc(sizeof(LencLtoBatchDesc), stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
     d_fdesc.data(), &f_desc, sizeof(LencLtoBatchDesc), cudaMemcpyHostToDevice, stream.get()));
   auto mask_tbl = filter_prog.run_with_user_data(
-    d_fdesc.data(), static_cast<cudf::size_type>(num_rows), stream, mr);
-  auto sel_col = compact_mask_indices(mask_tbl->view().column(0), stream, mr);
-  if (sel_col->size() == 0) {
+    d_fdesc.data(), static_cast<cudf::size_type>(stage1_nrows), stream, mr);
+  auto local_sel = compact_mask_indices(mask_tbl->view().column(0), stream, mr);
+  if (local_sel->size() == 0) {
     stream.sync();
     return nullptr;
+  }
+  std::unique_ptr<cudf::column> sel_col;
+  if (stage1_sel_ptr != nullptr) {
+    sel_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                        local_sel->size(),
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        mr);
+    uint32_t const m = static_cast<uint32_t>(local_sel->size());
+    gather_selected_ids_kernel<<<(m + 255u) / 256u, 256, 0, stream.get()>>>(
+      stage1_sel_ptr, local_sel->view().data<int32_t>(), sel_col->mutable_view().data<int32_t>(), m);
+  } else {
+    sel_col = std::move(local_sel);
   }
 
   // Stage 2: Project LTO (or late-materialized decode) on the SAME d_packed buffer!

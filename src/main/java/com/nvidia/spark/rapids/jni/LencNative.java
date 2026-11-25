@@ -73,9 +73,8 @@ public final class LencNative {
       return planColScaleExp10Native(handle);
     }
 
-    public Table fusedQ1(HostMemoryBuffer src, int maxShipdateDays) {
-      long addr = totalPackedBytes() > 0 ? src.getAddress() : 0L;
-      return new Table(fusedQ1FromLencNative(handle, addr, maxShipdateDays));
+    public long[] readRanges() {
+      return planGetReadRangesNative(handle);
     }
 
     long nativeHandle() {
@@ -126,6 +125,10 @@ public final class LencNative {
 
   public static ReadPlan planRead(String path, int[] colIndices) {
     return new ReadPlan(planReadNative(path, colIndices));
+  }
+
+  public static ReadPlan planReadFromBuffers(byte[] hdrBytes, byte[] ftrBytes, int[] colIndices) {
+    return new ReadPlan(planReadFromBuffersNative(hdrBytes, ftrBytes, colIndices));
   }
 
   public static final class LtoProgram implements AutoCloseable {
@@ -209,13 +212,77 @@ public final class LencNative {
       String[][] filterDictLits,
       int[] projColMap,
       String[][] projDictLits,
-      byte[] outDict32) {
+      byte[] outDict32,
+      int[] cpSlots,
+      int[] cpOps,
+      byte[] cpIsFloat,
+      long[] cpIntBounds,
+      double[] cpDoubleBounds) {
     long addr = unionPlan.totalPackedBytes() > 0 ? src.getAddress() : 0L;
     long pHandle = projProg != null ? projProg.handle : 0L;
     long[] handles = runLtoFilterAndProjectNative(
         filterProg.handle, pHandle, unionPlan.nativeHandle(), addr,
-        filterColMap, filterDictLits, projColMap, projDictLits, outDict32);
+        filterColMap, filterDictLits, projColMap, projDictLits, outDict32,
+        cpSlots, cpOps, cpIsFloat, cpIntBounds, cpDoubleBounds);
     return handles == null ? null : new Table(handles);
+  }
+
+  public static final class JitReduceProgram implements AutoCloseable {
+    private long handle;
+
+    private JitReduceProgram(long handle) {
+      this.handle = handle;
+    }
+
+    public Table runOnLenc(
+        ReadPlan plan,
+        HostMemoryBuffer src,
+        String[][] dictLits,
+        int[] groupKeySlots,
+        int maxGroups,
+        byte[] aggKinds,
+        int[] cpSlots,
+        int[] cpOps,
+        byte[] cpIsFloat,
+        long[] cpIntBounds,
+        double[] cpDoubleBounds) {
+      long addr = plan.totalPackedBytes() > 0 ? src.getAddress() : 0L;
+      return new Table(runJitReduceLencNative(
+          handle, plan.nativeHandle(), addr, dictLits, groupKeySlots, maxGroups, aggKinds,
+          cpSlots, cpOps, cpIsFloat, cpIntBounds, cpDoubleBounds));
+    }
+
+    public Table runOnTable(
+        Table table,
+        String[][] dictLits,
+        int[] groupKeySlots,
+        int maxGroups,
+        byte[] aggKinds) {
+      return new Table(runJitReduceTableNative(
+          handle, table.getNativeView(), dictLits, groupKeySlots, maxGroups, aggKinds));
+    }
+
+    public Table runHighCardGroupBy(
+        Table groupKeys,
+        Table valueCols,
+        String[][] dictLits,
+        byte[] aggKinds) {
+      return new Table(runJitReduceHighCardNative(
+          handle, groupKeys.getNativeView(), valueCols.getNativeView(), dictLits, aggKinds));
+    }
+
+    @Override
+    public void close() {
+      if (handle != 0L) {
+        long h = handle;
+        handle = 0L;
+        destroyJitReduceNative(h);
+      }
+    }
+  }
+
+  public static JitReduceProgram compileJitReduce(String cudaSource, String kernelName) {
+    return new JitReduceProgram(compileJitReduceNative(cudaSource, kernelName));
   }
 
   public static DeviceMemoryBuffer[] splitAndEncodeShuffleToDevice(Table table, int... splits) {
@@ -252,31 +319,11 @@ public final class LencNative {
         hostOffsets, typeIds, scales, dictAsDictionary32));
   }
 
-  public static Table fusedQ1FromTable(Table table, int maxShipdateDays) {
-    return new Table(fusedQ1FromTableNative(table.getNativeView(), maxShipdateDays));
-  }
-
-  public static Table fusedWideDictCaseAgg(
-      Table groupKeys,
-      ColumnView metricCol,
-      ColumnView numerCol,
-      ColumnView denomCol,
-      String[] metricLiterals,
-      int[] outMetricIds,
-      double[] outCoeffs,
-      byte[] outUseDenom) {
-    return new Table(fusedWideDictCaseAggNative(
-        groupKeys.getNativeView(),
-        metricCol.getNativeView(),
-        numerCol.getNativeView(),
-        denomCol.getNativeView(),
-        metricLiterals,
-        outMetricIds,
-        outCoeffs,
-        outUseDenom));
-  }
-
   private static native void destroyLtoProgramNative(long ltoProgHandle);
+
+  private static native long planReadFromBuffersNative(byte[] hdr, byte[] ftr, int[] colIndices);
+
+  private static native long[] planGetReadRangesNative(long planHandle);
 
   private static native long[] planColMinsNative(long planHandle);
 
@@ -289,7 +336,8 @@ public final class LencNative {
   private static native long[] runLtoFilterAndProjectNative(
       long filterProgHandle, long projProgHandle, long unionPlanHandle, long hostAddr,
       int[] filterColMap, String[][] filterDictLits,
-      int[] projColMap, String[][] projDictLits, byte[] outDict32);
+      int[] projColMap, String[][] projDictLits, byte[] outDict32,
+      int[] cpSlots, int[] cpOps, byte[] cpIsFloat, long[] cpIntBounds, double[] cpDoubleBounds);
 
   private static native long[] splitAndEncodeShuffleNative(long tableView, int[] splits);
 
@@ -297,12 +345,19 @@ public final class LencNative {
       long hostAddr, long dataDevAddr, long dataDevLen, long[] hostOffsets,
       int[] typeIds, int[] scales, byte[] dict32);
 
-  private static native long[] fusedQ1FromLencNative(
-      long planHandle, long hostAddr, int maxShipdateDays);
+  private static native long compileJitReduceNative(String cudaSrc, String kernelName);
 
-  private static native long[] fusedQ1FromTableNative(long tableView, int maxShipdateDays);
+  private static native void destroyJitReduceNative(long progHandle);
 
-  private static native long[] fusedWideDictCaseAggNative(
-      long groupKeysView, long metricView, long numerView, long denomView,
-      String[] literals, int[] outMetricIds, double[] outCoeffs, byte[] outUseDenom);
+  private static native long[] runJitReduceLencNative(
+      long progHandle, long planHandle, long hostAddr, String[][] dictLits,
+      int[] groupKeySlots, int maxGroups, byte[] aggKinds,
+      int[] cpSlots, int[] cpOps, byte[] cpIsFloat, long[] cpIntBounds, double[] cpDoubleBounds);
+
+  private static native long[] runJitReduceTableNative(
+      long progHandle, long tableView, String[][] dictLits,
+      int[] groupKeySlots, int maxGroups, byte[] aggKinds);
+
+  private static native long[] runJitReduceHighCardNative(
+      long progHandle, long gkView, long valView, String[][] dictLits, byte[] aggKinds);
 }

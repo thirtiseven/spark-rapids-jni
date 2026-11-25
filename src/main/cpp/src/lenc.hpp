@@ -131,6 +131,33 @@ void write_table(cudf::table_view const& table,
 ReadPlan plan_read(std::string const& path, std::vector<int32_t> const& col_indices);
 
 /**
+ * Item 1 (Distributed / S3A / HDFS): Build ReadPlan purely from in-memory header + footer bytes
+ * fetched via Hadoop FileSystem / S3A (zero local POSIX open/pread).
+ */
+ReadPlan plan_read_from_buffers(uint8_t const* hdr_bytes,
+                                size_t hdr_len,
+                                uint8_t const* ftr_bytes,
+                                size_t ftr_len,
+                                std::vector<int32_t> const& col_indices);
+
+/**
+ * Returns flattened triples [file_offset, byte_len, packed_dst_offset, ...] for all projected
+ * column payloads and null masks so remote FS readers (S3A/HDFS) read ONLY projected byte ranges.
+ */
+std::vector<int64_t> plan_get_read_ranges(ReadPlan const& plan);
+
+/**
+ * Item 5: 1,024-row chunk-level Min-Max range predicate (op: 0=LT, 1=LE, 2=GT, 3=GE, 4=EQ).
+ */
+struct ChunkRangePred {
+  int32_t col_slot;
+  int32_t op;
+  uint8_t is_float;
+  int64_t int_bound;
+  double double_bound;
+};
+
+/**
  * Read all projected column byte ranges into a caller-provided host buffer (e.g. Spark pinned pool)
  * using POSIX pread(). Runs off the GPU semaphore.
  */
@@ -241,8 +268,9 @@ std::unique_ptr<cudf::table> run_lto_filter_and_project(
   std::vector<int32_t> const& proj_col_map,
   std::vector<std::vector<std::string>> const& proj_dict_lits,
   std::vector<uint8_t> const& out_dict32,
-  cuda::stream_ref stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  std::vector<ChunkRangePred> const& chunk_preds = {},
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 // ---------------- Track 1: GPU-Native Lightweight-Encoded Shuffle ----------------
 
@@ -274,44 +302,63 @@ std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
-// ---------------- Track 4: GPU Fused Conditional Aggregation / Reduce ----------------
+// ---------------- Item 2: Generic Compiler-Level NVRTC/LTO Reduce + Conditional GroupBy ---------
+
+struct JitReduceProgram;
 
 /**
- * Fused Q1 Filter + Arithmetic + Partial GroupBy-Reduce directly from packed .lenc (in-register!)
- * or from already-decoded Parquet table! Eliminates 97.5% full-table filter copy & intermediate
- * project columns, accumulating into shared-memory per-block group buckets.
- * Output columns: [l_returnflag(STR), l_linestatus(STR), sum_qty(F64), sum_base(F64),
- *                  sum_disc_price(F64), sum_charge(F64), sum_disc(F64), count(INT64)].
+ * Compile arbitrary Spark-generated CUDA reduction kernel source via NVRTC into a reusable
+ * device module (cached in executor pool; zero hardcoded query logic!).
  */
-std::unique_ptr<cudf::table> fused_q1_from_lenc(
+JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
+                                             std::string const& kernel_name);
+
+void destroy_jit_reduce_program(JitReduceProgram* prog);
+
+/**
+ * Generic Mode 0 (Global Reduce) & Mode 1 (Low-Cardinality GroupBy <= 64 buckets) from compressed
+ * .lenc buffer IN REGISTERS (with optional 1,024-row chunk Min-Max pruning!).
+ * Output columns: [group_key_cols... (if num_group_keys > 0), agg_output_cols...].
+ * agg_kinds: 0=SUM_F64, 1=SUM_I64, 2=COUNT_I64, 3=MIN_F64, 4=MAX_F64, 5=MIN_I64, 6=MAX_I64.
+ */
+std::unique_ptr<cudf::table> run_jit_reduce_lenc(
+  JitReduceProgram& prog,
   ReadPlan const& plan,
   uint8_t const* host_src,
-  int32_t max_shipdate_days,
-  cuda::stream_ref stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  std::vector<std::vector<std::string>> const& dict_lits,
+  std::vector<int32_t> const& group_key_slots,
+  int32_t max_groups,
+  std::vector<uint8_t> const& agg_kinds,
+  std::vector<ChunkRangePred> const& chunk_preds = {},
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
-std::unique_ptr<cudf::table> fused_q1_from_table(
+/**
+ * Generic Mode 0 (Global Reduce) & Mode 1 (Low-Cardinality GroupBy <= 64 buckets) from already-
+ * decoded Parquet/GPU Table (zero-rewrite Parquet support!).
+ */
+std::unique_ptr<cudf::table> run_jit_reduce_table(
+  JitReduceProgram& prog,
   cudf::table_view const& table,
-  int32_t max_shipdate_days,
+  std::vector<std::vector<std::string>> const& dict_lits,
+  std::vector<int32_t> const& group_key_slots,
+  int32_t max_groups,
+  std::vector<uint8_t> const& agg_kinds,
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
- * Fused Dictionary-Bucketed Wide `SUM(CASE WHEN metric_name = lit_k THEN val * coeff)` Partial
- * Hash-Aggregate (e.g. Netflix Job 48 36-way CASE WHEN):
- * Computes unique group IDs once over `group_keys`, then in ONE GPU kernel scatters each row's
- * numer/denom contribution ONLY into its matching metric slot(s) via atomicAdd — zero 36-column
- * intermediate DOUBLE materialization!
+ * Generic Mode 2 (Arbitrary High-Cardinality Conditional GroupBy):
+ * Runs cudf::groupby::get_groups() ONCE over `group_keys`, remaps any DICTIONARY32/STRING input
+ * columns with `dict_lits` to canonical INT32 codes, and runs the NVRTC-compiled generic per-group
+ * kernel writing directly into `agg_kinds.size()` output columns (zero intermediate CASE columns!).
  */
-std::unique_ptr<cudf::table> fused_wide_dict_case_agg(
+std::unique_ptr<cudf::table> run_jit_reduce_highcard_groupby(
+  JitReduceProgram& prog,
   cudf::table_view const& group_keys,
-  cudf::column_view const& metric_col,  // DICTIONARY32 or STRING
-  cudf::column_view const& numer_col,   // FLOAT64
-  cudf::column_view const& denom_col,   // FLOAT64
-  std::vector<std::string> const& metric_literals,
-  std::vector<int32_t> const& out_metric_ids,
-  std::vector<double> const& out_coeffs,
-  std::vector<uint8_t> const& out_use_denom,
+  cudf::table_view const& value_cols,
+  std::vector<std::vector<std::string>> const& dict_lits,
+  std::vector<uint8_t> const& agg_kinds,
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
