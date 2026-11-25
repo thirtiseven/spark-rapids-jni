@@ -224,6 +224,20 @@ __global__ void scatter_for256_slices_kernel(uint8_t* __restrict__ d_out,
   }
 }
 
+__global__ void scatter_headers_kernel(uint8_t const* __restrict__ src_hdrs,
+                                       uint8_t* __restrict__ d_out,
+                                       int64_t const* __restrict__ part_offs,
+                                       uint32_t const* __restrict__ part_lens,
+                                       size_t hdr_stride,
+                                       uint32_t num_parts)
+{
+  uint32_t const p = blockIdx.x;
+  if (p >= num_parts || part_lens[p] == 0u) { return; }
+  uint8_t const* s = src_hdrs + static_cast<size_t>(p) * hdr_stride;
+  uint8_t* d       = d_out + part_offs[p];
+  for (size_t i = threadIdx.x; i < hdr_stride; i += blockDim.x) { d[i] = s[i]; }
+}
+
 __global__ void scatter_lz4_slices_kernel(uint8_t const* __restrict__ comp_base,
                                           uint8_t const* __restrict__ raw_base,
                                           uint8_t* __restrict__ d_out,
@@ -851,7 +865,11 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     size_t total_raw_b = 0;
     for (uint32_t c = 0; c < ncols; ++c) {
       auto& w = works[c];
-      if (w.tid != cudf::type_id::FLOAT32 && w.tid != cudf::type_id::FLOAT64) continue;
+      // Only run GPU nvCOMP LZ4 on nullable/sparse FLOAT/DOUBLE columns (e.g. NF48 36-DOUBLE partial agg)
+      // — avoids wasting GPU bandwidth & VRAM on dense incompressible FLOAT32 payloads (e.g. l_extendedprice)!
+      if ((w.tid != cudf::type_id::FLOAT32 && w.tid != cudf::type_id::FLOAT64) || !w.has_nulls) {
+        continue;
+      }
       auto const cv        = table.column(static_cast<cudf::size_type>(c));
       auto const* col_base =
         static_cast<uint8_t const*>(cv.head()) + static_cast<size_t>(cv.offset()) * w.elem_size;
@@ -999,8 +1017,24 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       m.type_id        = static_cast<uint8_t>(works[c].tid);
       std::memcpy(hp + kudo_hdr + sizeof(lh) + c * sizeof(ShufColMeta), &m, sizeof(m));
     }
+  }
+  rmm::device_buffer d_offs((n_parts + 1) * sizeof(int64_t), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(d_offs.data(),
+                                h_part_offsets.data(),
+                                (n_parts + 1) * sizeof(int64_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
+  rmm::device_buffer d_hdrs(h_hdrs.size(), stream, mr);
+  if (!h_hdrs.empty()) {
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      d_base + h_part_offsets[p], hp, hdr_stride, cudaMemcpyHostToDevice, stream.get()));
+      d_hdrs.data(), h_hdrs.data(), h_hdrs.size(), cudaMemcpyHostToDevice, stream.get()));
+    scatter_headers_kernel<<<static_cast<uint32_t>(n_parts), 64, 0, stream.get()>>>(
+      static_cast<uint8_t const*>(d_hdrs.data()),
+      d_base,
+      static_cast<int64_t const*>(d_offs.data()),
+      d_part_len.data(),
+      hdr_stride,
+      static_cast<uint32_t>(n_parts));
   }
 
   // Launch ONE GPU scatter kernel per column across ALL 200 partitions in parallel!
@@ -1123,12 +1157,6 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     }
   }
 
-  rmm::device_buffer d_offs((n_parts + 1) * sizeof(int64_t), stream, mr);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(d_offs.data(),
-                                h_part_offsets.data(),
-                                (n_parts + 1) * sizeof(int64_t),
-                                cudaMemcpyHostToDevice,
-                                stream.get()));
   stream.sync();
   return {std::move(d_data), std::move(d_offs)};
 }
