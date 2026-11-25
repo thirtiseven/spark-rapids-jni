@@ -17,10 +17,14 @@
 #include "cudf_jni_apis.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/interop.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -33,7 +37,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -78,7 +82,6 @@ struct ArrowDeviceArray {
 
 namespace {
 
-// Minimal C-ABI declarations matching vortex/vortex-ffi/cinclude/vortex.h & vortex_cuda.h
 struct vx_session;
 struct vx_error;
 struct vx_dtype;
@@ -116,6 +119,14 @@ struct VortexCudaApi {
                                                  vx_view const*,
                                                  size_t,
                                                  vx_error**)                                = nullptr;
+  vx_cuda_device_batches* (*scan_device_batches_with_rows)(vx_session const*,
+                                                           vx_view,
+                                                           vx_cuda_scan_options const*,
+                                                           vx_view const*,
+                                                           size_t,
+                                                           uint64_t const*,
+                                                           size_t,
+                                                           vx_error**)                      = nullptr;
   int (*device_batches_next)(
     vx_cuda_device_batches*, ArrowSchema*, ArrowDeviceArray*, vx_error**)                   = nullptr;
   void (*device_batches_free)(vx_cuda_device_batches*)                                      = nullptr;
@@ -163,6 +174,7 @@ struct VortexCudaApi {
       a.load(a.sink_push, "vx_array_sink_push");
       a.load(a.sink_close, "vx_array_sink_close");
       a.load(a.scan_device_batches, "vx_cuda_scan_path_device_batches");
+      a.load(a.scan_device_batches_with_rows, "vx_cuda_scan_path_device_batches_with_rows");
       a.load(a.device_batches_next, "vx_cuda_device_batches_next");
       a.load(a.device_batches_free, "vx_cuda_device_batches_free");
 
@@ -176,8 +188,174 @@ struct VortexCudaApi {
   }
 };
 
-struct VortexScanState {
-  vx_cuda_device_batches* batches{nullptr};
+struct RawArrowBatch {
+  ArrowSchema schema{};
+  ArrowDeviceArray dev_arr{};
+
+  RawArrowBatch() = default;
+  RawArrowBatch(RawArrowBatch&& o) noexcept : schema(o.schema), dev_arr(o.dev_arr)
+  {
+    o.schema.release        = nullptr;
+    o.dev_arr.array.release = nullptr;
+  }
+  RawArrowBatch& operator=(RawArrowBatch&& o) noexcept
+  {
+    if (this != &o) {
+      release();
+      schema                  = o.schema;
+      dev_arr                 = o.dev_arr;
+      o.schema.release        = nullptr;
+      o.dev_arr.array.release = nullptr;
+    }
+    return *this;
+  }
+  RawArrowBatch(RawArrowBatch const&)            = delete;
+  RawArrowBatch& operator=(RawArrowBatch const&) = delete;
+
+  void release() noexcept
+  {
+    if (dev_arr.array.release != nullptr) {
+      dev_arr.array.release(&dev_arr.array);
+      dev_arr.array.release = nullptr;
+    }
+    if (schema.release != nullptr) {
+      schema.release(&schema);
+      schema.release = nullptr;
+    }
+  }
+  ~RawArrowBatch() { release(); }
+};
+
+// Single-pass zero-double-copy materializer: takes 1+ raw ArrowDeviceArray batches,
+// imports zero-copy via cudf::from_arrow_device, and runs ONE GPU concatenate + ONE sync!
+std::unique_ptr<cudf::table> materialize_raw_batches(
+  std::vector<RawArrowBatch>& raw_batches,
+  std::vector<uint8_t> const& keep_dict32,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::unique_table_view_t> holders;
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> decoded_temps;
+  std::vector<cudf::table_view> norm_views;
+  holders.reserve(raw_batches.size());
+  decoded_temps.reserve(raw_batches.size());
+  norm_views.reserve(raw_batches.size());
+
+  for (auto& rb : raw_batches) {
+    auto h  = cudf::from_arrow_device(&rb.schema, &rb.dev_arr, stream, mr);
+    auto tv = *h;
+    std::vector<cudf::column_view> cols;
+    cols.reserve(static_cast<size_t>(tv.num_columns()));
+    std::vector<std::unique_ptr<cudf::column>> temps;
+    for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
+      auto cv = tv.column(c);
+      bool const want_d32 =
+        (static_cast<size_t>(c) < keep_dict32.size() && keep_dict32[static_cast<size_t>(c)] != 0);
+      if (cv.type().id() == cudf::type_id::DICTIONARY32 && !want_d32) {
+        auto dec = cudf::dictionary::decode(cudf::dictionary_column_view(cv), stream, mr);
+        cols.push_back(dec->view());
+        temps.push_back(std::move(dec));
+      } else {
+        cols.push_back(cv);
+      }
+    }
+    holders.push_back(std::move(h));
+    decoded_temps.push_back(std::move(temps));
+    norm_views.emplace_back(cols);
+  }
+
+  std::unique_ptr<cudf::table> out_tbl;
+  if (norm_views.size() == 1) {
+    auto const& tv = norm_views[0];
+    std::vector<std::unique_ptr<cudf::column>> owned_cols;
+    owned_cols.reserve(static_cast<size_t>(tv.num_columns()));
+    size_t tmp_idx = 0;
+    auto& temps0   = decoded_temps[0];
+    for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
+      auto cv = tv.column(c);
+      if (tmp_idx < temps0.size() && temps0[tmp_idx]->view().head() == cv.head() &&
+          temps0[tmp_idx]->type() == cv.type()) {
+        owned_cols.push_back(std::move(temps0[tmp_idx++]));
+      } else {
+        owned_cols.push_back(std::make_unique<cudf::column>(cv, stream, mr));
+      }
+    }
+    out_tbl = std::make_unique<cudf::table>(std::move(owned_cols));
+  } else {
+    out_tbl = cudf::concatenate(norm_views, stream, mr);
+  }
+  stream.sync();
+  decoded_temps.clear();
+  holders.clear();
+  raw_batches.clear();
+  return out_tbl;
+}
+
+// Synchronous single-thread multi-file scan state (paced strictly by GpuSemaphore — zero SM contention!)
+struct VortexMultiFileScanState {
+  std::vector<std::string> files;
+  std::vector<std::string> col_names;
+  size_t batch_rows{0};
+  size_t file_idx{0};
+  vx_cuda_device_batches* active{nullptr};
+  std::deque<RawArrowBatch> pushback;
+
+  bool pop_next(RawArrowBatch& out)
+  {
+    if (!pushback.empty()) {
+      out = std::move(pushback.front());
+      pushback.pop_front();
+      return true;
+    }
+    auto& api = VortexCudaApi::get();
+    std::vector<vx_view> col_views;
+    col_views.reserve(col_names.size());
+    for (auto const& s : col_names) { col_views.push_back(vx_view{s.data(), s.size()}); }
+    vx_cuda_scan_options opts{};
+    opts.flags      = 0u;
+    opts.batch_rows = batch_rows;
+
+    while (true) {
+      if (active != nullptr) {
+        RawArrowBatch item;
+        vx_error* err = nullptr;
+        int rc        = api.device_batches_next(active, &item.schema, &item.dev_arr, &err);
+        if (rc != 0 || err != nullptr) {
+          api.device_batches_free(active);
+          active = nullptr;
+          CUDF_FAIL("VortexJni: device_batches_next failed: " + api.consume_error(err));
+        }
+        if (item.dev_arr.array.release != nullptr || item.schema.release != nullptr) {
+          if (item.dev_arr.array.length == 0) { continue; }
+          out = std::move(item);
+          return true;
+        }
+        api.device_batches_free(active);
+        active = nullptr;
+      }
+      if (file_idx >= files.size()) { return false; }
+      auto const& path_str = files[file_idx++];
+      vx_error* err        = nullptr;
+      vx_view pview{path_str.data(), path_str.size()};
+      active = api.scan_device_batches(api.shared_session,
+                                       pview,
+                                       &opts,
+                                       col_views.empty() ? nullptr : col_views.data(),
+                                       col_views.size(),
+                                       &err);
+      CUDF_EXPECTS(active != nullptr && err == nullptr,
+                   "VortexJni: scan_device_batches failed on " + path_str + ": " + api.consume_error(err));
+    }
+  }
+
+  ~VortexMultiFileScanState()
+  {
+    pushback.clear();
+    if (active != nullptr) {
+      VortexCudaApi::get().device_batches_free(active);
+      active = nullptr;
+    }
+  }
 };
 
 }  // namespace
@@ -190,7 +368,7 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_writeTableN
   JNI_TRY
   {
     cudf::jni::auto_set_device(env);
-    auto& api = VortexCudaApi::get();
+    auto& api      = VortexCudaApi::get();
     auto const* tv = reinterpret_cast<cudf::table_view const*>(j_table_view);
     cudf::jni::native_jstring path(env, j_path);
 
@@ -210,8 +388,8 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_writeTableN
     auto host_arr = cudf::to_arrow_host(*tv, stream);
     stream.sync();
 
-    vx_error* err        = nullptr;
-    vx_dtype const* vdt  = api.dtype_from_arrow(api.shared_session, schema_d.get(), &err);
+    vx_error* err       = nullptr;
+    vx_dtype const* vdt = api.dtype_from_arrow(api.shared_session, schema_d.get(), &err);
     CUDF_EXPECTS(vdt != nullptr && err == nullptr,
                  "VortexJni: vx_dtype_from_arrow_schema failed: " + api.consume_error(err));
 
@@ -222,9 +400,8 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_writeTableN
     CUDF_EXPECTS(sink != nullptr && err == nullptr,
                  "VortexJni: vx_cuda_array_sink_open_file failed: " + api.consume_error(err));
 
-    // Transfer host ArrowArray + ArrowSchema into vx_array
-    ArrowArray raw_arr = host_arr->array;
-    host_arr->array.release = nullptr;  // ownership transferred to raw_arr
+    ArrowArray raw_arr      = host_arr->array;
+    host_arr->array.release = nullptr;
     vx_array const* vx_arr =
       api.array_from_arrow(api.shared_session, &raw_arr, schema_a.get(), false, &err);
     if (vx_arr == nullptr || err != nullptr) {
@@ -251,59 +428,49 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_writeTableN
   JNI_CATCH(env, );
 }
 
-JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_openScanNative(
-  JNIEnv* env, jclass, jstring j_path, jobjectArray j_col_names, jlong j_batch_rows)
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_openMultiScanNative(
+  JNIEnv* env, jclass, jobjectArray j_paths, jobjectArray j_col_names, jlong j_batch_rows, jint)
 {
   JNI_TRY
   {
     cudf::jni::auto_set_device(env);
-    auto& api = VortexCudaApi::get();
-    cudf::jni::native_jstring path(env, j_path);
-    std::string const path_str(path.get());
+    (void)VortexCudaApi::get();
 
-    jsize const ncols = (j_col_names != nullptr) ? env->GetArrayLength(j_col_names) : 0;
-    std::vector<std::string> col_strs;
-    std::vector<vx_view> col_views;
-    col_strs.reserve(static_cast<size_t>(ncols));
-    col_views.reserve(static_cast<size_t>(ncols));
-    for (jsize i = 0; i < ncols; ++i) {
-      auto js = static_cast<jstring>(env->GetObjectArrayElement(j_col_names, i));
+    auto* st       = new VortexMultiFileScanState();
+    st->batch_rows = (j_batch_rows > 0) ? static_cast<size_t>(j_batch_rows) : 0u;
+
+    jsize const nf = env->GetArrayLength(j_paths);
+    st->files.reserve(static_cast<size_t>(nf));
+    for (jsize i = 0; i < nf; ++i) {
+      auto js = static_cast<jstring>(env->GetObjectArrayElement(j_paths, i));
       cudf::jni::native_jstring ns(env, js);
-      col_strs.emplace_back(ns.get());
+      st->files.emplace_back(ns.get());
       env->DeleteLocalRef(js);
     }
-    for (auto const& s : col_strs) { col_views.push_back(vx_view{s.data(), s.size()}); }
 
-    vx_cuda_scan_options opts{};
-    opts.flags      = 0u;
-    opts.batch_rows = (j_batch_rows > 0) ? static_cast<size_t>(j_batch_rows) : 0u;
+    jsize const nc = (j_col_names != nullptr) ? env->GetArrayLength(j_col_names) : 0;
+    st->col_names.reserve(static_cast<size_t>(nc));
+    for (jsize i = 0; i < nc; ++i) {
+      auto js = static_cast<jstring>(env->GetObjectArrayElement(j_col_names, i));
+      cudf::jni::native_jstring ns(env, js);
+      st->col_names.emplace_back(ns.get());
+      env->DeleteLocalRef(js);
+    }
 
-    vx_error* err = nullptr;
-    vx_view pview{path_str.data(), path_str.size()};
-    auto* batches = api.scan_device_batches(api.shared_session,
-                                            pview,
-                                            &opts,
-                                            col_views.empty() ? nullptr : col_views.data(),
-                                            col_views.size(),
-                                            &err);
-    CUDF_EXPECTS(batches != nullptr && err == nullptr,
-                 "VortexJni: vx_cuda_scan_path_device_batches failed: " + api.consume_error(err));
-    auto* st = new VortexScanState{batches};
     return std::bit_cast<jlong>(st);
   }
   JNI_CATCH(env, 0);
 }
 
-JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextBatchNative(
-  JNIEnv* env, jclass, jlong j_handle, jbyteArray j_dict32_mask)
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextCoalescedBatchNative(
+  JNIEnv* env, jclass, jlong j_handle, jbyteArray j_dict32_mask, jlong j_target_bytes)
 {
   JNI_TRY
   {
     cudf::jni::auto_set_device(env);
-    auto& api     = VortexCudaApi::get();
-    auto* st      = std::bit_cast<VortexScanState*>(j_handle);
-    auto stream   = cudf::get_default_stream();
-    auto mr       = cudf::get_current_device_resource_ref();
+    auto* st    = std::bit_cast<VortexMultiFileScanState*>(j_handle);
+    auto stream = cudf::get_default_stream();
+    auto mr     = cudf::get_current_device_resource_ref();
 
     std::vector<uint8_t> keep_dict32;
     if (j_dict32_mask != nullptr) {
@@ -314,69 +481,188 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextB
       }
     }
 
-    while (true) {
-      ArrowSchema schema{};
-      ArrowDeviceArray dev_arr{};
-      vx_error* err = nullptr;
-      int rc        = api.device_batches_next(st->batches, &schema, &dev_arr, &err);
-      if (rc != 0 || err != nullptr) {
-        if (dev_arr.array.release != nullptr) { dev_arr.array.release(&dev_arr.array); }
-        if (schema.release != nullptr) { schema.release(&schema); }
-        CUDF_FAIL("VortexJni: vx_cuda_device_batches_next failed: " + api.consume_error(err));
-      }
-      // EOS: both release callbacks are null
-      if (dev_arr.array.release == nullptr && schema.release == nullptr) { return nullptr; }
+    RawArrowBatch first;
+    if (!st->pop_next(first)) { return nullptr; }
 
-      struct ArrowGuard {
-        ArrowSchema* s;
-        ArrowDeviceArray* a;
-        ~ArrowGuard()
-        {
-          if (a->array.release != nullptr) { a->array.release(&a->array); }
-          if (s->release != nullptr) { s->release(s); }
-        }
-      } guard{&schema, &dev_arr};
-
-      if (dev_arr.array.length == 0) { continue; }
-
-      // Zero-copy Arrow C Device import into cuDF (waits on dev_arr.sync_event on `stream`!)
-      auto tv_holder = cudf::from_arrow_device(&schema, &dev_arr, stream, mr);
-      auto tv        = *tv_holder;
-
-      // Materialize RMM-owned columns (decoding DICTIONARY32 unless requested in keep_dict32)
-      // and sync stream before releasing Vortex's device buffers!
-      std::vector<std::unique_ptr<cudf::column>> owned_cols;
-      owned_cols.reserve(static_cast<size_t>(tv.num_columns()));
-      for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
-        auto cv = tv.column(c);
-        bool const want_d32 =
-          (static_cast<size_t>(c) < keep_dict32.size() && keep_dict32[static_cast<size_t>(c)] != 0);
-        if (cv.type().id() == cudf::type_id::DICTIONARY32 && !want_d32) {
-          owned_cols.push_back(cudf::dictionary::decode(cudf::dictionary_column_view(cv), stream, mr));
-        } else {
-          owned_cols.push_back(std::make_unique<cudf::column>(cv, stream, mr));
+    auto has_kept_d32 = [&](ArrowSchema const& s) -> bool {
+      if (keep_dict32.empty()) { return false; }
+      for (int64_t c = 0; c < s.n_children && static_cast<size_t>(c) < keep_dict32.size(); ++c) {
+        if (keep_dict32[static_cast<size_t>(c)] != 0 && s.children[c]->dictionary != nullptr) {
+          return true;
         }
       }
-      stream.sync();
-      auto tbl = std::make_unique<cudf::table>(std::move(owned_cols));
-      return cudf::jni::convert_table_for_return(env, std::move(tbl));
+      return false;
+    };
+
+    std::vector<RawArrowBatch> raw_batches;
+    bool const first_d32 = has_kept_d32(first.schema);
+    int64_t acc_rows     = first.dev_arr.array.length;
+    size_t acc_bytes     = static_cast<size_t>(acc_rows) * std::max<size_t>(st->col_names.size(), 1u) * 8u;
+    raw_batches.push_back(std::move(first));
+
+    size_t const target_b = (j_target_bytes > 0) ? static_cast<size_t>(j_target_bytes) : 0u;
+    if (target_b > 0 && !first_d32) {
+      while (acc_bytes < target_b && acc_rows < 80000000LL) {
+        RawArrowBatch nxt;
+        if (!st->pop_next(nxt)) { break; }
+        if (has_kept_d32(nxt.schema)) {
+          st->pushback.push_front(std::move(nxt));
+          break;
+        }
+        acc_rows += nxt.dev_arr.array.length;
+        acc_bytes += static_cast<size_t>(nxt.dev_arr.array.length) *
+                     std::max<size_t>(st->col_names.size(), 1u) * 8u;
+        raw_batches.push_back(std::move(nxt));
+      }
     }
+
+    auto out_tbl = materialize_raw_batches(raw_batches, keep_dict32, stream, mr);
+    return cudf::jni::convert_table_for_return(env, std::move(out_tbl));
   }
   JNI_CATCH(env, nullptr);
 }
 
-JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_closeScanNative(
+JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_closeMultiScanNative(
   JNIEnv* env, jclass, jlong j_handle)
 {
   JNI_TRY
   {
-    auto* st = std::bit_cast<VortexScanState*>(j_handle);
-    if (st != nullptr) {
-      if (st->batches != nullptr) { VortexCudaApi::get().device_batches_free(st->batches); }
-      delete st;
-    }
+    auto* st = std::bit_cast<VortexMultiFileScanState*>(j_handle);
+    delete st;
   }
   JNI_CATCH(env, );
+}
+
+// Opt V2: GPU 2-Phase Late Materialization helpers!
+// 1. Scan one file completely (or with strictly-sorted u64 row indices via vx_cuda_scan_path_device_batches_with_rows!)
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_scanFileWithRowsNative(
+  JNIEnv* env,
+  jclass,
+  jstring j_path,
+  jobjectArray j_col_names,
+  jlongArray j_row_indices,
+  jbyteArray j_dict32_mask)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto& api   = VortexCudaApi::get();
+    auto stream = cudf::get_default_stream();
+    auto mr     = cudf::get_current_device_resource_ref();
+    cudf::jni::native_jstring path(env, j_path);
+    std::string const path_str(path.get());
+
+    jsize const nc = (j_col_names != nullptr) ? env->GetArrayLength(j_col_names) : 0;
+    std::vector<std::string> col_strs;
+    std::vector<vx_view> col_views;
+    col_strs.reserve(static_cast<size_t>(nc));
+    col_views.reserve(static_cast<size_t>(nc));
+    for (jsize i = 0; i < nc; ++i) {
+      auto js = static_cast<jstring>(env->GetObjectArrayElement(j_col_names, i));
+      cudf::jni::native_jstring ns(env, js);
+      col_strs.emplace_back(ns.get());
+      env->DeleteLocalRef(js);
+    }
+    for (auto const& s : col_strs) { col_views.push_back(vx_view{s.data(), s.size()}); }
+
+    std::vector<uint8_t> keep_dict32;
+    if (j_dict32_mask != nullptr) {
+      cudf::jni::native_jbyteArray nb(env, j_dict32_mask);
+      keep_dict32.resize(static_cast<size_t>(nb.size()));
+      for (size_t i = 0; i < keep_dict32.size(); ++i) {
+        keep_dict32[i] = static_cast<uint8_t>(nb[i]);
+      }
+    }
+
+    std::vector<uint64_t> row_idx;
+    uint64_t const* rptr = nullptr;
+    size_t rlen          = 0;
+    if (j_row_indices != nullptr) {
+      cudf::jni::native_jlongArray nr(env, j_row_indices);
+      rlen = static_cast<size_t>(nr.size());
+      if (rlen == 0) { return nullptr; }
+      row_idx.resize(rlen);
+      for (size_t i = 0; i < rlen; ++i) { row_idx[i] = static_cast<uint64_t>(nr[i]); }
+      rptr = row_idx.data();
+    }
+
+    vx_cuda_scan_options opts{};
+    opts.flags      = 0u;
+    opts.batch_rows = 0u;
+    vx_error* err   = nullptr;
+    vx_view pview{path_str.data(), path_str.size()};
+    vx_cuda_device_batches* batches =
+      (rptr != nullptr)
+        ? api.scan_device_batches_with_rows(api.shared_session,
+                                            pview,
+                                            &opts,
+                                            col_views.empty() ? nullptr : col_views.data(),
+                                            col_views.size(),
+                                            rptr,
+                                            rlen,
+                                            &err)
+        : api.scan_device_batches(api.shared_session,
+                                  pview,
+                                  &opts,
+                                  col_views.empty() ? nullptr : col_views.data(),
+                                  col_views.size(),
+                                  &err);
+    CUDF_EXPECTS(batches != nullptr && err == nullptr,
+                 "VortexJni: scanFileWithRows failed on " + path_str + ": " + api.consume_error(err));
+
+    std::vector<RawArrowBatch> raw_batches;
+    while (true) {
+      RawArrowBatch item;
+      vx_error* berr = nullptr;
+      int rc         = api.device_batches_next(batches, &item.schema, &item.dev_arr, &berr);
+      if (rc != 0 || berr != nullptr) {
+        api.device_batches_free(batches);
+        CUDF_FAIL("VortexJni: scanFileWithRows next failed: " + api.consume_error(berr));
+      }
+      if (item.dev_arr.array.release == nullptr && item.schema.release == nullptr) { break; }
+      if (item.dev_arr.array.length == 0) { continue; }
+      raw_batches.push_back(std::move(item));
+    }
+    api.device_batches_free(batches);
+    if (raw_batches.empty()) { return nullptr; }
+
+    auto out_tbl = materialize_raw_batches(raw_batches, keep_dict32, stream, mr);
+    return cudf::jni::convert_table_for_return(env, std::move(out_tbl));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+// 2. Compact a BOOL8 GPU mask column into strictly-sorted int64_t surviving row indices on host!
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_maskToRowIndicesNative(
+  JNIEnv* env, jclass, jlong j_mask_col_view)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto stream    = cudf::get_default_stream();
+    auto mr        = cudf::get_current_device_resource_ref();
+    auto const* mv = reinterpret_cast<cudf::column_view const*>(j_mask_col_view);
+    auto const n   = mv->size();
+    if (n == 0) {
+      cudf::jni::native_jlongArray empty(env, 0);
+      return empty.get_jArray();
+    }
+    cudf::numeric_scalar<int64_t> zero(0, true, stream);
+    auto seq     = cudf::sequence(n, zero, stream, mr);
+    auto idx_tbl = cudf::apply_retention_mask(cudf::table_view({seq->view()}), *mv, stream, mr);
+    auto const m = idx_tbl->num_rows();
+    cudf::jni::native_jlongArray ret(env, m);
+    if (m > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(ret.data(),
+                                    idx_tbl->get_column(0).view().data<int64_t>(),
+                                    static_cast<size_t>(m) * sizeof(int64_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+    }
+    return ret.get_jArray();
+  }
+  JNI_CATCH(env, nullptr);
 }
 
 }  // extern "C"

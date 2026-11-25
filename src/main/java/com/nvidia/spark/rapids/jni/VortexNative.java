@@ -16,12 +16,13 @@
 
 package com.nvidia.spark.rapids.jni;
 
+import ai.rapids.cudf.ColumnView;
 import ai.rapids.cudf.NativeDepsLoader;
 import ai.rapids.cudf.Table;
 
 /**
  * JNI bridge for Tier 1 Standard Vortex GPU scanning & writing via official vortex-cuda-ffi
- * (Arrow C Device ABI -> cudf::from_arrow_device zero-copy GPU import).
+ * with single-pass zero-double-copy coalescing and GPU 2-Phase Late Materialization.
  */
 public final class VortexNative {
   static {
@@ -34,18 +35,18 @@ public final class VortexNative {
     writeTableNative(table.getNativeView(), colNames, path);
   }
 
-  public static final class DeviceScan implements AutoCloseable {
+  public static final class MultiFileScan implements AutoCloseable {
     private long handle;
 
-    private DeviceScan(long handle) {
+    private MultiFileScan(long handle) {
       this.handle = handle;
     }
 
-    public Table nextBatch(byte[] dict32Mask) {
+    public Table nextCoalescedBatch(byte[] dict32Mask, long coalesceTargetBytes) {
       if (handle == 0L) {
         return null;
       }
-      long[] cols = nextBatchNative(handle, dict32Mask);
+      long[] cols = nextCoalescedBatchNative(handle, dict32Mask, coalesceTargetBytes);
       return cols == null ? null : new Table(cols);
     }
 
@@ -54,20 +55,40 @@ public final class VortexNative {
       if (handle != 0L) {
         long h = handle;
         handle = 0L;
-        closeScanNative(h);
+        closeMultiScanNative(h);
       }
     }
   }
 
-  public static DeviceScan openScan(String path, String[] colNames, long batchRows) {
-    return new DeviceScan(openScanNative(path, colNames, batchRows));
+  public static MultiFileScan openMultiScan(
+      String[] filePaths, String[] colNames, long batchRows, int prefetchCap) {
+    return new MultiFileScan(openMultiScanNative(filePaths, colNames, batchRows, prefetchCap));
+  }
+
+  /** Opt V2: Scan a single Vortex file projecting colNames (optionally taking ONLY rowIndices!). */
+  public static Table scanFileWithRows(
+      String path, String[] colNames, long[] rowIndices, byte[] dict32Mask) {
+    long[] cols = scanFileWithRowsNative(path, colNames, rowIndices, dict32Mask);
+    return cols == null ? null : new Table(cols);
+  }
+
+  /** Opt V2: Compact a BOOL8 GPU mask column into strictly-sorted surviving row indices. */
+  public static long[] maskToRowIndices(ColumnView maskCol) {
+    return maskToRowIndicesNative(maskCol.getNativeView());
   }
 
   private static native void writeTableNative(long tableView, String[] colNames, String path);
 
-  private static native long openScanNative(String path, String[] colNames, long batchRows);
+  private static native long openMultiScanNative(
+      String[] filePaths, String[] colNames, long batchRows, int prefetchCap);
 
-  private static native long[] nextBatchNative(long handle, byte[] dict32Mask);
+  private static native long[] nextCoalescedBatchNative(
+      long handle, byte[] dict32Mask, long coalesceTargetBytes);
 
-  private static native void closeScanNative(long handle);
+  private static native void closeMultiScanNative(long handle);
+
+  private static native long[] scanFileWithRowsNative(
+      String path, String[] colNames, long[] rowIndices, byte[] dict32Mask);
+
+  private static native long[] maskToRowIndicesNative(long maskColView);
 }
