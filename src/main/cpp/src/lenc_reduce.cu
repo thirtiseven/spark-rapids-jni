@@ -644,7 +644,7 @@ std::unique_ptr<cudf::table> run_jit_reduce_table(
     gk_dicts, gk_strides, args.max_groups, agg_kinds, h_f64, h_i64, h_cnt, stream, mr);
 }
 
-std::unique_ptr<cudf::table> run_jit_reduce_highcard_groupby(
+std::unique_ptr<cudf::table> run_jit_reduce_high_card(
   JitReduceProgram& prog,
   cudf::table_view const& group_keys,
   cudf::table_view const& value_cols,
