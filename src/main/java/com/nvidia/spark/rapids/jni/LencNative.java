@@ -18,6 +18,8 @@ package com.nvidia.spark.rapids.jni;
 
 import ai.rapids.cudf.ColumnVector;
 import ai.rapids.cudf.ColumnView;
+import ai.rapids.cudf.DType;
+import ai.rapids.cudf.DeviceMemoryBuffer;
 import ai.rapids.cudf.HostMemoryBuffer;
 import ai.rapids.cudf.NativeDepsLoader;
 import ai.rapids.cudf.Table;
@@ -53,6 +55,27 @@ public final class LencNative {
 
     public byte[] columnTypes() {
       return planColumnTypesNative(handle);
+    }
+
+    public long[] colMins() {
+      return planColMinsNative(handle);
+    }
+
+    public long[] colMaxs() {
+      return planColMaxsNative(handle);
+    }
+
+    public byte[] colHasMinMax() {
+      return planColHasMinMaxNative(handle);
+    }
+
+    public byte[] colScaleExp10() {
+      return planColScaleExp10Native(handle);
+    }
+
+    public Table fusedQ1(HostMemoryBuffer src, int maxShipdateDays) {
+      long addr = totalPackedBytes() > 0 ? src.getAddress() : 0L;
+      return new Table(fusedQ1FromLencNative(handle, addr, maxShipdateDays));
     }
 
     long nativeHandle() {
@@ -177,5 +200,109 @@ public final class LencNative {
   private static native long[] runLtoProgramNative(
       long ltoProgHandle, long planHandle, long hostAddr, String[][] dictLiteralsPerCol,
       long selectedRowsView);
+  public static Table runLtoFilterAndProject(
+      LtoProgram filterProg,
+      LtoProgram projProg,
+      ReadPlan unionPlan,
+      HostMemoryBuffer src,
+      int[] filterColMap,
+      String[][] filterDictLits,
+      int[] projColMap,
+      String[][] projDictLits,
+      byte[] outDict32) {
+    long addr = unionPlan.totalPackedBytes() > 0 ? src.getAddress() : 0L;
+    long pHandle = projProg != null ? projProg.handle : 0L;
+    long[] handles = runLtoFilterAndProjectNative(
+        filterProg.handle, pHandle, unionPlan.nativeHandle(), addr,
+        filterColMap, filterDictLits, projColMap, projDictLits, outDict32);
+    return handles == null ? null : new Table(handles);
+  }
+
+  public static DeviceMemoryBuffer[] splitAndEncodeShuffleToDevice(Table table, int... splits) {
+    DeviceMemoryBuffer[] ret = new DeviceMemoryBuffer[2];
+    boolean ok = false;
+    try {
+      long[] v = splitAndEncodeShuffleNative(table.getNativeView(), splits);
+      ret[0] = DeviceMemoryBuffer.fromRmm(v[0], v[1], v[2]);
+      ret[1] = DeviceMemoryBuffer.fromRmm(v[3], v[4], v[5]);
+      ok = true;
+      return ret;
+    } finally {
+      if (!ok) {
+        if (ret[0] != null) ret[0].close();
+        if (ret[1] != null) ret[1].close();
+      }
+    }
+  }
+
+  public static Table assembleAndDecodeShuffleFromDevice(
+      HostMemoryBuffer dataHost,
+      DeviceMemoryBuffer dataDev,
+      long[] hostOffsets,
+      DType[] dtypes,
+      byte[] dictAsDictionary32) {
+    int[] typeIds = new int[dtypes.length];
+    int[] scales = new int[dtypes.length];
+    for (int i = 0; i < dtypes.length; i++) {
+      typeIds[i] = dtypes[i].getTypeId().getNativeId();
+      scales[i] = dtypes[i].getScale();
+    }
+    return new Table(assembleAndDecodeShuffleNative(
+        dataHost.getAddress(), dataDev.getAddress(), dataDev.getLength(),
+        hostOffsets, typeIds, scales, dictAsDictionary32));
+  }
+
+  public static Table fusedQ1FromTable(Table table, int maxShipdateDays) {
+    return new Table(fusedQ1FromTableNative(table.getNativeView(), maxShipdateDays));
+  }
+
+  public static Table fusedWideDictCaseAgg(
+      Table groupKeys,
+      ColumnView metricCol,
+      ColumnView numerCol,
+      ColumnView denomCol,
+      String[] metricLiterals,
+      int[] outMetricIds,
+      double[] outCoeffs,
+      byte[] outUseDenom) {
+    return new Table(fusedWideDictCaseAggNative(
+        groupKeys.getNativeView(),
+        metricCol.getNativeView(),
+        numerCol.getNativeView(),
+        denomCol.getNativeView(),
+        metricLiterals,
+        outMetricIds,
+        outCoeffs,
+        outUseDenom));
+  }
+
   private static native void destroyLtoProgramNative(long ltoProgHandle);
+
+  private static native long[] planColMinsNative(long planHandle);
+
+  private static native long[] planColMaxsNative(long planHandle);
+
+  private static native byte[] planColHasMinMaxNative(long planHandle);
+
+  private static native byte[] planColScaleExp10Native(long planHandle);
+
+  private static native long[] runLtoFilterAndProjectNative(
+      long filterProgHandle, long projProgHandle, long unionPlanHandle, long hostAddr,
+      int[] filterColMap, String[][] filterDictLits,
+      int[] projColMap, String[][] projDictLits, byte[] outDict32);
+
+  private static native long[] splitAndEncodeShuffleNative(long tableView, int[] splits);
+
+  private static native long[] assembleAndDecodeShuffleNative(
+      long hostAddr, long dataDevAddr, long dataDevLen, long[] hostOffsets,
+      int[] typeIds, int[] scales, byte[] dict32);
+
+  private static native long[] fusedQ1FromLencNative(
+      long planHandle, long hostAddr, int maxShipdateDays);
+
+  private static native long[] fusedQ1FromTableNative(long tableView, int maxShipdateDays);
+
+  private static native long[] fusedWideDictCaseAggNative(
+      long groupKeysView, long metricView, long numerView, long denomView,
+      String[] literals, int[] outMetricIds, double[] outCoeffs, byte[] outUseDenom);
 }

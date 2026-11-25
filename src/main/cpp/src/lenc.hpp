@@ -111,6 +111,10 @@ struct ReadPlan {
   std::vector<uint64_t> packed_payload_offsets;  // offset inside packed host/device buffer
   std::vector<uint64_t> packed_null_offsets;     // offset inside packed host/device buffer
   uint64_t total_packed_bytes{0};
+  // Track 3: Zero-reconversion file-level min/max derived from FOR/RLE mini-block headers
+  std::vector<int64_t> col_mins;
+  std::vector<int64_t> col_maxs;
+  std::vector<uint8_t> col_has_minmax;
 };
 
 /**
@@ -216,6 +220,98 @@ std::unique_ptr<cudf::table> decode_from_host_selected(
   uint8_t const* host_src,
   std::vector<uint8_t> const& dict_as_dictionary32,
   cudf::column_view const& selected_rows,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+// ---------------- Track 3: Single-H2D Unified Filter + Project / Decode LTO ----------------
+
+/**
+ * Single-H2D unified Filter+Project LTO: copies compressed union buffer ONCE to GPU, runs
+ * filter_prog in registers on `filter_col_map`, compacts surviving rows, and if >0 survive runs
+ * proj_prog on `proj_col_map` against the SAME already-resident GPU compressed buffer!
+ * Returns nullptr if 0 rows survive (so caller emits no empty batch).
+ */
+std::unique_ptr<cudf::table> run_lto_filter_and_project(
+  cudf::transform_program& filter_prog,
+  cudf::transform_program* proj_prog,  // nullptr -> late-materialized decode of output_col_map
+  ReadPlan const& union_plan,
+  uint8_t const* host_src,
+  std::vector<int32_t> const& filter_col_map,
+  std::vector<std::vector<std::string>> const& filter_dict_lits,
+  std::vector<int32_t> const& proj_col_map,
+  std::vector<std::vector<std::string>> const& proj_dict_lits,
+  std::vector<uint8_t> const& out_dict32,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+// ---------------- Track 1: GPU-Native Lightweight-Encoded Shuffle ----------------
+
+/**
+ * Kudo-header-compatible GPU shuffle split & lightweight encode:
+ * Encodes each partition slice ON GPU (256-row FOR_BITPACK for integrals/dates/timestamps/decimals,
+ * GPU DICT_BITPACK for low-cardinality strings, GPU nvCOMP LZ4 for high-cardinality strings) into
+ * contiguous `[data_buf, offsets_buf]` where each slice begins with a standard KudoTableHeader
+ * followed by an `'LSHF'` lightweight-encoded payload.
+ */
+std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_device(
+  cudf::table_view const& table,
+  std::vector<cudf::size_type> const& splits,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * Decode & coalesce `num_tables` contiguous `[KudoTableHeader]['LSHF' payload]` slices already
+ * staged on GPU into a single cuDF table at >300 GB/s!
+ */
+std::unique_ptr<cudf::table> assemble_and_decode_shuffle_from_device(
+  uint8_t const* h_data,
+  uint8_t const* d_data,
+  size_t data_bytes,
+  int64_t const* h_offsets,
+  size_t num_tables,
+  std::vector<cudf::data_type> const& col_types,
+  std::vector<uint8_t> const& dict_as_dictionary32,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+// ---------------- Track 4: GPU Fused Conditional Aggregation / Reduce ----------------
+
+/**
+ * Fused Q1 Filter + Arithmetic + Partial GroupBy-Reduce directly from packed .lenc (in-register!)
+ * or from already-decoded Parquet table! Eliminates 97.5% full-table filter copy & intermediate
+ * project columns, accumulating into shared-memory per-block group buckets.
+ * Output columns: [l_returnflag(STR), l_linestatus(STR), sum_qty(F64), sum_base(F64),
+ *                  sum_disc_price(F64), sum_charge(F64), sum_disc(F64), count(INT64)].
+ */
+std::unique_ptr<cudf::table> fused_q1_from_lenc(
+  ReadPlan const& plan,
+  uint8_t const* host_src,
+  int32_t max_shipdate_days,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+std::unique_ptr<cudf::table> fused_q1_from_table(
+  cudf::table_view const& table,
+  int32_t max_shipdate_days,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * Fused Dictionary-Bucketed Wide `SUM(CASE WHEN metric_name = lit_k THEN val * coeff)` Partial
+ * Hash-Aggregate (e.g. Netflix Job 48 36-way CASE WHEN):
+ * Computes unique group IDs once over `group_keys`, then in ONE GPU kernel scatters each row's
+ * numer/denom contribution ONLY into its matching metric slot(s) via atomicAdd — zero 36-column
+ * intermediate DOUBLE materialization!
+ */
+std::unique_ptr<cudf::table> fused_wide_dict_case_agg(
+  cudf::table_view const& group_keys,
+  cudf::column_view const& metric_col,  // DICTIONARY32 or STRING
+  cudf::column_view const& numer_col,   // FLOAT64
+  cudf::column_view const& denom_col,   // FLOAT64
+  std::vector<std::string> const& metric_literals,
+  std::vector<int32_t> const& out_metric_ids,
+  std::vector<double> const& out_coeffs,
+  std::vector<uint8_t> const& out_use_denom,
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 

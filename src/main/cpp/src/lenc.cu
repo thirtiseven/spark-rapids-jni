@@ -1285,15 +1285,18 @@ ReadPlan plan_read(std::string const& path, std::vector<int32_t> const& col_indi
                 plan.header.num_cols * sizeof(ColumnMeta),
                 static_cast<off_t>(plan.header.footer_offset));
   }
-  ::close(fd);
-
   plan.col_indices = col_indices;
   plan.metas.reserve(col_indices.size());
   plan.packed_payload_offsets.reserve(col_indices.size());
   plan.packed_null_offsets.reserve(col_indices.size());
+  plan.col_mins.assign(col_indices.size(), 0);
+  plan.col_maxs.assign(col_indices.size(), 0);
+  plan.col_has_minmax.assign(col_indices.size(), 0);
 
-  uint64_t packed_off = 0;
-  for (int32_t const ci : col_indices) {
+  uint32_t const num_chunks = (plan.header.num_rows + kChunkSize - 1) / kChunkSize;
+  uint64_t packed_off       = 0;
+  for (size_t idx = 0; idx < col_indices.size(); ++idx) {
+    int32_t const ci = col_indices[idx];
     CUDF_EXPECTS(ci >= 0 && static_cast<uint32_t>(ci) < plan.header.num_cols,
                  "lenc::plan_read: column index out of range");
     ColumnMeta const& m = all_metas[static_cast<size_t>(ci)];
@@ -1308,7 +1311,45 @@ ReadPlan plan_read(std::string const& path, std::vector<int32_t> const& col_indi
     } else {
       plan.packed_null_offsets.push_back(0);
     }
+
+    // Track 3: Derive exact file-level [min, max] from FOR/SCALED_FLOAT/RLE mini-block headers
+    // (zero data re-conversion required on existing .lenc files!)
+    auto const enc = static_cast<Encoding>(m.encoding);
+    if (plan.header.num_rows > 0 && !m.has_nulls &&
+        (enc == Encoding::FOR_BITPACK || enc == Encoding::SCALED_FLOAT_FOR) && num_chunks > 0) {
+      size_t const hdr_sz = num_chunks * (sizeof(int64_t) + sizeof(uint8_t));
+      if (hdr_sz <= m.payload_size) {
+        std::vector<uint8_t> tmp(hdr_sz);
+        pread_exact(fd, tmp.data(), hdr_sz, static_cast<off_t>(m.payload_offset));
+        auto const* mins = reinterpret_cast<int64_t const*>(tmp.data());
+        auto const* bws  = tmp.data() + num_chunks * sizeof(int64_t);
+        int64_t gmin     = std::numeric_limits<int64_t>::max();
+        int64_t gmax     = std::numeric_limits<int64_t>::min();
+        bool ok          = true;
+        for (uint32_t c = 0; c < num_chunks; ++c) {
+          if (bws[c] >= 63) {
+            ok = false;
+            break;
+          }
+          int64_t const lo  = mins[c];
+          int64_t const rng = (bws[c] == 0) ? 0LL : static_cast<int64_t>((1ULL << bws[c]) - 1ULL);
+          __int128 const hi = static_cast<__int128>(lo) + static_cast<__int128>(rng);
+          if (hi > static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
+            ok = false;
+            break;
+          }
+          if (lo < gmin) { gmin = lo; }
+          if (static_cast<int64_t>(hi) > gmax) { gmax = static_cast<int64_t>(hi); }
+        }
+        if (ok && gmin <= gmax) {
+          plan.col_mins[idx]       = gmin;
+          plan.col_maxs[idx]       = gmax;
+          plan.col_has_minmax[idx] = 1;
+        }
+      }
+    }
   }
+  ::close(fd);
   plan.total_packed_bytes = align_up(packed_off, 64);
   return plan;
 }
@@ -2585,6 +2626,169 @@ std::unique_ptr<cudf::table> decode_from_host_selected(
 
   stream.sync();
   return std::make_unique<cudf::table>(std::move(out_cols));
+}
+
+// Track 3: Single-H2D Unified Filter + Project / Decode LTO (eliminates Stage 2 re-open & 2nd H2D!)
+std::unique_ptr<cudf::table> run_lto_filter_and_project(
+  cudf::transform_program& filter_prog,
+  cudf::transform_program* proj_prog,
+  ReadPlan const& union_plan,
+  uint8_t const* host_src,
+  std::vector<int32_t> const& filter_col_map,
+  std::vector<std::vector<std::string>> const& filter_dict_lits,
+  std::vector<int32_t> const& proj_col_map,
+  std::vector<std::vector<std::string>> const& proj_dict_lits,
+  std::vector<uint8_t> const& out_dict32,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  uint32_t const num_rows = union_plan.header.num_rows;
+  if (num_rows == 0) { return nullptr; }
+
+  // ONE single H2D copy of the compressed union buffer!
+  rmm::device_buffer d_packed(union_plan.total_packed_bytes, stream, mr);
+  if (union_plan.total_packed_bytes > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(d_packed.data(),
+                                  host_src,
+                                  union_plan.total_packed_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+  }
+  auto const* d_base = static_cast<uint8_t const*>(d_packed.data());
+
+  auto populate_desc = [&](std::vector<int32_t> const& cmap,
+                           std::vector<std::vector<std::string>> const& dlits,
+                           int32_t const* sel_ptr,
+                           std::vector<rmm::device_buffer>& d_temps) -> LencLtoBatchDesc {
+    LencLtoBatchDesc desc{};
+    desc.selected_rows = sel_ptr;
+    CUDF_EXPECTS(cmap.size() <= static_cast<size_t>(kMaxLtoCols), "lenc LTO: max 16 cols");
+    for (size_t s = 0; s < cmap.size(); ++s) {
+      size_t const ui     = static_cast<size_t>(cmap[s]);
+      ColumnMeta const& m = union_plan.metas[ui];
+      auto const* d_pay   = d_base + union_plan.packed_payload_offsets[ui];
+      auto const enc      = static_cast<Encoding>(m.encoding);
+      auto const ctype    = static_cast<ColType>(m.type);
+      LencLtoColDesc& cd  = desc.cols[s];
+      if (m.has_nulls && m.null_mask_size > 0) {
+        cd.null_mask = reinterpret_cast<cudf::bitmask_type const*>(
+          d_base + union_plan.packed_null_offsets[ui]);
+      }
+      if (enc == Encoding::FOR_BITPACK || enc == Encoding::SCALED_FLOAT_FOR) {
+        auto fv               = make_for_view(d_pay, num_rows);
+        cd.min_vals           = fv.min_vals;
+        cd.bit_widths         = fv.bit_widths;
+        cd.chunk_word_offsets = fv.chunk_word_offsets;
+        cd.packed_words       = fv.packed_words;
+        cd.inv_scale = (m.scale_exp10 == 0) ? 1.0 : ((m.scale_exp10 == 2) ? 0.01 : 0.0001);
+      } else if (enc == Encoding::RLE_INT) {
+        auto rv            = make_rle_view(d_pay, num_rows, m.extra);
+        cd.rle_chunk_start = rv.chunk_start_run;
+        cd.rle_run_ends    = rv.run_ends;
+        cd.rle_run_vals    = rv.run_vals;
+        cd.rle_num_runs    = rv.num_runs;
+      } else if (enc == Encoding::DELTA_FOR_BITPACK) {
+        uint32_t const nchunk = (num_rows + kChunkSize - 1) / kChunkSize;
+        auto dv               = make_delta_for_view(d_pay, num_rows);
+        bool const is64       = (ctype == ColType::INT64 || ctype == ColType::TIMESTAMP_US ||
+                           ctype == ColType::DECIMAL64);
+        rmm::device_buffer d_dec(static_cast<size_t>(num_rows) * (is64 ? 8 : 4), stream, mr);
+        if (is64) {
+          delta_for_decode_kernel<int64_t><<<nchunk, 256, 0, stream.get()>>>(
+            dv, static_cast<int64_t*>(d_dec.data()), num_rows);
+        } else {
+          delta_for_decode_kernel<int32_t><<<nchunk, 256, 0, stream.get()>>>(
+            dv, static_cast<int32_t*>(d_dec.data()), num_rows);
+        }
+        cd.raw_ptr = static_cast<uint8_t const*>(d_dec.data());
+        d_temps.push_back(std::move(d_dec));
+      } else if (enc == Encoding::NVCOMP_LZ4_FIXED) {
+        Lz4PayloadHeader lh{};
+        auto d_dec = nvcomp_lz4_decompress_device(
+          host_src + union_plan.packed_payload_offsets[ui], d_pay, lh, stream, mr);
+        cd.raw_ptr = static_cast<uint8_t const*>(d_dec.data());
+        d_temps.push_back(std::move(d_dec));
+      } else if (enc == Encoding::DICT_BITPACK) {
+        DictPayloadHeader dh{};
+        uint8_t const* h_pay = host_src + union_plan.packed_payload_offsets[ui];
+        std::memcpy(&dh, h_pay, sizeof(dh));
+        auto fv               = make_for_view(d_pay + dh.codes_offset, num_rows);
+        cd.min_vals           = fv.min_vals;
+        cd.bit_widths         = fv.bit_widths;
+        cd.chunk_word_offsets = fv.chunk_word_offsets;
+        cd.packed_words       = fv.packed_words;
+        cd.dict_size          = dh.dict_size;
+        std::vector<int32_t> h_remap(dh.dict_size, -1);
+        if (s < dlits.size() && !dlits[s].empty()) {
+          std::unordered_map<std::string_view, int32_t> lmap;
+          lmap.reserve(dlits[s].size() * 2 + 1);
+          for (size_t l = 0; l < dlits[s].size(); ++l) {
+            lmap.emplace(std::string_view{dlits[s][l]}, static_cast<int32_t>(l));
+          }
+          auto const* dict_offs = reinterpret_cast<int32_t const*>(h_pay + sizeof(dh));
+          auto const* dict_ch   = reinterpret_cast<char const*>(
+            h_pay + sizeof(dh) + (dh.dict_size + 1) * sizeof(int32_t));
+          for (uint32_t k = 0; k < dh.dict_size; ++k) {
+            int32_t const st = dict_offs[k];
+            int32_t const en = dict_offs[k + 1];
+            auto it          = lmap.find(std::string_view(dict_ch + st, static_cast<size_t>(en - st)));
+            if (it != lmap.end()) { h_remap[k] = it->second; }
+          }
+        }
+        rmm::device_buffer d_rm(std::max<size_t>(dh.dict_size, 1) * sizeof(int32_t), stream, mr);
+        if (dh.dict_size > 0) {
+          CUDF_CUDA_TRY(cudaMemcpyAsync(d_rm.data(),
+                                        h_remap.data(),
+                                        dh.dict_size * sizeof(int32_t),
+                                        cudaMemcpyHostToDevice,
+                                        stream.get()));
+        }
+        cd.dict_remap = static_cast<int32_t const*>(d_rm.data());
+        d_temps.push_back(std::move(d_rm));
+      } else if (enc == Encoding::RAW_FIXED) {
+        cd.raw_ptr = d_pay;
+      }
+    }
+    return desc;
+  };
+
+  // Stage 1: Filter LTO in registers on already-resident d_packed
+  std::vector<rmm::device_buffer> d_temps;
+  auto f_desc = populate_desc(filter_col_map, filter_dict_lits, nullptr, d_temps);
+  rmm::device_buffer d_fdesc(sizeof(LencLtoBatchDesc), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    d_fdesc.data(), &f_desc, sizeof(LencLtoBatchDesc), cudaMemcpyHostToDevice, stream.get()));
+  auto mask_tbl = filter_prog.run_with_user_data(
+    d_fdesc.data(), static_cast<cudf::size_type>(num_rows), stream, mr);
+  auto sel_col = compact_mask_indices(mask_tbl->view().column(0), stream, mr);
+  if (sel_col->size() == 0) {
+    stream.sync();
+    return nullptr;
+  }
+
+  // Stage 2: Project LTO (or late-materialized decode) on the SAME d_packed buffer!
+  if (proj_prog != nullptr) {
+    auto p_desc = populate_desc(
+      proj_col_map, proj_dict_lits, sel_col->view().data<int32_t>(), d_temps);
+    rmm::device_buffer d_pdesc(sizeof(LencLtoBatchDesc), stream, mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      d_pdesc.data(), &p_desc, sizeof(LencLtoBatchDesc), cudaMemcpyHostToDevice, stream.get()));
+    auto out_tbl = proj_prog->run_with_user_data(d_pdesc.data(), sel_col->size(), stream, mr);
+    stream.sync();
+    return out_tbl;
+  }
+
+  // Decode selected rows of proj_col_map from union_plan
+  ReadPlan sub_plan{};
+  sub_plan.header             = union_plan.header;
+  sub_plan.total_packed_bytes = union_plan.total_packed_bytes;
+  for (int32_t const ui : proj_col_map) {
+    sub_plan.metas.push_back(union_plan.metas[static_cast<size_t>(ui)]);
+    sub_plan.packed_payload_offsets.push_back(
+      union_plan.packed_payload_offsets[static_cast<size_t>(ui)]);
+    sub_plan.packed_null_offsets.push_back(union_plan.packed_null_offsets[static_cast<size_t>(ui)]);
+  }
+  return decode_from_host_selected(sub_plan, host_src, out_dict32, sel_col->view(), stream, mr);
 }
 
 }  // namespace rapids::jni::lenc
