@@ -205,6 +205,7 @@ struct VortexCudaApi {
                                                            vx_error**)                      = nullptr;
   int (*device_batches_next)(
     vx_cuda_device_batches*, ArrowSchema*, ArrowDeviceArray*, vx_error**)                   = nullptr;
+  size_t (*device_batches_last_file_idx)(vx_cuda_device_batches const*)                     = nullptr;
   void (*device_batches_free)(vx_cuda_device_batches*)                                      = nullptr;
   vx_session* shared_session{nullptr};
 
@@ -254,6 +255,7 @@ struct VortexCudaApi {
       a.load(a.scan_paths_prefetch_batches, "vx_cuda_scan_paths_prefetch_batches");
       a.load(a.scan_device_batches_with_rows, "vx_cuda_scan_path_device_batches_with_rows");
       a.load(a.device_batches_next, "vx_cuda_device_batches_next");
+      a.load(a.device_batches_last_file_idx, "vx_cuda_device_batches_last_file_idx");
       a.load(a.device_batches_free, "vx_cuda_device_batches_free");
 
       // Inject Spark RAPIDS RMM pool into vortex-cuda BEFORE creating the shared session!
@@ -272,9 +274,10 @@ struct VortexCudaApi {
 struct RawArrowBatch {
   ArrowSchema schema{};
   ArrowDeviceArray dev_arr{};
+  int32_t file_idx{0};
 
   RawArrowBatch() = default;
-  RawArrowBatch(RawArrowBatch&& o) noexcept : schema(o.schema), dev_arr(o.dev_arr)
+  RawArrowBatch(RawArrowBatch&& o) noexcept : schema(o.schema), dev_arr(o.dev_arr), file_idx(o.file_idx)
   {
     o.schema.release        = nullptr;
     o.dev_arr.array.release = nullptr;
@@ -285,6 +288,7 @@ struct RawArrowBatch {
       release();
       schema                  = o.schema;
       dev_arr                 = o.dev_arr;
+      file_idx                = o.file_idx;
       o.schema.release        = nullptr;
       o.dev_arr.array.release = nullptr;
     }
@@ -424,6 +428,7 @@ struct VortexMultiFileScanState {
   size_t prefetch_depth{3};
   vx_cuda_device_batches* active{nullptr};
   bool started{false};
+  int32_t last_file_idx{0};
   std::deque<RawArrowBatch> pushback;
 
   void start_prefetch()
@@ -456,7 +461,8 @@ struct VortexMultiFileScanState {
   bool pop_next(RawArrowBatch& out)
   {
     if (!pushback.empty()) {
-      out = std::move(pushback.front());
+      out           = std::move(pushback.front());
+      last_file_idx = out.file_idx;
       pushback.pop_front();
       return true;
     }
@@ -474,7 +480,9 @@ struct VortexMultiFileScanState {
       }
       if (item.dev_arr.array.release != nullptr || item.schema.release != nullptr) {
         if (item.dev_arr.array.length == 0) { continue; }
-        out = std::move(item);
+        item.file_idx = static_cast<int32_t>(api.device_batches_last_file_idx(active));
+        last_file_idx = item.file_idx;
+        out           = std::move(item);
         return true;
       }
       api.device_batches_free(active);
@@ -1017,6 +1025,17 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZ
     return ret.get_jArray();
   }
   JNI_CATCH(env, nullptr);
+}
+
+JNIEXPORT jint JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_getLastFileIndexNative(
+  JNIEnv* env, jclass, jlong j_handle)
+{
+  JNI_TRY
+  {
+    auto* st = std::bit_cast<VortexMultiFileScanState*>(j_handle);
+    return (st != nullptr) ? static_cast<jint>(st->last_file_idx) : 0;
+  }
+  JNI_CATCH(env, 0);
 }
 
 JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_releaseArrowOwnerNative(

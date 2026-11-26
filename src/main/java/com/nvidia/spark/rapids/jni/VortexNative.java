@@ -109,6 +109,13 @@ public final class VortexNative {
       }
     }
 
+    public int getLastFileIndex() {
+      if (handle == 0L) {
+        return 0;
+      }
+      return getLastFileIndexNative(handle);
+    }
+
     public Table nextCoalescedBatch(byte[] dict32Mask, long coalesceTargetBytes) {
       if (handle == 0L) {
         return null;
@@ -148,6 +155,8 @@ public final class VortexNative {
       String[] filePaths, String[] colNames, long batchRows, int prefetchCap);
 
   private static native long[] nextZeroCopyBatchNative(long handle, byte[] dict32Mask);
+
+  private static native int getLastFileIndexNative(long handle);
 
   private static native void releaseArrowOwnerNative(long ownerPtr);
 
