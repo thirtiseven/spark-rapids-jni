@@ -104,19 +104,48 @@ struct vx_cuda_scan_options {
   size_t batch_rows;
 };
 
+// Forward declaration so vortex_rmm_alloc_cb can drain pending async zero-copy owners on OOM retry!
+void drain_arrow_owner_reaper() noexcept;
+
 // Unified RMM allocator callbacks injected into vortex-cuda so Vortex and Spark RAPIDS
 // share ONE unified spillable RMM GPU pool (eliminates allocFraction=0.72 fragmentation & OOM!).
 constexpr size_t kVortexRmmAlign = 256u;
+static std::atomic<int64_t> g_rmm_alloc_bytes{0};
+static std::atomic<int64_t> g_rmm_free_bytes{0};
+static std::atomic<int64_t> g_owners_created{0};
+static std::atomic<int64_t> g_owners_freed{0};
 
 extern "C" uint64_t vortex_rmm_alloc_cb(size_t bytes, void* cu_stream) noexcept
 {
-  try {
+  auto try_alloc = [&]() -> uint64_t {
     auto mr = cudf::get_current_device_resource_ref();
     void* p = mr.allocate(
       cuda::stream_ref(static_cast<cudaStream_t>(cu_stream)), bytes, kVortexRmmAlign);
+    g_rmm_alloc_bytes.fetch_add(static_cast<int64_t>(bytes), std::memory_order_relaxed);
     return reinterpret_cast<uint64_t>(p);
+  };
+  try {
+    return try_alloc();
   } catch (...) {
-    return 0ULL;
+    // Reclaim any completed/in-flight ZeroCopyArrowOwners sitting in the async reaper, then retry!
+    drain_arrow_owner_reaper();
+    try {
+      return try_alloc();
+    } catch (std::exception const& e) {
+      fprintf(stderr,
+              "VortexJni: vortex_rmm_alloc_cb(%zu) failed after reaper drain: %s "
+              "[vortex_live_MB=%.1f alloc_MB=%.1f free_MB=%.1f owners=%lld/%lld]\n",
+              bytes,
+              e.what(),
+              (g_rmm_alloc_bytes.load() - g_rmm_free_bytes.load()) / (1024.0 * 1024.0),
+              g_rmm_alloc_bytes.load() / (1024.0 * 1024.0),
+              g_rmm_free_bytes.load() / (1024.0 * 1024.0),
+              static_cast<long long>(g_owners_created.load()),
+              static_cast<long long>(g_owners_freed.load()));
+      return 0ULL;
+    } catch (...) {
+      return 0ULL;
+    }
   }
 }
 
@@ -129,6 +158,9 @@ extern "C" void vortex_rmm_free_cb(uint64_t ptr, size_t bytes, void* cu_stream) 
                   reinterpret_cast<void*>(ptr),
                   bytes,
                   kVortexRmmAlign);
+    g_rmm_free_bytes.fetch_add(static_cast<int64_t>(bytes), std::memory_order_relaxed);
+  } catch (std::exception const& e) {
+    fprintf(stderr, "VortexJni: vortex_rmm_free_cb(%zu) exception: %s\n", bytes, e.what());
   } catch (...) {
   }
 }
@@ -155,6 +187,14 @@ struct VortexCudaApi {
                                                  vx_view const*,
                                                  size_t,
                                                  vx_error**)                                = nullptr;
+  vx_cuda_device_batches* (*scan_paths_prefetch_batches)(vx_session const*,
+                                                         vx_view const*,
+                                                         size_t,
+                                                         vx_cuda_scan_options const*,
+                                                         vx_view const*,
+                                                         size_t,
+                                                         size_t,
+                                                         vx_error**)                        = nullptr;
   vx_cuda_device_batches* (*scan_device_batches_with_rows)(vx_session const*,
                                                            vx_view,
                                                            vx_cuda_scan_options const*,
@@ -211,6 +251,7 @@ struct VortexCudaApi {
       a.load(a.sink_push, "vx_array_sink_push");
       a.load(a.sink_close, "vx_array_sink_close");
       a.load(a.scan_device_batches, "vx_cuda_scan_path_device_batches");
+      a.load(a.scan_paths_prefetch_batches, "vx_cuda_scan_paths_prefetch_batches");
       a.load(a.scan_device_batches_with_rows, "vx_cuda_scan_path_device_batches_with_rows");
       a.load(a.device_batches_next, "vx_cuda_device_batches_next");
       a.load(a.device_batches_free, "vx_cuda_device_batches_free");
@@ -331,14 +372,42 @@ std::unique_ptr<cudf::table> materialize_raw_batches(
   return out_tbl;
 }
 
-// Synchronous single-thread multi-file scan state (paced strictly by GpuSemaphore — zero SM contention!)
+// Multi-file scan state backed by pure-CPU off-semaphore NVMe prefetcher + single reused CudaExecutionCtx!
 struct VortexMultiFileScanState {
   std::vector<std::string> files;
   std::vector<std::string> col_names;
   size_t batch_rows{0};
-  size_t file_idx{0};
+  size_t prefetch_depth{3};
   vx_cuda_device_batches* active{nullptr};
+  bool started{false};
   std::deque<RawArrowBatch> pushback;
+
+  void start_prefetch()
+  {
+    if (started || files.empty()) { return; }
+    started   = true;
+    auto& api = VortexCudaApi::get();
+    std::vector<vx_view> path_views;
+    path_views.reserve(files.size());
+    for (auto const& f : files) { path_views.push_back(vx_view{f.data(), f.size()}); }
+    std::vector<vx_view> col_views;
+    col_views.reserve(col_names.size());
+    for (auto const& s : col_names) { col_views.push_back(vx_view{s.data(), s.size()}); }
+    vx_cuda_scan_options opts{};
+    opts.flags      = 0u;
+    opts.batch_rows = batch_rows;
+    vx_error* err   = nullptr;
+    active          = api.scan_paths_prefetch_batches(api.shared_session,
+                                             path_views.data(),
+                                             path_views.size(),
+                                             &opts,
+                                             col_views.empty() ? nullptr : col_views.data(),
+                                             col_views.size(),
+                                             prefetch_depth > 0 ? prefetch_depth : 3u,
+                                             &err);
+    CUDF_EXPECTS(active != nullptr && err == nullptr,
+                 "VortexJni: scan_paths_prefetch_batches failed: " + api.consume_error(err));
+  }
 
   bool pop_next(RawArrowBatch& out)
   {
@@ -347,45 +416,27 @@ struct VortexMultiFileScanState {
       pushback.pop_front();
       return true;
     }
+    if (!started) { start_prefetch(); }
+    if (active == nullptr) { return false; }
     auto& api = VortexCudaApi::get();
-    std::vector<vx_view> col_views;
-    col_views.reserve(col_names.size());
-    for (auto const& s : col_names) { col_views.push_back(vx_view{s.data(), s.size()}); }
-    vx_cuda_scan_options opts{};
-    opts.flags      = 0u;
-    opts.batch_rows = batch_rows;
-
-    while (true) {
-      if (active != nullptr) {
-        RawArrowBatch item;
-        vx_error* err = nullptr;
-        int rc        = api.device_batches_next(active, &item.schema, &item.dev_arr, &err);
-        if (rc != 0 || err != nullptr) {
-          api.device_batches_free(active);
-          active = nullptr;
-          CUDF_FAIL("VortexJni: device_batches_next failed: " + api.consume_error(err));
-        }
-        if (item.dev_arr.array.release != nullptr || item.schema.release != nullptr) {
-          if (item.dev_arr.array.length == 0) { continue; }
-          out = std::move(item);
-          return true;
-        }
+    while (active != nullptr) {
+      RawArrowBatch item;
+      vx_error* err = nullptr;
+      int rc        = api.device_batches_next(active, &item.schema, &item.dev_arr, &err);
+      if (rc != 0 || err != nullptr) {
         api.device_batches_free(active);
         active = nullptr;
+        CUDF_FAIL("VortexJni: device_batches_next failed: " + api.consume_error(err));
       }
-      if (file_idx >= files.size()) { return false; }
-      auto const& path_str = files[file_idx++];
-      vx_error* err        = nullptr;
-      vx_view pview{path_str.data(), path_str.size()};
-      active = api.scan_device_batches(api.shared_session,
-                                       pview,
-                                       &opts,
-                                       col_views.empty() ? nullptr : col_views.data(),
-                                       col_views.size(),
-                                       &err);
-      CUDF_EXPECTS(active != nullptr && err == nullptr,
-                   "VortexJni: scan_device_batches failed on " + path_str + ": " + api.consume_error(err));
+      if (item.dev_arr.array.release != nullptr || item.schema.release != nullptr) {
+        if (item.dev_arr.array.length == 0) { continue; }
+        out = std::move(item);
+        return true;
+      }
+      api.device_batches_free(active);
+      active = nullptr;
     }
+    return false;
   }
 
   ~VortexMultiFileScanState()
@@ -407,6 +458,7 @@ struct ZeroCopyArrowOwner {
 
   ~ZeroCopyArrowOwner()
   {
+    g_owners_freed.fetch_add(1, std::memory_order_relaxed);
     decoded_dict_cols.clear();
     holder.reset();
     raw.release();
@@ -422,6 +474,7 @@ struct ArrowOwnerReaper {
     ZeroCopyArrowOwner* owner;
   };
   std::mutex mtx;
+  std::mutex drain_mtx;
   std::condition_variable cv;
   std::deque<Pending> queue;
   bool stop{false};
@@ -456,14 +509,30 @@ struct ArrowOwnerReaper {
     cudaEvent_t ev = nullptr;
     if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess &&
         cudaEventRecord(ev, stream) == cudaSuccess) {
+      std::vector<Pending> overflow;
       {
         std::lock_guard<std::mutex> lk(mtx);
         if (!stop) {
           queue.push_back(Pending{ev, owner});
+          // Bound pending queue to <= 8 owners (~0.8 GiB) so fast scans (250+ files/s)
+          // never accumulate 200+ owners (~24 GiB) faster than the single reaper thread frees them!
+          while (queue.size() > 8u) {
+            overflow.push_back(queue.front());
+            queue.pop_front();
+          }
           cv.notify_one();
-          return;
+          ev    = nullptr;
+          owner = nullptr;
         }
       }
+      for (auto& p : overflow) {
+        if (p.ev != nullptr) {
+          cudaEventSynchronize(p.ev);
+          cudaEventDestroy(p.ev);
+        }
+        delete p.owner;
+      }
+      if (owner == nullptr) { return; }
       cudaEventSynchronize(ev);
       cudaEventDestroy(ev);
     } else {
@@ -471,6 +540,24 @@ struct ArrowOwnerReaper {
       cudaStreamSynchronize(stream);
     }
     delete owner;
+  }
+
+  void drain_all()
+  {
+    // Serialize concurrent OOM callers so thread B waits until thread A finishes freeing `local`!
+    std::lock_guard<std::mutex> dlk(drain_mtx);
+    std::deque<Pending> local;
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      local.swap(queue);
+    }
+    for (auto& p : local) {
+      if (p.ev != nullptr) {
+        cudaEventSynchronize(p.ev);
+        cudaEventDestroy(p.ev);
+      }
+      delete p.owner;
+    }
   }
 
   ~ArrowOwnerReaper()
@@ -481,6 +568,7 @@ struct ArrowOwnerReaper {
     }
     cv.notify_all();
     if (worker.joinable()) { worker.join(); }
+    drain_all();
   }
 
   static ArrowOwnerReaper& get()
@@ -489,6 +577,14 @@ struct ArrowOwnerReaper {
     return inst;
   }
 };
+
+void drain_arrow_owner_reaper() noexcept
+{
+  try {
+    ArrowOwnerReaper::get().drain_all();
+  } catch (...) {
+  }
+}
 
 }  // namespace
 
@@ -561,15 +657,16 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_writeTableN
 }
 
 JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_openMultiScanNative(
-  JNIEnv* env, jclass, jobjectArray j_paths, jobjectArray j_col_names, jlong j_batch_rows, jint)
+  JNIEnv* env, jclass, jobjectArray j_paths, jobjectArray j_col_names, jlong j_batch_rows, jint j_prefetch)
 {
   JNI_TRY
   {
     cudf::jni::auto_set_device(env);
     (void)VortexCudaApi::get();
 
-    auto* st       = new VortexMultiFileScanState();
-    st->batch_rows = (j_batch_rows > 0) ? static_cast<size_t>(j_batch_rows) : 0u;
+    auto* st           = new VortexMultiFileScanState();
+    st->batch_rows     = (j_batch_rows > 0) ? static_cast<size_t>(j_batch_rows) : 0u;
+    st->prefetch_depth = (j_prefetch > 0) ? static_cast<size_t>(j_prefetch) : 3u;
 
     jsize const nf = env->GetArrayLength(j_paths);
     st->files.reserve(static_cast<size_t>(nf));
@@ -588,6 +685,9 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_openMultiS
       st->col_names.emplace_back(ns.get());
       env->DeleteLocalRef(js);
     }
+
+    // Start pure-CPU off-semaphore NVMe compressed-segment prefetcher immediately!
+    st->start_prefetch();
 
     return std::bit_cast<jlong>(st);
   }
@@ -820,6 +920,7 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZ
 
     auto owner = std::make_unique<ZeroCopyArrowOwner>();
     if (!st->pop_next(owner->raw)) { return nullptr; }
+    g_owners_created.fetch_add(1, std::memory_order_relaxed);
 
     // Zero-copy Arrow C Device import (automatically calls cudaStreamWaitEvent on stream!)
     owner->holder.emplace(cudf::from_arrow_device(&owner->raw.schema, &owner->raw.dev_arr, stream, mr));
