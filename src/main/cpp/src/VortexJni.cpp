@@ -104,8 +104,39 @@ struct vx_cuda_scan_options {
   size_t batch_rows;
 };
 
+// Unified RMM allocator callbacks injected into vortex-cuda so Vortex and Spark RAPIDS
+// share ONE unified spillable RMM GPU pool (eliminates allocFraction=0.72 fragmentation & OOM!).
+constexpr size_t kVortexRmmAlign = 256u;
+
+extern "C" uint64_t vortex_rmm_alloc_cb(size_t bytes, void* cu_stream) noexcept
+{
+  try {
+    auto mr = cudf::get_current_device_resource_ref();
+    void* p = mr.allocate(
+      cuda::stream_ref(static_cast<cudaStream_t>(cu_stream)), bytes, kVortexRmmAlign);
+    return reinterpret_cast<uint64_t>(p);
+  } catch (...) {
+    return 0ULL;
+  }
+}
+
+extern "C" void vortex_rmm_free_cb(uint64_t ptr, size_t bytes, void* cu_stream) noexcept
+{
+  if (ptr == 0ULL) { return; }
+  try {
+    auto mr = cudf::get_current_device_resource_ref();
+    mr.deallocate(cuda::stream_ref(static_cast<cudaStream_t>(cu_stream)),
+                  reinterpret_cast<void*>(ptr),
+                  bytes,
+                  kVortexRmmAlign);
+  } catch (...) {
+  }
+}
+
 struct VortexCudaApi {
   void* dl{nullptr};
+  void (*set_external_allocator)(uint64_t (*)(size_t, void*), void (*)(uint64_t, size_t, void*)) =
+    nullptr;
   vx_session* (*session_new)(vx_error**)                                                    = nullptr;
   void (*session_free)(vx_session const*)                                                   = nullptr;
   void (*error_free)(vx_error const*)                                                       = nullptr;
@@ -167,6 +198,7 @@ struct VortexCudaApi {
       CUDF_EXPECTS(a.dl != nullptr,
                    "VortexJni: dlopen failed for " + lib_path + ": " +
                      (dlerror() ? dlerror() : "unknown"));
+      a.load(a.set_external_allocator, "vx_cuda_set_external_allocator");
       a.load(a.session_new, "vx_cuda_session_new");
       a.load(a.session_free, "vx_session_free");
       a.load(a.error_free, "vx_error_free");
@@ -182,6 +214,9 @@ struct VortexCudaApi {
       a.load(a.scan_device_batches_with_rows, "vx_cuda_scan_path_device_batches_with_rows");
       a.load(a.device_batches_next, "vx_cuda_device_batches_next");
       a.load(a.device_batches_free, "vx_cuda_device_batches_free");
+
+      // Inject Spark RAPIDS RMM pool into vortex-cuda BEFORE creating the shared session!
+      a.set_external_allocator(&vortex_rmm_alloc_cb, &vortex_rmm_free_cb);
 
       vx_error* err    = nullptr;
       a.shared_session = a.session_new(&err);
