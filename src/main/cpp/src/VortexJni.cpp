@@ -307,6 +307,48 @@ struct RawArrowBatch {
   ~RawArrowBatch() { release(); }
 };
 
+// Recursively patches ArrowDeviceArray nodes whose buffers[0] == nullptr while null_count != 0
+// (e.g. all-null Vortex columns or dictionary keys in TPC-DS), restoring nullptr before release.
+struct ArrowNullMaskPatcher {
+  std::vector<rmm::device_buffer> masks;
+  std::vector<ArrowArray*> patched_bufs;
+
+  void patch_recursive(ArrowArray* a, cuda::stream_ref stream, rmm::device_async_resource_ref mr)
+  {
+    if (a == nullptr) { return; }
+    if (a->n_buffers > 0 && a->buffers != nullptr && a->buffers[0] == nullptr) {
+      if (a->null_count > 0 && a->length > 0) {
+        size_t const mbytes = cudf::bitmask_allocation_size_bytes(
+          static_cast<cudf::size_type>(a->length + a->offset));
+        rmm::device_buffer mask(mbytes, stream, mr);
+        CUDF_CUDA_TRY(cudaMemsetAsync(mask.data(), 0, mbytes, stream.get()));
+        const_cast<void const**>(a->buffers)[0] = mask.data();
+        masks.push_back(std::move(mask));
+        patched_bufs.push_back(a);
+      } else if (a->null_count < 0) {
+        a->null_count = 0;
+      }
+    }
+    if (a->dictionary != nullptr) { patch_recursive(a->dictionary, stream, mr); }
+    if (a->children != nullptr) {
+      for (int64_t i = 0; i < a->n_children; ++i) { patch_recursive(a->children[i], stream, mr); }
+    }
+  }
+
+  void restore() noexcept
+  {
+    for (auto* a : patched_bufs) {
+      if (a != nullptr && a->buffers != nullptr && a->n_buffers > 0) {
+        const_cast<void const**>(a->buffers)[0] = nullptr;
+      }
+    }
+    patched_bufs.clear();
+    masks.clear();
+  }
+
+  ~ArrowNullMaskPatcher() { restore(); }
+};
+
 // Single-pass zero-double-copy materializer: takes 1+ raw ArrowDeviceArray batches,
 // imports zero-copy via cudf::from_arrow_device, and runs ONE GPU concatenate + ONE sync!
 std::unique_ptr<cudf::table> materialize_raw_batches(
@@ -315,6 +357,7 @@ std::unique_ptr<cudf::table> materialize_raw_batches(
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
+  ArrowNullMaskPatcher patcher;
   std::vector<cudf::unique_table_view_t> holders;
   std::vector<std::vector<std::unique_ptr<cudf::column>>> decoded_temps;
   std::vector<cudf::table_view> norm_views;
@@ -323,6 +366,7 @@ std::unique_ptr<cudf::table> materialize_raw_batches(
   norm_views.reserve(raw_batches.size());
 
   for (auto& rb : raw_batches) {
+    patcher.patch_recursive(&rb.dev_arr.array, stream, mr);
     auto h  = cudf::from_arrow_device(&rb.schema, &rb.dev_arr, stream, mr);
     auto tv = *h;
     std::vector<cudf::column_view> cols;
@@ -453,6 +497,7 @@ struct VortexMultiFileScanState {
 // alive across all ColumnVectors in the batch until the last GpuColumnVector is closed!
 struct ZeroCopyArrowOwner {
   RawArrowBatch raw;
+  ArrowNullMaskPatcher null_patcher;
   std::optional<cudf::unique_table_view_t> holder;
   std::vector<std::unique_ptr<cudf::column>> decoded_dict_cols;
 
@@ -461,6 +506,7 @@ struct ZeroCopyArrowOwner {
     g_owners_freed.fetch_add(1, std::memory_order_relaxed);
     decoded_dict_cols.clear();
     holder.reset();
+    null_patcher.restore();
     raw.release();
   }
 };
@@ -921,6 +967,9 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZ
     auto owner = std::make_unique<ZeroCopyArrowOwner>();
     if (!st->pop_next(owner->raw)) { return nullptr; }
     g_owners_created.fetch_add(1, std::memory_order_relaxed);
+
+    // Recursively patch any all-null Arrow children or dictionaries exported with buffers[0] == nullptr
+    owner->null_patcher.patch_recursive(&owner->raw.dev_arr.array, stream, mr);
 
     // Zero-copy Arrow C Device import (automatically calls cudaStreamWaitEvent on stream!)
     owner->holder.emplace(cudf::from_arrow_device(&owner->raw.schema, &owner->raw.dev_arr, stream, mr));
