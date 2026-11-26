@@ -442,6 +442,7 @@ std::unique_ptr<cudf::column> remap_dictionary_to_canonical(
 struct JitReduceProgram {
   CUmodule mod{nullptr};
   CUfunction func{nullptr};
+  CUfunction func_blk{nullptr};
 };
 
 JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
@@ -456,9 +457,9 @@ JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
   CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
   CUDF_CUDA_TRY(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
   std::string arch_opt = "--gpu-architecture=compute_" + std::to_string(major * 10 + minor);
-  char const* opts[]   = {arch_opt.c_str(), "--std=c++17", "--fmad=false"};
+  char const* opts[]   = {arch_opt.c_str(), "--std=c++17", "--fmad=false", "--device-int128"};
 
-  rc = nvrtcCompileProgram(prog, 3, opts);
+  rc = nvrtcCompileProgram(prog, 4, opts);
   if (rc != NVRTC_SUCCESS) {
     size_t log_sz = 0;
     nvrtcGetProgramLogSize(prog, &log_sz);
@@ -485,6 +486,10 @@ JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
     drv.mod_unload(out->mod);
     delete out;
     CUDF_FAIL("cuModuleGetFunction failed for " + kernel_name);
+  }
+  std::string const blk_name = kernel_name + "_blk";
+  if (drv.get_func(&out->func_blk, out->mod, blk_name.c_str()) != CUDA_SUCCESS) {
+    out->func_blk = nullptr;
   }
   return out;
 }
@@ -764,11 +769,26 @@ std::unique_ptr<cudf::table> run_jit_reduce_high_card(
     rmm::device_buffer d_args(sizeof(JitReduceArgs), stream, mr);
     CUDF_CUDA_TRY(
       cudaMemcpyAsync(d_args.data(), &args, sizeof(JitReduceArgs), cudaMemcpyHostToDevice, stream.get()));
-    void* arg_ptr         = d_args.data();
-    void* kparams[]       = {&arg_ptr};
-    uint32_t const blocks = (static_cast<uint32_t>(num_groups) + 255u) / 256u;
-    CUresult cr           = CudaDriverApi::get().launch(
-      prog.func, blocks, 1, 1, 256, 1, 1, 0, static_cast<CUstream>(stream.get()), kparams, nullptr);
+    void* arg_ptr   = d_args.data();
+    void* kparams[] = {&arg_ptr};
+    CUresult cr;
+    if (num_groups < 1024 && prog.func_blk != nullptr) {
+      cr = CudaDriverApi::get().launch(prog.func_blk,
+                                       static_cast<uint32_t>(num_groups),
+                                       1,
+                                       1,
+                                       128,
+                                       1,
+                                       1,
+                                       0,
+                                       static_cast<CUstream>(stream.get()),
+                                       kparams,
+                                       nullptr);
+    } else {
+      uint32_t const blocks = (static_cast<uint32_t>(num_groups) + 255u) / 256u;
+      cr = CudaDriverApi::get().launch(
+        prog.func, blocks, 1, 1, 256, 1, 1, 0, static_cast<CUstream>(stream.get()), kparams, nullptr);
+    }
     CUDF_EXPECTS(cr == CUDA_SUCCESS, "cuLaunchKernel failed in run_jit_reduce_highcard_groupby");
   }
 
