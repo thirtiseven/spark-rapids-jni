@@ -426,6 +426,7 @@ struct VortexMultiFileScanState {
   std::vector<std::string> col_names;
   size_t batch_rows{0};
   size_t prefetch_depth{3};
+  uint32_t scan_flags{0};
   vx_cuda_device_batches* active{nullptr};
   bool started{false};
   int32_t last_file_idx{0};
@@ -443,7 +444,7 @@ struct VortexMultiFileScanState {
     col_views.reserve(col_names.size());
     for (auto const& s : col_names) { col_views.push_back(vx_view{s.data(), s.size()}); }
     vx_cuda_scan_options opts{};
-    opts.flags      = 0u;
+    opts.flags      = scan_flags;
     opts.batch_rows = batch_rows;
     vx_error* err   = nullptr;
     active          = api.scan_paths_prefetch_batches(api.shared_session,
@@ -718,9 +719,15 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_openMultiS
     cudf::jni::auto_set_device(env);
     (void)VortexCudaApi::get();
 
-    auto* st           = new VortexMultiFileScanState();
-    st->batch_rows     = (j_batch_rows > 0) ? static_cast<size_t>(j_batch_rows) : 0u;
-    st->prefetch_depth = (j_prefetch > 0) ? static_cast<size_t>(j_prefetch) : 3u;
+    auto* st       = new VortexMultiFileScanState();
+    st->batch_rows = (j_batch_rows > 0) ? static_cast<size_t>(j_batch_rows) : 0u;
+    if (j_prefetch < 0) {
+      st->scan_flags     = (1u << 1);  // VX_CUDA_SCAN_FLAG_DECODE_DICT
+      st->prefetch_depth = static_cast<size_t>(-j_prefetch);
+    } else {
+      st->scan_flags     = 0u;
+      st->prefetch_depth = (j_prefetch > 0) ? static_cast<size_t>(j_prefetch) : 3u;
+    }
 
     jsize const nf = env->GetArrayLength(j_paths);
     st->files.reserve(static_cast<size_t>(nf));
