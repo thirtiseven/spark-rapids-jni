@@ -130,6 +130,59 @@ public final class LencNative {
     return new Table(decodeCachedLshfProjectedNative(lshfBytes, selectedCols, typeIds, scales));
   }
 
+  public static final class StarJoinBuildTable implements AutoCloseable {
+    private long handle;
+
+    private StarJoinBuildTable(long handle) {
+      this.handle = handle;
+    }
+
+    public long getHandle() {
+      return handle;
+    }
+
+    @Override
+    public void close() {
+      if (handle != 0L) {
+        long h = handle;
+        handle = 0L;
+        destroyStarJoinTableNative(h);
+      }
+    }
+  }
+
+  public static StarJoinBuildTable buildStarJoinTable(ColumnView keyCol) {
+    return new StarJoinBuildTable(buildStarJoinTableNative(keyCol.getNativeView()));
+  }
+
+  public static long runStarJoinCount(
+      Table factTable, int[] probeOrds, StarJoinBuildTable[] buildTables, int[] extraNotNull) {
+    long[] bHandles = new long[buildTables.length];
+    for (int i = 0; i < buildTables.length; i++) {
+      bHandles[i] = buildTables[i].getHandle();
+    }
+    return runStarJoinCountNative(factTable.getNativeView(), probeOrds, bHandles, extraNotNull);
+  }
+
+  public static Table runStarJoinMaterialize(
+      Table factTable,
+      int[] probeOrds,
+      StarJoinBuildTable[] buildTables,
+      Table[] dimTables,
+      int[] extraNotNull,
+      int[] outSrcTable,
+      int[] outSrcCol) {
+    long[] bHandles = new long[buildTables.length];
+    long[] dHandles = new long[dimTables.length];
+    for (int i = 0; i < buildTables.length; i++) {
+      bHandles[i] = buildTables[i].getHandle();
+      dHandles[i] = (dimTables[i] != null) ? dimTables[i].getNativeView() : 0L;
+    }
+    return new Table(runStarJoinMaterializeNative(
+        factTable.getNativeView(), probeOrds, bHandles, dHandles, extraNotNull,
+        outSrcTable, outSrcCol));
+  }
+
   private static native long decodeDictionaryNative(long colView);
 
   private static native long remapDictionaryToCanonicalNative(long colView, String[] literals);
@@ -153,4 +206,15 @@ public final class LencNative {
 
   private static native long[] runJitReduceHighCardNative(
       long progHandle, long gkView, long valView, String[][] dictLits, byte[] aggKinds);
+
+  private static native long buildStarJoinTableNative(long keyColView);
+
+  private static native void destroyStarJoinTableNative(long handle);
+
+  private static native long runStarJoinCountNative(
+      long factTableView, int[] probeOrds, long[] buildTableHandles, int[] extraNotNull);
+
+  private static native long[] runStarJoinMaterializeNative(
+      long factTableView, int[] probeOrds, long[] buildTableHandles, long[] dimTableViews,
+      int[] extraNotNull, int[] outSrcTable, int[] outSrcCol);
 }

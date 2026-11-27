@@ -104,4 +104,34 @@ std::unique_ptr<cudf::table> run_jit_reduce_high_card(
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
+// ---------------- Path C: Fused Multi-Way Star Broadcast Equi-Join (L2 LUT / Hash) ----------------
+
+struct StarJoinBuildTable;
+
+StarJoinBuildTable* build_star_join_table(
+  cudf::column_view const& key_col,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+void destroy_star_join_table(StarJoinBuildTable* bt);
+
+int64_t run_star_join_count(
+  cudf::table_view const& fact_table,
+  std::vector<int32_t> const& probe_key_ords,
+  std::vector<StarJoinBuildTable const*> const& build_tables,
+  std::vector<int32_t> const& extra_nn_ords,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+std::unique_ptr<cudf::table> run_star_join_materialize(
+  cudf::table_view const& fact_table,
+  std::vector<int32_t> const& probe_key_ords,
+  std::vector<StarJoinBuildTable const*> const& build_tables,
+  std::vector<cudf::table_view> const& dim_payload_tables,
+  std::vector<int32_t> const& extra_nn_ords,
+  std::vector<int32_t> const& out_src_table,
+  std::vector<int32_t> const& out_src_col,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 }  // namespace rapids::jni::lenc

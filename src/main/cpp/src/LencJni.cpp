@@ -277,4 +277,102 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runJitR
   JNI_CATCH(env, nullptr);
 }
 
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_buildStarJoinTableNative(
+  JNIEnv* env, jclass, jlong j_key_col)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto const* cv = reinterpret_cast<cudf::column_view const*>(j_key_col);
+    auto* bt       = rapids::jni::lenc::build_star_join_table(*cv);
+    return std::bit_cast<jlong>(bt);
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_destroyStarJoinTableNative(
+  JNIEnv* env, jclass, jlong j_bt)
+{
+  JNI_TRY
+  {
+    auto* bt = std::bit_cast<rapids::jni::lenc::StarJoinBuildTable*>(j_bt);
+    rapids::jni::lenc::destroy_star_join_table(bt);
+  }
+  JNI_CATCH(env, );
+}
+
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runStarJoinCountNative(
+  JNIEnv* env,
+  jclass,
+  jlong j_fact_table,
+  jintArray j_probe_ords,
+  jlongArray j_build_tables,
+  jintArray j_extra_nn)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto const* ftv = reinterpret_cast<cudf::table_view const*>(j_fact_table);
+    cudf::jni::native_jintArray np(env, j_probe_ords);
+    std::vector<int32_t> probe_ords(np.begin(), np.end());
+    cudf::jni::native_jlongArray nb(env, j_build_tables);
+    std::vector<rapids::jni::lenc::StarJoinBuildTable const*> bts;
+    bts.reserve(static_cast<size_t>(nb.size()));
+    for (int i = 0; i < nb.size(); ++i) {
+      bts.push_back(std::bit_cast<rapids::jni::lenc::StarJoinBuildTable const*>(nb[i]));
+    }
+    cudf::jni::native_jintArray ne(env, j_extra_nn);
+    std::vector<int32_t> extra_nn(ne.begin(), ne.end());
+    return static_cast<jlong>(
+      rapids::jni::lenc::run_star_join_count(*ftv, probe_ords, bts, extra_nn));
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runStarJoinMaterializeNative(
+  JNIEnv* env,
+  jclass,
+  jlong j_fact_table,
+  jintArray j_probe_ords,
+  jlongArray j_build_tables,
+  jlongArray j_dim_tables,
+  jintArray j_extra_nn,
+  jintArray j_out_src_table,
+  jintArray j_out_src_col)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto const* ftv = reinterpret_cast<cudf::table_view const*>(j_fact_table);
+    cudf::jni::native_jintArray np(env, j_probe_ords);
+    std::vector<int32_t> probe_ords(np.begin(), np.end());
+    cudf::jni::native_jlongArray nb(env, j_build_tables);
+    std::vector<rapids::jni::lenc::StarJoinBuildTable const*> bts;
+    bts.reserve(static_cast<size_t>(nb.size()));
+    for (int i = 0; i < nb.size(); ++i) {
+      bts.push_back(std::bit_cast<rapids::jni::lenc::StarJoinBuildTable const*>(nb[i]));
+    }
+    cudf::jni::native_jlongArray nd(env, j_dim_tables);
+    std::vector<cudf::table_view> dtvs;
+    dtvs.reserve(static_cast<size_t>(nd.size()));
+    for (int i = 0; i < nd.size(); ++i) {
+      if (nd[i] != 0) {
+        dtvs.push_back(*reinterpret_cast<cudf::table_view const*>(nd[i]));
+      } else {
+        dtvs.emplace_back();
+      }
+    }
+    cudf::jni::native_jintArray ne(env, j_extra_nn);
+    std::vector<int32_t> extra_nn(ne.begin(), ne.end());
+    cudf::jni::native_jintArray ost(env, j_out_src_table);
+    std::vector<int32_t> out_src_tbl(ost.begin(), ost.end());
+    cudf::jni::native_jintArray osc(env, j_out_src_col);
+    std::vector<int32_t> out_src_col(osc.begin(), osc.end());
+    auto out = rapids::jni::lenc::run_star_join_materialize(
+      *ftv, probe_ords, bts, dtvs, extra_nn, out_src_tbl, out_src_col);
+    return cudf::jni::convert_table_for_return(env, std::move(out));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
 }  // extern "C"

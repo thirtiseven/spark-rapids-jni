@@ -293,6 +293,7 @@ add_library(
   src/join_primitives.cu
   src/lenc_shuffle.cu
   src/lenc_reduce.cu
+  src/lenc_join.cu
   src/list_slice.cu
   src/like.cu
   src/map.cu
