@@ -313,30 +313,45 @@ struct RawArrowBatch {
 
 // Recursively patches ArrowDeviceArray nodes whose buffers[0] == nullptr while null_count != 0
 // (e.g. all-null Vortex columns or dictionary keys in TPC-DS), restoring nullptr before release.
+// Also temporarily patches Arrow UNKNOWN_NULL_COUNT (-1) with a non-null mask to 1 so
+// cudf::from_arrow_device keeps the validity bitmask intact for fused cudf::concatenate popcount!
 struct ArrowNullMaskPatcher {
   std::vector<rmm::device_buffer> masks;
   std::vector<ArrowArray*> patched_bufs;
+  std::vector<ArrowArray*> patched_unknown_nc;
 
-  void patch_recursive(ArrowArray* a, cuda::stream_ref stream, rmm::device_async_resource_ref mr)
+  bool patch_recursive(ArrowArray* a, cuda::stream_ref stream, rmm::device_async_resource_ref mr)
   {
-    if (a == nullptr) { return; }
-    if (a->n_buffers > 0 && a->buffers != nullptr && a->buffers[0] == nullptr) {
-      if (a->null_count > 0 && a->length > 0) {
-        size_t const mbytes = cudf::bitmask_allocation_size_bytes(
-          static_cast<cudf::size_type>(a->length + a->offset));
-        rmm::device_buffer mask(mbytes, stream, mr);
-        CUDF_CUDA_TRY(cudaMemsetAsync(mask.data(), 0, mbytes, stream.get()));
-        const_cast<void const**>(a->buffers)[0] = mask.data();
-        masks.push_back(std::move(mask));
-        patched_bufs.push_back(a);
+    bool saw_unknown = false;
+    if (a == nullptr) { return false; }
+    if (a->n_buffers > 0 && a->buffers != nullptr) {
+      if (a->buffers[0] == nullptr) {
+        if (a->null_count > 0 && a->length > 0) {
+          size_t const mbytes = cudf::bitmask_allocation_size_bytes(
+            static_cast<cudf::size_type>(a->length + a->offset));
+          rmm::device_buffer mask(mbytes, stream, mr);
+          CUDF_CUDA_TRY(cudaMemsetAsync(mask.data(), 0, mbytes, stream.get()));
+          const_cast<void const**>(a->buffers)[0] = mask.data();
+          masks.push_back(std::move(mask));
+          patched_bufs.push_back(a);
+        } else if (a->null_count < 0) {
+          a->null_count = 0;
+        }
       } else if (a->null_count < 0) {
-        a->null_count = 0;
+        a->null_count = 1;
+        patched_unknown_nc.push_back(a);
+        saw_unknown = true;
       }
     }
-    if (a->dictionary != nullptr) { patch_recursive(a->dictionary, stream, mr); }
-    if (a->children != nullptr) {
-      for (int64_t i = 0; i < a->n_children; ++i) { patch_recursive(a->children[i], stream, mr); }
+    if (a->dictionary != nullptr) {
+      saw_unknown = patch_recursive(a->dictionary, stream, mr) || saw_unknown;
     }
+    if (a->children != nullptr) {
+      for (int64_t i = 0; i < a->n_children; ++i) {
+        saw_unknown = patch_recursive(a->children[i], stream, mr) || saw_unknown;
+      }
+    }
+    return saw_unknown;
   }
 
   void restore() noexcept
@@ -346,31 +361,66 @@ struct ArrowNullMaskPatcher {
         const_cast<void const**>(a->buffers)[0] = nullptr;
       }
     }
+    for (auto* a : patched_unknown_nc) {
+      if (a != nullptr) { a->null_count = -1; }
+    }
     patched_bufs.clear();
+    patched_unknown_nc.clear();
     masks.clear();
   }
 
   ~ArrowNullMaskPatcher() { restore(); }
 };
 
+// Async release payload so materialize_raw_batches NEVER blocks the Spark thread on stream.sync()!
+struct MaterializedInputsOwner {
+  std::vector<RawArrowBatch> raw_batches;
+  ArrowNullMaskPatcher patcher;
+  std::vector<cudf::unique_table_view_t> holders;
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> decoded_temps;
+
+  ~MaterializedInputsOwner()
+  {
+    decoded_temps.clear();
+    holders.clear();
+    patcher.restore();
+    raw_batches.clear();
+  }
+};
+
+void enqueue_materialized_inputs_async(MaterializedInputsOwner* payload, cudaStream_t stream);
+
 // Single-pass zero-double-copy materializer: takes 1+ raw ArrowDeviceArray batches,
-// imports zero-copy via cudf::from_arrow_device, and runs ONE GPU concatenate + ONE sync!
+// imports zero-copy via cudf::from_arrow_device, and runs ONE GPU concatenate with
+// fused __popc exact null_count + async off-thread input cleanup (ZERO stream.sync()!)
 std::unique_ptr<cudf::table> materialize_raw_batches(
   std::vector<RawArrowBatch>& raw_batches,
   std::vector<uint8_t> const& keep_dict32,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
-  ArrowNullMaskPatcher patcher;
-  std::vector<cudf::unique_table_view_t> holders;
-  std::vector<std::vector<std::unique_ptr<cudf::column>>> decoded_temps;
-  std::vector<cudf::table_view> norm_views;
-  holders.reserve(raw_batches.size());
-  decoded_temps.reserve(raw_batches.size());
-  norm_views.reserve(raw_batches.size());
+  auto payload         = std::make_unique<MaterializedInputsOwner>();
+  payload->raw_batches = std::move(raw_batches);
+  payload->holders.reserve(payload->raw_batches.size());
+  payload->decoded_temps.reserve(payload->raw_batches.size());
 
-  for (auto& rb : raw_batches) {
-    patcher.patch_recursive(&rb.dev_arr.array, stream, mr);
+  std::vector<cudf::table_view> norm_views;
+  norm_views.reserve(payload->raw_batches.size());
+  std::vector<uint8_t> col_unknown_nc;
+
+  for (auto& rb : payload->raw_batches) {
+    if (rb.dev_arr.array.n_children > 0 && rb.dev_arr.array.children != nullptr) {
+      if (col_unknown_nc.size() < static_cast<size_t>(rb.dev_arr.array.n_children)) {
+        col_unknown_nc.resize(static_cast<size_t>(rb.dev_arr.array.n_children), 0u);
+      }
+      for (int64_t c = 0; c < rb.dev_arr.array.n_children; ++c) {
+        if (payload->patcher.patch_recursive(rb.dev_arr.array.children[c], stream, mr)) {
+          col_unknown_nc[static_cast<size_t>(c)] = 1u;
+        }
+      }
+    } else {
+      payload->patcher.patch_recursive(&rb.dev_arr.array, stream, mr);
+    }
     auto h  = cudf::from_arrow_device(&rb.schema, &rb.dev_arr, stream, mr);
     auto tv = *h;
     std::vector<cudf::column_view> cols;
@@ -388,8 +438,8 @@ std::unique_ptr<cudf::table> materialize_raw_batches(
         cols.push_back(cv);
       }
     }
-    holders.push_back(std::move(h));
-    decoded_temps.push_back(std::move(temps));
+    payload->holders.push_back(std::move(h));
+    payload->decoded_temps.push_back(std::move(temps));
     norm_views.emplace_back(cols);
   }
 
@@ -399,24 +449,30 @@ std::unique_ptr<cudf::table> materialize_raw_batches(
     std::vector<std::unique_ptr<cudf::column>> owned_cols;
     owned_cols.reserve(static_cast<size_t>(tv.num_columns()));
     size_t tmp_idx = 0;
-    auto& temps0   = decoded_temps[0];
+    auto& temps0   = payload->decoded_temps[0];
     for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
       auto cv = tv.column(c);
+      std::unique_ptr<cudf::column> col;
       if (tmp_idx < temps0.size() && temps0[tmp_idx]->view().head() == cv.head() &&
           temps0[tmp_idx]->type() == cv.type()) {
-        owned_cols.push_back(std::move(temps0[tmp_idx++]));
+        col = std::move(temps0[tmp_idx++]);
       } else {
-        owned_cols.push_back(std::make_unique<cudf::column>(cv, stream, mr));
+        col = std::make_unique<cudf::column>(cv, stream, mr);
       }
+      if (static_cast<size_t>(c) < col_unknown_nc.size() && col_unknown_nc[static_cast<size_t>(c)] != 0 &&
+          col->nullable()) {
+        auto nc = cudf::null_count(col->view().null_mask(), 0, col->size(), stream);
+        col->set_null_count(nc);
+      }
+      owned_cols.push_back(std::move(col));
     }
     out_tbl = std::make_unique<cudf::table>(std::move(owned_cols));
   } else {
+    // cudf::concatenate computes exact null_count for all K merged files inside its fused
+    // kernel (or per-column bitmask concat), eliminating K-1 per-file DtoH sync stalls!
     out_tbl = cudf::concatenate(norm_views, stream, mr);
   }
-  stream.sync();
-  decoded_temps.clear();
-  holders.clear();
-  raw_batches.clear();
+  enqueue_materialized_inputs_async(payload.release(), stream.get());
   return out_tbl;
 }
 
@@ -527,6 +583,7 @@ struct ArrowOwnerReaper {
   struct Pending {
     cudaEvent_t ev;
     ZeroCopyArrowOwner* owner;
+    MaterializedInputsOwner* mat_owner;
   };
   std::mutex mtx;
   std::mutex drain_mtx;
@@ -542,7 +599,7 @@ struct ArrowOwnerReaper {
     worker = std::thread([this]() {
       cudaSetDevice(dev);
       while (true) {
-        Pending p{nullptr, nullptr};
+        Pending p{nullptr, nullptr, nullptr};
         {
           std::unique_lock<std::mutex> lk(mtx);
           cv.wait(lk, [&]() { return !queue.empty() || stop; });
@@ -555,11 +612,12 @@ struct ArrowOwnerReaper {
           cudaEventDestroy(p.ev);
         }
         delete p.owner;
+        delete p.mat_owner;
       }
     });
   }
 
-  void enqueue(ZeroCopyArrowOwner* owner, cudaStream_t stream)
+  void enqueue_any(ZeroCopyArrowOwner* owner, MaterializedInputsOwner* mat_owner, cudaStream_t stream)
   {
     cudaEvent_t ev = nullptr;
     if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess &&
@@ -568,16 +626,15 @@ struct ArrowOwnerReaper {
       {
         std::lock_guard<std::mutex> lk(mtx);
         if (!stop) {
-          queue.push_back(Pending{ev, owner});
-          // Bound pending queue to <= 8 owners (~0.8 GiB) so fast scans (250+ files/s)
-          // never accumulate 200+ owners (~24 GiB) faster than the single reaper thread frees them!
+          queue.push_back(Pending{ev, owner, mat_owner});
           while (queue.size() > 8u) {
             overflow.push_back(queue.front());
             queue.pop_front();
           }
           cv.notify_one();
-          ev    = nullptr;
-          owner = nullptr;
+          ev        = nullptr;
+          owner     = nullptr;
+          mat_owner = nullptr;
         }
       }
       for (auto& p : overflow) {
@@ -586,8 +643,9 @@ struct ArrowOwnerReaper {
           cudaEventDestroy(p.ev);
         }
         delete p.owner;
+        delete p.mat_owner;
       }
-      if (owner == nullptr) { return; }
+      if (owner == nullptr && mat_owner == nullptr) { return; }
       cudaEventSynchronize(ev);
       cudaEventDestroy(ev);
     } else {
@@ -595,6 +653,17 @@ struct ArrowOwnerReaper {
       cudaStreamSynchronize(stream);
     }
     delete owner;
+    delete mat_owner;
+  }
+
+  void enqueue(ZeroCopyArrowOwner* owner, cudaStream_t stream)
+  {
+    enqueue_any(owner, nullptr, stream);
+  }
+
+  void enqueue_mat(MaterializedInputsOwner* mat_owner, cudaStream_t stream)
+  {
+    enqueue_any(nullptr, mat_owner, stream);
   }
 
   void drain_all()
@@ -612,6 +681,7 @@ struct ArrowOwnerReaper {
         cudaEventDestroy(p.ev);
       }
       delete p.owner;
+      delete p.mat_owner;
     }
   }
 
@@ -632,6 +702,11 @@ struct ArrowOwnerReaper {
     return inst;
   }
 };
+
+void enqueue_materialized_inputs_async(MaterializedInputsOwner* payload, cudaStream_t stream)
+{
+  ArrowOwnerReaper::get().enqueue_mat(payload, stream);
+}
 
 void drain_arrow_owner_reaper() noexcept
 {
@@ -722,7 +797,8 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_openMultiS
     auto* st       = new VortexMultiFileScanState();
     st->batch_rows = (j_batch_rows > 0) ? static_cast<size_t>(j_batch_rows) : 0u;
     if (j_prefetch < 0) {
-      st->scan_flags     = (1u << 1);  // VX_CUDA_SCAN_FLAG_DECODE_DICT
+      // Negative prefetch requests fused GPU dict decode + lazy null count for batched multi-file decode!
+      st->scan_flags     = (1u << 1) | (1u << 2);  // DECODE_DICT | LAZY_NULL_COUNT
       st->prefetch_depth = static_cast<size_t>(-j_prefetch);
     } else {
       st->scan_flags     = 0u;
@@ -983,8 +1059,18 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZ
     if (!st->pop_next(owner->raw)) { return nullptr; }
     g_owners_created.fetch_add(1, std::memory_order_relaxed);
 
-    // Recursively patch any all-null Arrow children or dictionaries exported with buffers[0] == nullptr
-    owner->null_patcher.patch_recursive(&owner->raw.dev_arr.array, stream, mr);
+    // Recursively patch any all-null Arrow children, or lazy UNKNOWN_NULL_COUNT (-1) with bitmask!
+    std::vector<uint8_t> col_unknown_nc;
+    if (owner->raw.dev_arr.array.n_children > 0 && owner->raw.dev_arr.array.children != nullptr) {
+      col_unknown_nc.resize(static_cast<size_t>(owner->raw.dev_arr.array.n_children), 0u);
+      for (int64_t c = 0; c < owner->raw.dev_arr.array.n_children; ++c) {
+        if (owner->null_patcher.patch_recursive(owner->raw.dev_arr.array.children[c], stream, mr)) {
+          col_unknown_nc[static_cast<size_t>(c)] = 1u;
+        }
+      }
+    } else {
+      owner->null_patcher.patch_recursive(&owner->raw.dev_arr.array, stream, mr);
+    }
 
     // Zero-copy Arrow C Device import (automatically calls cudaStreamWaitEvent on stream!)
     owner->holder.emplace(cudf::from_arrow_device(&owner->raw.schema, &owner->raw.dev_arr, stream, mr));
@@ -998,6 +1084,13 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZ
     try {
       for (cudf::size_type c = 0; c < nc; ++c) {
         auto cv = tv.column(c);
+        if (static_cast<size_t>(c) < col_unknown_nc.size() &&
+            col_unknown_nc[static_cast<size_t>(c)] != 0 && cv.nullable()) {
+          auto exact_nc = cudf::null_count(cv.null_mask(), cv.offset(), cv.offset() + cv.size(), stream);
+          cv = cudf::column_view(
+            cv.type(), cv.size(), cv.head(), cv.null_mask(), exact_nc, cv.offset(),
+            std::vector<cudf::column_view>(cv.child_begin(), cv.child_end()));
+        }
         bool const want_d32 =
           (static_cast<size_t>(c) < keep_dict32.size() && keep_dict32[static_cast<size_t>(c)] != 0);
         if (cv.type().id() == cudf::type_id::DICTIONARY32 && !want_d32) {
@@ -1028,6 +1121,70 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZ
     ret[1] = static_cast<jlong>(std::max<size_t>(approx_bytes, 64u));
     for (cudf::size_type c = 0; c < nc; ++c) {
       ret[2 + c] = std::bit_cast<jlong>(allocated_views[static_cast<size_t>(c)]);
+    }
+    return ret.get_jArray();
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+// Path A2: Batched Multi-File GPU Decode — pops up to max_batches small files in ONE JNI call,
+// concatenates with fused exact __popc null_count (zero per-file DtoH syncs & zero stream.sync()!),
+// and returns packed [ncols, colPtr_0..colPtr_{nc-1}, numRuns, fIdx_0, rows_0, ...].
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextBatchedMultiFileNative(
+  JNIEnv* env, jclass, jlong j_handle, jint j_max_batches, jlong j_max_rows, jlong j_target_bytes)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* st    = std::bit_cast<VortexMultiFileScanState*>(j_handle);
+    auto stream = cudf::get_default_stream();
+    auto mr     = cudf::get_current_device_resource_ref();
+
+    RawArrowBatch first;
+    if (!st->pop_next(first)) { return nullptr; }
+
+    size_t const max_b    = (j_max_batches > 0) ? static_cast<size_t>(j_max_batches) : 64u;
+    int64_t const max_r   = (j_max_rows > 0) ? static_cast<int64_t>(j_max_rows) : 32000000LL;
+    size_t const target_b = (j_target_bytes > 0) ? static_cast<size_t>(j_target_bytes) : (256u << 20);
+    size_t const est_row_b = std::max<size_t>(st->col_names.size(), 1u) * 8u;
+
+    std::vector<RawArrowBatch> raw_batches;
+    raw_batches.reserve(std::min<size_t>(max_b, 64u));
+    std::vector<std::pair<int32_t, int64_t>> runs;
+    runs.reserve(std::min<size_t>(max_b, 64u));
+
+    int64_t acc_rows = first.dev_arr.array.length;
+    size_t acc_bytes = static_cast<size_t>(acc_rows) * est_row_b;
+    runs.emplace_back(first.file_idx, first.dev_arr.array.length);
+    raw_batches.push_back(std::move(first));
+
+    while (raw_batches.size() < max_b && acc_bytes < target_b && acc_rows < max_r) {
+      RawArrowBatch nxt;
+      if (!st->pop_next(nxt)) { break; }
+      int64_t const nr = nxt.dev_arr.array.length;
+      if (!runs.empty() && runs.back().first == nxt.file_idx) {
+        runs.back().second += nr;
+      } else {
+        runs.emplace_back(nxt.file_idx, nr);
+      }
+      acc_rows += nr;
+      acc_bytes += static_cast<size_t>(nr) * est_row_b;
+      raw_batches.push_back(std::move(nxt));
+    }
+
+    auto out_tbl  = materialize_raw_batches(raw_batches, {}, stream, mr);
+    auto cols     = out_tbl->release();
+    auto const nc = static_cast<jsize>(cols.size());
+    auto const nr = static_cast<jsize>(runs.size());
+    cudf::jni::native_jlongArray ret(env, 2 + nc + 2 * nr);
+    ret[0] = static_cast<jlong>(nc);
+    for (jsize c = 0; c < nc; ++c) {
+      ret[1 + c] = std::bit_cast<jlong>(cols[static_cast<size_t>(c)].release());
+    }
+    ret[1 + nc] = static_cast<jlong>(nr);
+    for (jsize r = 0; r < nr; ++r) {
+      ret[2 + nc + 2 * r]     = static_cast<jlong>(runs[static_cast<size_t>(r)].first);
+      ret[2 + nc + 2 * r + 1] = static_cast<jlong>(runs[static_cast<size_t>(r)].second);
     }
     return ret.get_jArray();
   }

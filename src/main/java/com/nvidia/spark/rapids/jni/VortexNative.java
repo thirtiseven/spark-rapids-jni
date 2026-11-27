@@ -109,6 +109,39 @@ public final class VortexNative {
       }
     }
 
+    public static final class BatchedTable {
+      public final Table table;
+      public final int[] fileIndices;
+      public final int[] rowCounts;
+
+      BatchedTable(Table table, int[] fileIndices, int[] rowCounts) {
+        this.table = table;
+        this.fileIndices = fileIndices;
+        this.rowCounts = rowCounts;
+      }
+    }
+
+    public BatchedTable nextBatchedMultiFile(int maxBatches, long maxRows, long targetBytes) {
+      if (handle == 0L) {
+        return null;
+      }
+      long[] packed = nextBatchedMultiFileNative(handle, maxBatches, maxRows, targetBytes);
+      if (packed == null) {
+        return null;
+      }
+      int nc = (int) packed[0];
+      long[] cols = new long[nc];
+      System.arraycopy(packed, 1, cols, 0, nc);
+      int nRuns = (int) packed[1 + nc];
+      int[] fIdx = new int[nRuns];
+      int[] rCnt = new int[nRuns];
+      for (int i = 0; i < nRuns; i++) {
+        fIdx[i] = (int) packed[2 + nc + 2 * i];
+        rCnt[i] = (int) packed[2 + nc + 2 * i + 1];
+      }
+      return new BatchedTable(new Table(cols), fIdx, rCnt);
+    }
+
     public int getLastFileIndex() {
       if (handle == 0L) {
         return 0;
@@ -155,6 +188,9 @@ public final class VortexNative {
       String[] filePaths, String[] colNames, long batchRows, int prefetchCap);
 
   private static native long[] nextZeroCopyBatchNative(long handle, byte[] dict32Mask);
+
+  private static native long[] nextBatchedMultiFileNative(
+      long handle, int maxBatches, long maxRows, long targetBytes);
 
   private static native int getLastFileIndexNative(long handle);
 
