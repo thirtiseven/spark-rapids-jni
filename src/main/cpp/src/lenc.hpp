@@ -125,6 +125,8 @@ int64_t run_star_join_count(
 
 std::unique_ptr<cudf::table> run_star_join_materialize(
   cudf::table_view const& fact_table,
+  int32_t row_start,
+  int32_t row_end,
   std::vector<int32_t> const& probe_key_ords,
   std::vector<StarJoinBuildTable const*> const& build_tables,
   std::vector<cudf::table_view> const& dim_payload_tables,

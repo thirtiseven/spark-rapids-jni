@@ -166,6 +166,8 @@ public final class LencNative {
 
   public static Table runStarJoinMaterialize(
       Table factTable,
+      int rowStart,
+      int rowEnd,
       int[] probeOrds,
       StarJoinBuildTable[] buildTables,
       Table[] dimTables,
@@ -179,7 +181,7 @@ public final class LencNative {
       dHandles[i] = (dimTables[i] != null) ? dimTables[i].getNativeView() : 0L;
     }
     return new Table(runStarJoinMaterializeNative(
-        factTable.getNativeView(), probeOrds, bHandles, dHandles, extraNotNull,
+        factTable.getNativeView(), rowStart, rowEnd, probeOrds, bHandles, dHandles, extraNotNull,
         outSrcTable, outSrcCol));
   }
 
@@ -215,6 +217,6 @@ public final class LencNative {
       long factTableView, int[] probeOrds, long[] buildTableHandles, int[] extraNotNull);
 
   private static native long[] runStarJoinMaterializeNative(
-      long factTableView, int[] probeOrds, long[] buildTableHandles, long[] dimTableViews,
-      int[] extraNotNull, int[] outSrcTable, int[] outSrcCol);
+      long factTableView, int rowStart, int rowEnd, int[] probeOrds, long[] buildTableHandles,
+      long[] dimTableViews, int[] extraNotNull, int[] outSrcTable, int[] outSrcCol);
 }

@@ -333,6 +333,8 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runStar
   JNIEnv* env,
   jclass,
   jlong j_fact_table,
+  jint j_row_start,
+  jint j_row_end,
   jintArray j_probe_ords,
   jlongArray j_build_tables,
   jlongArray j_dim_tables,
@@ -369,7 +371,15 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runStar
     cudf::jni::native_jintArray osc(env, j_out_src_col);
     std::vector<int32_t> out_src_col(osc.begin(), osc.end());
     auto out = rapids::jni::lenc::run_star_join_materialize(
-      *ftv, probe_ords, bts, dtvs, extra_nn, out_src_tbl, out_src_col);
+      *ftv,
+      static_cast<int32_t>(j_row_start),
+      static_cast<int32_t>(j_row_end),
+      probe_ords,
+      bts,
+      dtvs,
+      extra_nn,
+      out_src_tbl,
+      out_src_col);
     return cudf::jni::convert_table_for_return(env, std::move(out));
   }
   JNI_CATCH(env, nullptr);

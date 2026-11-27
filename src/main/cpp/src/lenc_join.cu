@@ -612,7 +612,9 @@ int64_t run_star_join_count(
 }
 
 std::unique_ptr<cudf::table> run_star_join_materialize(
-  cudf::table_view const& fact_table,
+  cudf::table_view const& full_fact_table,
+  int32_t row_start,
+  int32_t row_end,
   std::vector<int32_t> const& probe_key_ords,
   std::vector<StarJoinBuildTable const*> const& build_tables,
   std::vector<cudf::table_view> const& dim_payload_tables,
@@ -622,6 +624,15 @@ std::unique_ptr<cudf::table> run_star_join_materialize(
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
+  // Zero-copy O(1) slice when caller chunks wide string batches to avoid cuDF 2 GiB string overflow!
+  std::vector<cudf::table_view> sliced_holder;
+  cudf::table_view fact_table = full_fact_table;
+  if (row_start > 0 || row_end < full_fact_table.num_rows()) {
+    int32_t const s = std::clamp(row_start, 0, full_fact_table.num_rows());
+    int32_t const e = std::clamp(row_end, s, full_fact_table.num_rows());
+    sliced_holder   = cudf::slice(full_fact_table, {s, e});
+    fact_table      = sliced_holder[0];
+  }
   int32_t const n     = fact_table.num_rows();
   int32_t const k     = static_cast<int32_t>(build_tables.size());
   int32_t const n_out = static_cast<int32_t>(out_src_table.size());
