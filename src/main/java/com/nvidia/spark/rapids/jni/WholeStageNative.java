@@ -182,6 +182,28 @@ public final class WholeStageNative {
         tids, scales, numParts, outSplits));
   }
 
+  public static Table runStageMaterialize(
+      Program countProg,
+      Program scatterProg,
+      ColumnView[] factCols,
+      int numRows,
+      long[] probeHandles,
+      ColumnView[] dimCols,
+      DType[] outTypes) {
+    long[] fViews = new long[factCols.length];
+    for (int i = 0; i < factCols.length; i++) { fViews[i] = factCols[i].getNativeView(); }
+    long[] dViews = new long[dimCols.length];
+    for (int i = 0; i < dimCols.length; i++) { dViews[i] = dimCols[i].getNativeView(); }
+    int[] tids = new int[outTypes.length];
+    int[] scales = new int[outTypes.length];
+    for (int i = 0; i < outTypes.length; i++) {
+      tids[i] = outTypes[i].getTypeId().getNativeId();
+      scales[i] = outTypes[i].getScale();
+    }
+    return new Table(runStageMaterializeNative(
+        countProg.handle, scatterProg.handle, fViews, numRows, probeHandles, dViews, tids, scales));
+  }
+
   private static native long compileProgramNative(String bodyCudaSrc, String kernelName);
   private static native void destroyProgramNative(long progHandle);
   private static native long buildProbeTableNative(long keyColView);
@@ -201,4 +223,7 @@ public final class WholeStageNative {
       long countProg, long scatterProg, long[] factCols, int numRows,
       long[] probeHandles, long[] dimCols, int[] outTids, int[] outScales,
       int numParts, int[] outSplits);
+  private static native long[] runStageMaterializeNative(
+      long countProg, long scatterProg, long[] factCols, int numRows,
+      long[] probeHandles, long[] dimCols, int[] outTids, int[] outScales);
 }

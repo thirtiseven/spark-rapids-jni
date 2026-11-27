@@ -1387,6 +1387,12 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_streamComp
   jclass,
   jobjectArray j_paths,
   jobjectArray j_col_names,
+  jint j_total_fact_slots,
+  jintArray j_file_col_slots,
+  jintArray j_part_const_slots,
+  jintArray j_part_const_widths,
+  jlongArray j_part_const_vals,
+  jbyteArray j_part_const_nulls,
   jlong j_agg_state,
   jlongArray j_probe_tables,
   jlongArray j_dim_col_views)
@@ -1425,6 +1431,27 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_streamComp
       env->DeleteLocalRef(js);
     }
     for (auto const& s : col_strs) { col_views.push_back(vx_view{s.data(), s.size()}); }
+
+    std::vector<int32_t> file_col_slots;
+    if (j_file_col_slots != nullptr) {
+      cudf::jni::native_jintArray fcs(env, j_file_col_slots);
+      file_col_slots.assign(fcs.begin(), fcs.end());
+    }
+    std::vector<int32_t> part_const_slots;
+    std::vector<int32_t> part_const_widths;
+    std::vector<int64_t> part_const_vals;
+    std::vector<int8_t> part_const_nulls;
+    if (j_part_const_slots != nullptr) {
+      cudf::jni::native_jintArray pcs(env, j_part_const_slots);
+      cudf::jni::native_jintArray pcw(env, j_part_const_widths);
+      cudf::jni::native_jlongArray pcv(env, j_part_const_vals);
+      cudf::jni::native_jbyteArray pcn(env, j_part_const_nulls);
+      part_const_slots.assign(pcs.begin(), pcs.end());
+      part_const_widths.assign(pcw.begin(), pcw.end());
+      part_const_vals.assign(pcv.begin(), pcv.end());
+      part_const_nulls.assign(pcn.begin(), pcn.end());
+    }
+    size_t const n_part_cols = part_const_slots.size();
 
     std::vector<cudf::whole_stage::broadcast_probe_table const*> probes;
     if (j_probe_tables != nullptr) {
@@ -1476,9 +1503,23 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_streamComp
           CUDF_FAIL("VortexJni next_compressed failed: " + api.consume_error(nerr));
         }
         if (cb_handle == nullptr) { break; }
+        size_t const fidx = api.device_batches_last_file_idx(batches);
         try {
           if (nrows > 0u) {
-            std::vector<cudf::whole_stage::col_source_desc> fact_srcs(cols_ptr, cols_ptr + ncols);
+            std::vector<cudf::whole_stage::col_source_desc> fact_srcs(
+              static_cast<size_t>(j_total_fact_slots));
+            for (size_t i = 0; i < ncols && i < file_col_slots.size(); ++i) {
+              fact_srcs[static_cast<size_t>(file_col_slots[i])] = cols_ptr[i];
+            }
+            for (size_t p = 0; p < n_part_cols; ++p) {
+              size_t const flat = fidx * n_part_cols + p;
+              fact_srcs[static_cast<size_t>(part_const_slots[p])] =
+                cudf::whole_stage::make_constant_i64_source(
+                  part_const_vals[flat],
+                  part_const_nulls[flat] != 0,
+                  static_cast<uint8_t>(part_const_widths[p]),
+                  nrows);
+            }
             cudf::whole_stage::add_batch_whole_stage_agg(*st, fact_srcs, nrows, probes, dim_srcs);
             cudf::get_default_stream().sync();
             total_rows += static_cast<int64_t>(nrows);

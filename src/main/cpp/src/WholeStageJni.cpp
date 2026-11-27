@@ -348,4 +348,68 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_r
   JNI_CATCH(env, nullptr);
 }
 
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_runStageMaterializeNative(
+  JNIEnv* env,
+  jclass,
+  jlong j_count_prog,
+  jlong j_scatter_prog,
+  jlongArray j_fact_col_views,
+  jint j_num_rows,
+  jlongArray j_probe_tables,
+  jlongArray j_dim_col_views,
+  jintArray j_out_tids,
+  jintArray j_out_scales)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* cprog = std::bit_cast<cudf::whole_stage::whole_stage_program*>(j_count_prog);
+    auto* sprog = std::bit_cast<cudf::whole_stage::whole_stage_program*>(j_scatter_prog);
+
+    std::vector<cudf::whole_stage::col_source_desc> fact_srcs;
+    if (j_fact_col_views != nullptr) {
+      cudf::jni::native_jlongArray fc(env, j_fact_col_views);
+      fact_srcs.reserve(static_cast<size_t>(fc.size()));
+      for (int i = 0; i < fc.size(); ++i) {
+        auto const* cv = reinterpret_cast<cudf::column_view const*>(fc[i]);
+        fact_srcs.push_back(cudf::whole_stage::make_raw_source(*cv));
+      }
+    }
+    std::vector<cudf::whole_stage::broadcast_probe_table const*> probes;
+    if (j_probe_tables != nullptr) {
+      cudf::jni::native_jlongArray pt(env, j_probe_tables);
+      probes.reserve(static_cast<size_t>(pt.size()));
+      for (int i = 0; i < pt.size(); ++i) {
+        probes.push_back(std::bit_cast<cudf::whole_stage::broadcast_probe_table const*>(pt[i]));
+      }
+    }
+    std::vector<cudf::whole_stage::col_source_desc> dim_srcs;
+    if (j_dim_col_views != nullptr) {
+      cudf::jni::native_jlongArray dc(env, j_dim_col_views);
+      dim_srcs.reserve(static_cast<size_t>(dc.size()));
+      for (int i = 0; i < dc.size(); ++i) {
+        auto const* cv = reinterpret_cast<cudf::column_view const*>(dc[i]);
+        dim_srcs.push_back(cudf::whole_stage::make_raw_source(*cv));
+      }
+    }
+    cudf::jni::native_jintArray tids(env, j_out_tids);
+    cudf::jni::native_jintArray scs(env, j_out_scales);
+    std::vector<cudf::data_type> out_dts;
+    out_dts.reserve(static_cast<size_t>(tids.size()));
+    for (int i = 0; i < tids.size(); ++i) {
+      auto tid = static_cast<cudf::type_id>(tids[i]);
+      if (tid == cudf::type_id::DECIMAL32 || tid == cudf::type_id::DECIMAL64 ||
+          tid == cudf::type_id::DECIMAL128) {
+        out_dts.emplace_back(tid, scs[i]);
+      } else {
+        out_dts.emplace_back(tid);
+      }
+    }
+    auto tbl = cudf::whole_stage::run_whole_stage_materialize(
+      *cprog, *sprog, fact_srcs, static_cast<uint32_t>(j_num_rows), probes, dim_srcs, out_dts);
+    return cudf::jni::convert_table_for_return(env, std::move(tbl));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
 }  // extern "C"

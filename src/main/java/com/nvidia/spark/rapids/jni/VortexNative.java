@@ -221,11 +221,17 @@ public final class VortexNative {
 
   /**
    * Streams multi-file Vortex compressed segments (FSST / FastLanes BitPacked+FoR / ALP / Dict)
-   * directly into a libcudf WholeStageNative.HashAggTask WITHOUT materializing uncompressed HBM columns!
+   * plus optional zero-HBM Hive partition CONSTANT columns directly into libcudf WholeStageNative.HashAggTask!
    */
   public static long streamCompressedPathsToWholeStageAgg(
       String[] paths,
-      String[] colNames,
+      String[] fileColNames,
+      int totalFactSlots,
+      int[] fileColSlots,
+      int[] partConstSlots,
+      int[] partConstWidths,
+      long[] partConstVals,
+      byte[] partConstNulls,
       WholeStageNative.HashAggTask aggTask,
       long[] probeHandles,
       ColumnView[] dimCols) {
@@ -234,7 +240,8 @@ public final class VortexNative {
       dViews[i] = dimCols[i].getNativeView();
     }
     return streamCompressedPathsToWholeStageAggNative(
-        paths, colNames, aggTask.getNativeHandle(), probeHandles, dViews);
+        paths, fileColNames, totalFactSlots, fileColSlots, partConstSlots, partConstWidths,
+        partConstVals, partConstNulls, aggTask.getNativeHandle(), probeHandles, dViews);
   }
 
   private static native void writeTableNative(long tableView, String[] colNames, String path);
@@ -262,6 +269,7 @@ public final class VortexNative {
   private static native long[] maskToRowIndicesNative(long maskColView);
 
   private static native long streamCompressedPathsToWholeStageAggNative(
-      String[] paths, String[] colNames, long aggTaskHandle,
-      long[] probeHandles, long[] dimColViews);
+      String[] paths, String[] fileColNames, int totalFactSlots, int[] fileColSlots,
+      int[] partConstSlots, int[] partConstWidths, long[] partConstVals, byte[] partConstNulls,
+      long aggTaskHandle, long[] probeHandles, long[] dimColViews);
 }
