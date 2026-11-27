@@ -19,6 +19,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
@@ -671,6 +672,408 @@ std::unique_ptr<cudf::table> run_jit_reduce_table(
   return finalize_lowcard_output(
     gk_dicts, gk_strides, args.max_groups, agg_kinds, h_f64, h_i64, h_cnt, stream, mr);
 }
+
+// ---------------- Generic Per-Task Cross-Batch GPU Accumulator ----------------
+// Keeps one persistent d_f64/d_i64/d_cnt GPU buffer across ALL input batches of a Spark task!
+// Eliminates per-batch GPU alloc/init/DtoH/sync + per-batch CudfTable creation & downstream shuffle
+// fragmentation for EVERY scan format (Parquet, Vortex, ORC, CSV).
+
+namespace {
+
+constexpr uint32_t kSmallDictPackBytes = 4096u;
+
+__global__ void pack_small_dict_keys_kernel(int32_t const* __restrict__ offsets,
+                                            char const* __restrict__ chars,
+                                            uint32_t ds,
+                                            uint8_t* __restrict__ out_buf)
+{
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    auto* out_i32   = reinterpret_cast<int32_t*>(out_buf);
+    int32_t base    = (ds > 0u) ? offsets[0] : 0;
+    int32_t total_c = (ds > 0u) ? (offsets[ds] - base) : 0;
+    uint32_t hdr_b  = (ds + 2u) * sizeof(int32_t);
+    out_i32[0]      = static_cast<int32_t>(ds);
+    if (hdr_b + static_cast<uint32_t>(total_c) > kSmallDictPackBytes) {
+      out_i32[0] = -1;  // signal caller to fall back to standard two-step readback
+      return;
+    }
+    for (uint32_t k = 0; k <= ds; ++k) { out_i32[1u + k] = offsets[k] - base; }
+    char* dst_c = reinterpret_cast<char*>(out_buf + hdr_b);
+    for (int32_t i = 0; i < total_c; ++i) { dst_c[i] = chars[base + i]; }
+  }
+}
+
+}  // namespace
+
+struct JitReduceTaskAccumulator {
+  JitReduceProgram* prog{nullptr};
+  std::vector<std::vector<std::string>> dict_lits;
+  std::vector<int32_t> group_key_slots;
+  int32_t max_groups{1};
+  std::vector<uint8_t> agg_kinds;
+  std::vector<int32_t> key_caps;
+  std::vector<int32_t> key_strides;
+  std::vector<std::vector<std::string>> task_gk_dicts;
+  std::vector<std::unordered_map<std::string, int32_t>> task_gk_maps;
+  int32_t eff_max_groups{1};
+  bool any_rows{false};
+
+  rmm::device_uvector<double> d_f64;
+  rmm::device_uvector<long long> d_i64;
+  rmm::device_uvector<unsigned long long> d_cnt;
+  rmm::device_buffer d_args;
+  rmm::device_uvector<uint8_t> d_pack_buf;
+  std::vector<rmm::device_uvector<int32_t>> d_remaps;
+  std::vector<std::unique_ptr<cudf::table>> overflow_tables;
+
+  JitReduceTaskAccumulator(JitReduceProgram& p,
+                           std::vector<std::vector<std::string>> const& dl,
+                           std::vector<int32_t> const& gks,
+                           int32_t mg,
+                           std::vector<uint8_t> const& ak,
+                           cuda::stream_ref stream,
+                           rmm::device_async_resource_ref mr)
+    : prog(&p),
+      dict_lits(dl),
+      group_key_slots(gks),
+      max_groups(std::max<int32_t>(mg, 1)),
+      agg_kinds(ak),
+      d_f64(0, stream, mr),
+      d_i64(0, stream, mr),
+      d_cnt(0, stream, mr),
+      d_args(sizeof(JitReduceArgs), stream, mr),
+      d_pack_buf(0, stream, mr)
+  {
+    size_t const ngk = group_key_slots.size();
+    task_gk_dicts.resize(ngk);
+    task_gk_maps.resize(ngk);
+    key_caps.resize(ngk, 1);
+    key_strides.resize(ngk, 1);
+    if (ngk == 0) {
+      eff_max_groups = 1;
+    } else if (ngk == 1) {
+      key_caps[0]    = max_groups;
+      key_strides[0] = 1;
+      eff_max_groups = max_groups;
+    } else if (ngk == 2) {
+      int32_t const c1 = std::max<int32_t>(1, static_cast<int32_t>(std::sqrt(static_cast<double>(max_groups))));
+      int32_t const c0 = std::max<int32_t>(1, max_groups / c1);
+      key_caps[0]      = c0;
+      key_caps[1]      = c1;
+      key_strides[0]   = c1;
+      key_strides[1]   = 1;
+      eff_max_groups   = c0 * c1;
+    } else {
+      eff_max_groups = 0;  // fall back to run_jit_reduce_table
+    }
+
+    if (eff_max_groups > 0) {
+      size_t const na    = agg_kinds.size();
+      size_t const slots = static_cast<size_t>(eff_max_groups) * na;
+      d_f64.resize(slots, stream);
+      d_i64.resize(slots, stream);
+      d_cnt.resize(slots, stream);
+      if (ngk > 0) {
+        d_pack_buf.resize(ngk * kSmallDictPackBytes, stream);
+        d_remaps.reserve(ngk);
+        for (size_t i = 0; i < ngk; ++i) {
+          d_remaps.emplace_back(static_cast<size_t>(std::max<int32_t>(max_groups, 64)), stream, mr);
+        }
+      }
+      reset_device_buffers(stream);
+    }
+  }
+
+  void reset_device_buffers(cuda::stream_ref stream)
+  {
+    size_t const na    = agg_kinds.size();
+    size_t const slots = static_cast<size_t>(eff_max_groups) * na;
+    std::vector<double> init_f64(slots, 0.0);
+    std::vector<long long> init_i64(slots, 0LL);
+    for (int32_t g = 0; g < eff_max_groups; ++g) {
+      for (size_t a = 0; a < na; ++a) {
+        size_t const off = static_cast<size_t>(g) * na + a;
+        if (agg_kinds[a] == 3) init_f64[off] = std::numeric_limits<double>::infinity();
+        else if (agg_kinds[a] == 4) init_f64[off] = -std::numeric_limits<double>::infinity();
+        else if (agg_kinds[a] == 5) init_i64[off] = std::numeric_limits<long long>::max();
+        else if (agg_kinds[a] == 6) init_i64[off] = std::numeric_limits<long long>::min();
+      }
+    }
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      d_f64.data(), init_f64.data(), slots * sizeof(double), cudaMemcpyHostToDevice, stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      d_i64.data(), init_i64.data(), slots * sizeof(long long), cudaMemcpyHostToDevice, stream.get()));
+    CUDF_CUDA_TRY(cudaMemsetAsync(d_cnt.data(), 0, slots * sizeof(unsigned long long), stream.get()));
+  }
+};
+
+JitReduceTaskAccumulator* open_jit_reduce_task(
+  JitReduceProgram& prog,
+  std::vector<std::vector<std::string>> const& dict_lits,
+  std::vector<int32_t> const& group_key_slots,
+  int32_t max_groups,
+  std::vector<uint8_t> const& agg_kinds,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  return new JitReduceTaskAccumulator(prog, dict_lits, group_key_slots, max_groups, agg_kinds, stream, mr);
+}
+
+void add_batch_jit_reduce_task(JitReduceTaskAccumulator& acc,
+                               cudf::table_view const& table,
+                               cuda::stream_ref stream,
+                               rmm::device_async_resource_ref mr)
+{
+  auto const n = static_cast<uint32_t>(table.num_rows());
+  if (n == 0) { return; }
+  if (acc.eff_max_groups <= 0) {
+    acc.overflow_tables.push_back(run_jit_reduce_table(
+      *acc.prog, table, acc.dict_lits, acc.group_key_slots, acc.max_groups, acc.agg_kinds, stream, mr));
+    return;
+  }
+
+  size_t const nc  = static_cast<size_t>(table.num_columns());
+  size_t const na  = acc.agg_kinds.size();
+  size_t const ngk = acc.group_key_slots.size();
+
+  JitReduceArgs args{};
+  args.num_rows   = n;
+  args.max_groups = acc.eff_max_groups;
+  args.num_aggs   = static_cast<int32_t>(na);
+  args.out_f64    = acc.d_f64.data();
+  args.out_i64    = acc.d_i64.data();
+  args.out_cnt    = acc.d_cnt.data();
+
+  std::vector<std::unique_ptr<cudf::column>> owned_cols;
+  struct GkBatchInfo {
+    size_t gk_idx;
+    size_t slot;
+    cudf::column_view dview;
+    uint32_t ds;
+  };
+  std::vector<GkBatchInfo> gk_infos;
+  gk_infos.reserve(ngk);
+
+  for (size_t s = 0; s < nc; ++s) {
+    cudf::column_view cv = table.column(static_cast<cudf::size_type>(s));
+    JitColDesc& cd       = args.cols[s];
+    cd.mode              = 0;
+    cd.has_nulls         = (cv.nullable() && cv.null_count() > 0) ? 1 : 0;
+    cd.null_mask         = cd.has_nulls ? reinterpret_cast<uint32_t const*>(cv.null_mask()) : nullptr;
+
+    auto gk_it = std::find(acc.group_key_slots.begin(), acc.group_key_slots.end(), static_cast<int32_t>(s));
+    bool const is_gk    = (gk_it != acc.group_key_slots.end());
+    bool const has_lits = (s < acc.dict_lits.size() && !acc.dict_lits[s].empty());
+
+    if (cv.type().id() == cudf::type_id::STRING || cv.type().id() == cudf::type_id::DICTIONARY32) {
+      cudf::column_view dview = cv;
+      if (cv.type().id() == cudf::type_id::STRING) {
+        auto enc = cudf::dictionary::encode(cv, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+        dview    = enc->view();
+        owned_cols.push_back(std::move(enc));
+      }
+      if (has_lits) {
+        auto canon = remap_dictionary_to_canonical(dview, acc.dict_lits[s], stream, mr);
+        cd.raw_ptr = canon->view().head();
+        owned_cols.push_back(std::move(canon));
+      } else if (is_gk) {
+        size_t const gk_idx = static_cast<size_t>(std::distance(acc.group_key_slots.begin(), gk_it));
+        cudf::dictionary_column_view const dcv(dview);
+        uint32_t const ds = static_cast<uint32_t>(dcv.keys_size());
+        gk_infos.push_back(GkBatchInfo{gk_idx, s, dview, ds});
+
+        // Pack small dictionary keys on GPU so ALL group-key cols read back in 1 single sync!
+        cudf::strings_column_view const ksv(dcv.keys());
+        uint8_t* dst_pack = acc.d_pack_buf.data() + gk_idx * kSmallDictPackBytes;
+        pack_small_dict_keys_kernel<<<1, 1, 0, stream.get()>>>(
+          ksv.offsets().data<int32_t>() + dcv.keys().offset(),
+          ksv.chars_begin(stream),
+          ds,
+          dst_pack);
+
+        cudf::column_view const idx_col = dcv.indices();
+        auto const idx_off              = static_cast<size_t>(dcv.offset());
+        switch (idx_col.type().id()) {
+          case cudf::type_id::UINT8:
+            cd.mode    = 4;
+            cd.raw_ptr = idx_col.data<uint8_t>() + idx_off;
+            break;
+          case cudf::type_id::UINT16:
+            cd.mode    = 5;
+            cd.raw_ptr = idx_col.data<uint16_t>() + idx_off;
+            break;
+          case cudf::type_id::INT8:
+            cd.mode    = 6;
+            cd.raw_ptr = idx_col.data<int8_t>() + idx_off;
+            break;
+          case cudf::type_id::INT16:
+            cd.mode    = 7;
+            cd.raw_ptr = idx_col.data<int16_t>() + idx_off;
+            break;
+          default:
+            cd.mode    = 0;
+            cd.raw_ptr = static_cast<uint8_t const*>(idx_col.head()) + idx_off * sizeof(int32_t);
+            break;
+        }
+        cd.dict_size = static_cast<uint32_t>(acc.key_caps[gk_idx]);
+      }
+    } else {
+      size_t const esz = cudf::size_of(cv.type());
+      cd.raw_ptr       = static_cast<uint8_t const*>(cv.head()) + static_cast<size_t>(cv.offset()) * esz;
+    }
+  }
+
+  // Single combined DtoH sync for ALL group-key dictionaries (0 syncs for global reduce!)
+  bool cap_exceeded = false;
+  if (!gk_infos.empty()) {
+    std::vector<uint8_t> h_pack(ngk * kSmallDictPackBytes);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      h_pack.data(), acc.d_pack_buf.data(), h_pack.size(), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
+
+    for (auto const& gi : gk_infos) {
+      uint8_t const* pb  = h_pack.data() + gi.gk_idx * kSmallDictPackBytes;
+      auto const* p_i32  = reinterpret_cast<int32_t const*>(pb);
+      int32_t const flag = p_i32[0];
+      std::vector<std::string> batch_keys(gi.ds);
+      if (flag >= 0) {
+        char const* ch_ptr = reinterpret_cast<char const*>(pb + (gi.ds + 2u) * sizeof(int32_t));
+        for (uint32_t k = 0; k < gi.ds; ++k) {
+          batch_keys[k].assign(ch_ptr + p_i32[1u + k], static_cast<size_t>(p_i32[2u + k] - p_i32[1u + k]));
+        }
+      } else {
+        // Fallback for unusually long string keys (> 4 KiB dictionary payload)
+        cudf::dictionary_column_view const dcv(gi.dview);
+        cudf::strings_column_view const ksv(dcv.keys());
+        std::vector<int32_t> h_offs(gi.ds + 1u, 0);
+        if (gi.ds > 0) {
+          CUDF_CUDA_TRY(cudaMemcpyAsync(h_offs.data(),
+                                        ksv.offsets().data<int32_t>() + dcv.keys().offset(),
+                                        (gi.ds + 1u) * sizeof(int32_t),
+                                        cudaMemcpyDeviceToHost,
+                                        stream.get()));
+          stream.sync();
+        }
+        int32_t const base_o = h_offs[0];
+        int32_t const kb     = h_offs[gi.ds] - base_o;
+        std::vector<char> h_ch(static_cast<size_t>(kb));
+        if (kb > 0) {
+          CUDF_CUDA_TRY(cudaMemcpyAsync(h_ch.data(),
+                                        ksv.chars_begin(stream) + base_o,
+                                        static_cast<size_t>(kb),
+                                        cudaMemcpyDeviceToHost,
+                                        stream.get()));
+          stream.sync();
+        }
+        for (uint32_t k = 0; k < gi.ds; ++k) {
+          batch_keys[k].assign(h_ch.data() + (h_offs[k] - base_o),
+                               static_cast<size_t>(h_offs[k + 1] - h_offs[k]));
+        }
+      }
+
+      std::vector<int32_t> h_remap(gi.ds, -1);
+      auto& tdict = acc.task_gk_dicts[gi.gk_idx];
+      auto& tmap  = acc.task_gk_maps[gi.gk_idx];
+      for (uint32_t k = 0; k < gi.ds; ++k) {
+        auto it = tmap.find(batch_keys[k]);
+        if (it == tmap.end()) {
+          if (static_cast<int32_t>(tdict.size()) >= acc.key_caps[gi.gk_idx]) {
+            cap_exceeded = true;
+            break;
+          }
+          int32_t const new_id = static_cast<int32_t>(tdict.size());
+          tmap.emplace(batch_keys[k], new_id);
+          tdict.push_back(batch_keys[k]);
+          h_remap[k] = new_id;
+        } else {
+          h_remap[k] = it->second;
+        }
+      }
+      if (cap_exceeded) { break; }
+      if (gi.ds > 0) {
+        if (acc.d_remaps[gi.gk_idx].size() < gi.ds) {
+          acc.d_remaps[gi.gk_idx].resize(gi.ds, stream);
+        }
+        CUDF_CUDA_TRY(cudaMemcpyAsync(acc.d_remaps[gi.gk_idx].data(),
+                                      h_remap.data(),
+                                      gi.ds * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        args.cols[gi.slot].dict_remap = acc.d_remaps[gi.gk_idx].data();
+      }
+    }
+  }
+
+  if (cap_exceeded) {
+    acc.overflow_tables.push_back(run_jit_reduce_table(
+      *acc.prog, table, acc.dict_lits, acc.group_key_slots, acc.max_groups, acc.agg_kinds, stream, mr));
+    return;
+  }
+
+  // Launch asynchronously directly into persistent task GPU accumulators (ZERO result DtoH/sync!)
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    acc.d_args.data(), &args, sizeof(JitReduceArgs), cudaMemcpyHostToDevice, stream.get()));
+  void* arg_ptr   = acc.d_args.data();
+  void* kparams[] = {&arg_ptr};
+  uint32_t const blocks = std::min<uint32_t>((n + 255u) / 256u, 2048u);
+  CUresult cr = CudaDriverApi::get().launch(
+    acc.prog->func, blocks, 1, 1, 256, 1, 1, 0, static_cast<CUstream>(stream.get()), kparams, nullptr);
+  CUDF_EXPECTS(cr == CUDA_SUCCESS, "cuLaunchKernel failed in add_batch_jit_reduce_task");
+  acc.any_rows = true;
+}
+
+std::unique_ptr<cudf::table> finish_jit_reduce_task(JitReduceTaskAccumulator& acc,
+                                                    cuda::stream_ref stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::table>> parts;
+  if (acc.any_rows && acc.eff_max_groups > 0) {
+    size_t const na    = acc.agg_kinds.size();
+    size_t const slots = static_cast<size_t>(acc.eff_max_groups) * na;
+    std::vector<double> h_f64(slots);
+    std::vector<long long> h_i64(slots);
+    std::vector<unsigned long long> h_cnt(slots);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      h_f64.data(), acc.d_f64.data(), slots * sizeof(double), cudaMemcpyDeviceToHost, stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      h_i64.data(), acc.d_i64.data(), slots * sizeof(long long), cudaMemcpyDeviceToHost, stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      h_cnt.data(), acc.d_cnt.data(), slots * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
+
+    // Pad task_gk_dicts to key_caps only via strides so finalize_lowcard_output decodes g correctly
+    std::vector<std::vector<std::string>> padded_dicts = acc.task_gk_dicts;
+    for (size_t i = 0; i < padded_dicts.size(); ++i) {
+      if (padded_dicts[i].size() < static_cast<size_t>(acc.key_caps[i])) {
+        padded_dicts[i].resize(static_cast<size_t>(acc.key_caps[i]));
+      }
+    }
+    auto main_tbl = finalize_lowcard_output(
+      padded_dicts, acc.key_strides, acc.eff_max_groups, acc.agg_kinds, h_f64, h_i64, h_cnt, stream, mr);
+    if (main_tbl->num_rows() > 0) { parts.push_back(std::move(main_tbl)); }
+  }
+  for (auto& ot : acc.overflow_tables) {
+    if (ot && ot->num_rows() > 0) { parts.push_back(std::move(ot)); }
+  }
+  acc.overflow_tables.clear();
+
+  if (parts.empty()) {
+    std::vector<std::vector<std::string>> empty_dicts(acc.group_key_slots.size());
+    std::vector<int32_t> empty_strides(acc.group_key_slots.size(), 1);
+    std::vector<double> z_f64(acc.agg_kinds.size(), 0.0);
+    std::vector<long long> z_i64(acc.agg_kinds.size(), 0LL);
+    std::vector<unsigned long long> z_cnt(acc.agg_kinds.size(), 0ULL);
+    return finalize_lowcard_output(
+      empty_dicts, empty_strides, 0, acc.agg_kinds, z_f64, z_i64, z_cnt, stream, mr);
+  }
+  if (parts.size() == 1) { return std::move(parts[0]); }
+  std::vector<cudf::table_view> views;
+  views.reserve(parts.size());
+  for (auto const& t : parts) { views.push_back(t->view()); }
+  return cudf::concatenate(views, stream, mr);
+}
+
+void destroy_jit_reduce_task(JitReduceTaskAccumulator* acc) { delete acc; }
 
 std::unique_ptr<cudf::table> run_jit_reduce_high_card(
   JitReduceProgram& prog,

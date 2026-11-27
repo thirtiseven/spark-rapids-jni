@@ -61,6 +61,15 @@ public final class LencNative {
           handle, table.getNativeView(), dictLits, groupKeySlots, maxGroups, aggKinds));
     }
 
+    public JitReduceTaskAccumulator openTaskAccumulator(
+        String[][] dictLits,
+        int[] groupKeySlots,
+        int maxGroups,
+        byte[] aggKinds) {
+      long accH = openJitReduceTaskNative(handle, dictLits, groupKeySlots, maxGroups, aggKinds);
+      return new JitReduceTaskAccumulator(accH);
+    }
+
     public Table runHighCardGroupBy(
         Table groupKeys,
         Table valueCols,
@@ -76,6 +85,31 @@ public final class LencNative {
         long h = handle;
         handle = 0L;
         destroyJitReduceNative(h);
+      }
+    }
+  }
+
+  public static final class JitReduceTaskAccumulator implements AutoCloseable {
+    private long handle;
+
+    private JitReduceTaskAccumulator(long handle) {
+      this.handle = handle;
+    }
+
+    public void addBatch(Table table) {
+      addBatchJitReduceTaskNative(handle, table.getNativeView());
+    }
+
+    public Table finish() {
+      return new Table(finishJitReduceTaskNative(handle));
+    }
+
+    @Override
+    public void close() {
+      if (handle != 0L) {
+        long h = handle;
+        handle = 0L;
+        destroyJitReduceTaskNative(h);
       }
     }
   }
@@ -205,6 +239,15 @@ public final class LencNative {
   private static native long[] runJitReduceTableNative(
       long progHandle, long tableView, String[][] dictLits,
       int[] groupKeySlots, int maxGroups, byte[] aggKinds);
+
+  private static native long openJitReduceTaskNative(
+      long progHandle, String[][] dictLits, int[] groupKeySlots, int maxGroups, byte[] aggKinds);
+
+  private static native void addBatchJitReduceTaskNative(long accHandle, long tableView);
+
+  private static native long[] finishJitReduceTaskNative(long accHandle);
+
+  private static native void destroyJitReduceTaskNative(long accHandle);
 
   private static native long[] runJitReduceHighCardNative(
       long progHandle, long gkView, long valView, String[][] dictLits, byte[] aggKinds);

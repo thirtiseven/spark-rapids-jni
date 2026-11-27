@@ -251,6 +251,72 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runJitR
   JNI_CATCH(env, nullptr);
 }
 
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_openJitReduceTaskNative(
+  JNIEnv* env,
+  jclass,
+  jlong j_prog,
+  jobjectArray j_dict_lits_2d,
+  jintArray j_gk_slots,
+  jint j_max_groups,
+  jbyteArray j_agg_kinds)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* prog     = std::bit_cast<rapids::jni::lenc::JitReduceProgram*>(j_prog);
+    auto dict_lits = parse_dict_lits_2d(env, j_dict_lits_2d);
+    std::vector<int32_t> gks;
+    if (j_gk_slots != nullptr) {
+      cudf::jni::native_jintArray ng(env, j_gk_slots);
+      gks.assign(ng.data(), ng.data() + ng.size());
+    }
+    cudf::jni::native_jbyteArray na(env, j_agg_kinds);
+    std::vector<uint8_t> aks(static_cast<size_t>(na.size()));
+    for (size_t i = 0; i < aks.size(); ++i) { aks[i] = static_cast<uint8_t>(na[i]); }
+    auto* acc = rapids::jni::lenc::open_jit_reduce_task(
+      *prog, dict_lits, gks, static_cast<int32_t>(j_max_groups), aks);
+    return std::bit_cast<jlong>(acc);
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_addBatchJitReduceTaskNative(
+  JNIEnv* env, jclass, jlong j_acc, jlong j_table_view)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* acc      = std::bit_cast<rapids::jni::lenc::JitReduceTaskAccumulator*>(j_acc);
+    auto const* tv = reinterpret_cast<cudf::table_view const*>(j_table_view);
+    rapids::jni::lenc::add_batch_jit_reduce_task(*acc, *tv);
+  }
+  JNI_CATCH(env, );
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_finishJitReduceTaskNative(
+  JNIEnv* env, jclass, jlong j_acc)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* acc = std::bit_cast<rapids::jni::lenc::JitReduceTaskAccumulator*>(j_acc);
+    auto tbl  = rapids::jni::lenc::finish_jit_reduce_task(*acc);
+    return cudf::jni::convert_table_for_return(env, std::move(tbl));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_destroyJitReduceTaskNative(
+  JNIEnv* env, jclass, jlong j_acc)
+{
+  JNI_TRY
+  {
+    auto* acc = std::bit_cast<rapids::jni::lenc::JitReduceTaskAccumulator*>(j_acc);
+    rapids::jni::lenc::destroy_jit_reduce_task(acc);
+  }
+  JNI_CATCH(env, );
+}
+
 JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_runJitReduceHighCardNative(
   JNIEnv* env,
   jclass,

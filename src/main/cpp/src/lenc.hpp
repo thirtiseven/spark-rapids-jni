@@ -95,6 +95,30 @@ std::unique_ptr<cudf::table> run_jit_reduce_table(
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
+struct JitReduceTaskAccumulator;
+
+JitReduceTaskAccumulator* open_jit_reduce_task(
+  JitReduceProgram& prog,
+  std::vector<std::vector<std::string>> const& dict_lits,
+  std::vector<int32_t> const& group_key_slots,
+  int32_t max_groups,
+  std::vector<uint8_t> const& agg_kinds,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+void add_batch_jit_reduce_task(
+  JitReduceTaskAccumulator& acc,
+  cudf::table_view const& table,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+std::unique_ptr<cudf::table> finish_jit_reduce_task(
+  JitReduceTaskAccumulator& acc,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+void destroy_jit_reduce_task(JitReduceTaskAccumulator* acc);
+
 std::unique_ptr<cudf::table> run_jit_reduce_high_card(
   JitReduceProgram& prog,
   cudf::table_view const& key_table,
