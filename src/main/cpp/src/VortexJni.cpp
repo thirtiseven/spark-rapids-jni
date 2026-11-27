@@ -205,6 +205,19 @@ struct VortexCudaApi {
                                                            vx_error**)                      = nullptr;
   int (*device_batches_next)(
     vx_cuda_device_batches*, ArrowSchema*, ArrowDeviceArray*, vx_error**)                   = nullptr;
+  int (*device_batches_next_merged)(vx_cuda_device_batches*,
+                                    size_t,
+                                    size_t,
+                                    size_t,
+                                    size_t,
+                                    ArrowSchema*,
+                                    ArrowDeviceArray*,
+                                    int32_t*,
+                                    int32_t*,
+                                    size_t,
+                                    size_t*,
+                                    uint8_t*,
+                                    vx_error**)                                             = nullptr;
   size_t (*device_batches_last_file_idx)(vx_cuda_device_batches const*)                     = nullptr;
   void (*device_batches_free)(vx_cuda_device_batches*)                                      = nullptr;
   vx_session* shared_session{nullptr};
@@ -255,6 +268,7 @@ struct VortexCudaApi {
       a.load(a.scan_paths_prefetch_batches, "vx_cuda_scan_paths_prefetch_batches");
       a.load(a.scan_device_batches_with_rows, "vx_cuda_scan_path_device_batches_with_rows");
       a.load(a.device_batches_next, "vx_cuda_device_batches_next");
+      a.load(a.device_batches_next_merged, "vx_cuda_device_batches_next_merged");
       a.load(a.device_batches_last_file_idx, "vx_cuda_device_batches_last_file_idx");
       a.load(a.device_batches_free, "vx_cuda_device_batches_free");
 
@@ -1127,9 +1141,13 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextZ
   JNI_CATCH(env, nullptr);
 }
 
-// Path A2: Batched Multi-File GPU Decode — pops up to max_batches small files in ONE JNI call,
-// concatenates with fused exact __popc null_count (zero per-file DtoH syncs & zero stream.sync()!),
-// and returns packed [ncols, colPtr_0..colPtr_{nc-1}, numRuns, fIdx_0, rows_0, ...].
+// Path A-Deep: Multi-stream pre-allocated direct-into-output multi-file GPU decode!
+// Calls vx_cuda_device_batches_next_merged to decode up to max_batches small files concurrently
+// across up to 8 CUDA streams into ONE pre-allocated ArrowDeviceArray + ONE SyncEvent, and imports
+// TRUE ZERO-COPY via ZeroCopyArrowOwner (ZERO cudf::concatenate, ZERO cudf::column copy!).
+// Packed return format: [ownerPtr, approxBytes, ncols, colPtr_0..colPtr_{nc-1}, numRuns, fIdx_0, rows_0, ...]
+// (ownerPtr != 0 => colPtr_i are zero-copy cudf::column_view* owned by ownerPtr;
+//  ownerPtr == 0 => colPtr_i are owned cudf::column* from string/non-fixed-width fallback).
 JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextBatchedMultiFileNative(
   JNIEnv* env, jclass, jlong j_handle, jint j_max_batches, jlong j_max_rows, jlong j_target_bytes)
 {
@@ -1140,13 +1158,123 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextB
     auto stream = cudf::get_default_stream();
     auto mr     = cudf::get_current_device_resource_ref();
 
+    st->start_prefetch();
+    if (st->active == nullptr) { return nullptr; }
+
+    size_t const max_b     = (j_max_batches > 0) ? static_cast<size_t>(j_max_batches) : 64u;
+    size_t const max_r     = (j_max_rows > 0) ? static_cast<size_t>(j_max_rows) : 32000000u;
+    size_t const target_b  = (j_target_bytes > 0) ? static_cast<size_t>(j_target_bytes) : (256u << 20);
+    size_t const est_row_b = std::max<size_t>(st->col_names.size(), 1u) * 8u;
+
+    auto& api = VortexCudaApi::get();
+    // If pushback is empty (normal case), invoke Path A-Deep directly!
+    if (st->pushback.empty() && api.device_batches_next_merged != nullptr) {
+      auto owner = std::make_unique<ZeroCopyArrowOwner>();
+      std::vector<int32_t> f_idx(max_b, 0);
+      std::vector<int32_t> r_cnt(max_b, 0);
+      size_t n_runs      = 0;
+      uint8_t was_merged = 0;
+      vx_error* err      = nullptr;
+      int const rc       = api.device_batches_next_merged(st->active,
+                                                    max_b,
+                                                    max_r,
+                                                    target_b,
+                                                    est_row_b,
+                                                    &owner->raw.schema,
+                                                    &owner->raw.dev_arr,
+                                                    f_idx.data(),
+                                                    r_cnt.data(),
+                                                    max_b,
+                                                    &n_runs,
+                                                    &was_merged,
+                                                    &err);
+      if (rc != 0) { CUDF_FAIL("Vortex next_merged failed: " + api.consume_error(err)); }
+      if (owner->raw.dev_arr.array.release == nullptr) {
+        api.device_batches_free(st->active);
+        st->active = nullptr;
+        return nullptr;
+      }
+
+      // If Path A-Deep merged multiple fixed-width files OR this is a single-batch return (e.g.
+      // 1 large file or string table where was_merged==0 and n_runs==1):
+      // Wait: if was_merged==0 and n_runs==1 and rows is tiny (string multi-file table), coalesce
+      // via existing materialize_raw_batches; otherwise wrap TRUE ZERO-COPY right here!
+      int64_t const nrows = owner->raw.dev_arr.array.length;
+      bool const small_unmerged_string =
+        (was_merged == 0u && max_b > 1u && nrows > 0 &&
+         static_cast<size_t>(nrows) * est_row_b < target_b / 2u &&
+         static_cast<size_t>(nrows) < max_r);
+
+      if (!small_unmerged_string) {
+        g_owners_created.fetch_add(1, std::memory_order_relaxed);
+        std::vector<uint8_t> col_unknown_nc;
+        if (owner->raw.dev_arr.array.n_children > 0 && owner->raw.dev_arr.array.children != nullptr) {
+          col_unknown_nc.resize(static_cast<size_t>(owner->raw.dev_arr.array.n_children), 0u);
+          for (int64_t c = 0; c < owner->raw.dev_arr.array.n_children; ++c) {
+            if (owner->null_patcher.patch_recursive(owner->raw.dev_arr.array.children[c], stream, mr)) {
+              col_unknown_nc[static_cast<size_t>(c)] = 1u;
+            }
+          }
+        } else {
+          owner->null_patcher.patch_recursive(&owner->raw.dev_arr.array, stream, mr);
+        }
+
+        owner->holder.emplace(
+          cudf::from_arrow_device(&owner->raw.schema, &owner->raw.dev_arr, stream, mr));
+        auto tv       = **owner->holder;
+        auto const nc = tv.num_columns();
+
+        size_t approx_bytes = 0;
+        std::vector<cudf::column_view*> allocated_views;
+        allocated_views.reserve(static_cast<size_t>(nc));
+        try {
+          for (cudf::size_type c = 0; c < nc; ++c) {
+            auto cv = tv.column(c);
+            if (static_cast<size_t>(c) < col_unknown_nc.size() &&
+                col_unknown_nc[static_cast<size_t>(c)] != 0 && cv.nullable()) {
+              auto exact_nc =
+                cudf::null_count(cv.null_mask(), cv.offset(), cv.offset() + cv.size(), stream);
+              cv = cudf::column_view(
+                cv.type(), cv.size(), cv.head(), cv.null_mask(), exact_nc, cv.offset(),
+                std::vector<cudf::column_view>(cv.child_begin(), cv.child_end()));
+            }
+            if (cv.type().id() == cudf::type_id::DICTIONARY32) {
+              auto dec = cudf::dictionary::decode(cudf::dictionary_column_view(cv), stream, mr);
+              approx_bytes += static_cast<size_t>(dec->size()) * 8u;
+              allocated_views.push_back(new cudf::column_view(dec->view()));
+              owner->decoded_dict_cols.push_back(std::move(dec));
+            } else {
+              approx_bytes += static_cast<size_t>(cv.size()) * 8u;
+              allocated_views.push_back(new cudf::column_view(cv));
+            }
+          }
+        } catch (...) {
+          for (auto* vp : allocated_views) { delete vp; }
+          throw;
+        }
+        auto const nr = static_cast<jsize>(n_runs);
+        cudf::jni::native_jlongArray ret(env, 4 + nc + 2 * nr);
+        ret[0] = std::bit_cast<jlong>(owner.release());
+        ret[1] = static_cast<jlong>(std::max<size_t>(approx_bytes, 64u));
+        ret[2] = static_cast<jlong>(nc);
+        for (cudf::size_type c = 0; c < nc; ++c) {
+          ret[3 + c] = reinterpret_cast<jlong>(allocated_views[static_cast<size_t>(c)]);
+        }
+        ret[3 + nc] = static_cast<jlong>(nr);
+        for (jsize r = 0; r < nr; ++r) {
+          ret[4 + nc + 2 * r]     = static_cast<jlong>(f_idx[static_cast<size_t>(r)]);
+          ret[4 + nc + 2 * r + 1] = static_cast<jlong>(r_cnt[static_cast<size_t>(r)]);
+        }
+        return ret.get_jArray();
+      } else {
+        // String / non-fixed-width small file fallback: coalesce up to max_b via materialize_raw_batches
+        owner->raw.file_idx = (n_runs > 0) ? f_idx[0] : 0;
+        st->pushback.push_front(std::move(owner->raw));
+      }
+    }
+
     RawArrowBatch first;
     if (!st->pop_next(first)) { return nullptr; }
-
-    size_t const max_b    = (j_max_batches > 0) ? static_cast<size_t>(j_max_batches) : 64u;
-    int64_t const max_r   = (j_max_rows > 0) ? static_cast<int64_t>(j_max_rows) : 32000000LL;
-    size_t const target_b = (j_target_bytes > 0) ? static_cast<size_t>(j_target_bytes) : (256u << 20);
-    size_t const est_row_b = std::max<size_t>(st->col_names.size(), 1u) * 8u;
 
     std::vector<RawArrowBatch> raw_batches;
     raw_batches.reserve(std::min<size_t>(max_b, 64u));
@@ -1158,17 +1286,18 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextB
     runs.emplace_back(first.file_idx, first.dev_arr.array.length);
     raw_batches.push_back(std::move(first));
 
-    while (raw_batches.size() < max_b && acc_bytes < target_b && acc_rows < max_r) {
+    while (raw_batches.size() < max_b && acc_bytes < target_b &&
+           acc_rows < static_cast<int64_t>(max_r)) {
       RawArrowBatch nxt;
       if (!st->pop_next(nxt)) { break; }
-      int64_t const nr = nxt.dev_arr.array.length;
+      int64_t const nr_rows = nxt.dev_arr.array.length;
       if (!runs.empty() && runs.back().first == nxt.file_idx) {
-        runs.back().second += nr;
+        runs.back().second += nr_rows;
       } else {
-        runs.emplace_back(nxt.file_idx, nr);
+        runs.emplace_back(nxt.file_idx, nr_rows);
       }
-      acc_rows += nr;
-      acc_bytes += static_cast<size_t>(nr) * est_row_b;
+      acc_rows += nr_rows;
+      acc_bytes += static_cast<size_t>(nr_rows) * est_row_b;
       raw_batches.push_back(std::move(nxt));
     }
 
@@ -1176,15 +1305,17 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_nextB
     auto cols     = out_tbl->release();
     auto const nc = static_cast<jsize>(cols.size());
     auto const nr = static_cast<jsize>(runs.size());
-    cudf::jni::native_jlongArray ret(env, 2 + nc + 2 * nr);
-    ret[0] = static_cast<jlong>(nc);
+    cudf::jni::native_jlongArray ret(env, 4 + nc + 2 * nr);
+    ret[0] = 0LL;  // ownerPtr == 0 => owned cudf::column* handles
+    ret[1] = 0LL;
+    ret[2] = static_cast<jlong>(nc);
     for (jsize c = 0; c < nc; ++c) {
-      ret[1 + c] = std::bit_cast<jlong>(cols[static_cast<size_t>(c)].release());
+      ret[3 + c] = std::bit_cast<jlong>(cols[static_cast<size_t>(c)].release());
     }
-    ret[1 + nc] = static_cast<jlong>(nr);
+    ret[3 + nc] = static_cast<jlong>(nr);
     for (jsize r = 0; r < nr; ++r) {
-      ret[2 + nc + 2 * r]     = static_cast<jlong>(runs[static_cast<size_t>(r)].first);
-      ret[2 + nc + 2 * r + 1] = static_cast<jlong>(runs[static_cast<size_t>(r)].second);
+      ret[4 + nc + 2 * r]     = static_cast<jlong>(runs[static_cast<size_t>(r)].first);
+      ret[4 + nc + 2 * r + 1] = static_cast<jlong>(runs[static_cast<size_t>(r)].second);
     }
     return ret.get_jArray();
   }

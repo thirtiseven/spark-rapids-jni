@@ -110,12 +110,12 @@ public final class VortexNative {
     }
 
     public static final class BatchedTable {
-      public final Table table;
+      public final ColumnVector[] columns;
       public final int[] fileIndices;
       public final int[] rowCounts;
 
-      BatchedTable(Table table, int[] fileIndices, int[] rowCounts) {
-        this.table = table;
+      BatchedTable(ColumnVector[] columns, int[] fileIndices, int[] rowCounts) {
+        this.columns = columns;
         this.fileIndices = fileIndices;
         this.rowCounts = rowCounts;
       }
@@ -129,17 +129,54 @@ public final class VortexNative {
       if (packed == null) {
         return null;
       }
-      int nc = (int) packed[0];
-      long[] cols = new long[nc];
-      System.arraycopy(packed, 1, cols, 0, nc);
-      int nRuns = (int) packed[1 + nc];
+      long ownerPtr = packed[0];
+      long approxBytes = packed[1];
+      int nc = (int) packed[2];
+      int nRuns = (int) packed[3 + nc];
       int[] fIdx = new int[nRuns];
       int[] rCnt = new int[nRuns];
       for (int i = 0; i < nRuns; i++) {
-        fIdx[i] = (int) packed[2 + nc + 2 * i];
-        rCnt[i] = (int) packed[2 + nc + 2 * i + 1];
+        fIdx[i] = (int) packed[4 + nc + 2 * i];
+        rCnt[i] = (int) packed[4 + nc + 2 * i + 1];
       }
-      return new BatchedTable(new Table(cols), fIdx, rCnt);
+      ColumnVector[] cvs = new ColumnVector[nc];
+      boolean ok = false;
+      if (ownerPtr != 0L) {
+        DeviceMemoryBuffer ownerBuf = DeviceMemoryBuffer.fromExternalCleaner(
+            0L, approxBytes, new ArrowOwnerCleaner(ownerPtr));
+        try {
+          for (int i = 0; i < nc; i++) {
+            cvs[i] = ColumnVector.fromViewWithContiguousAllocation(packed[3 + i], ownerBuf);
+          }
+          ok = true;
+          return new BatchedTable(cvs, fIdx, rCnt);
+        } finally {
+          ownerBuf.close();
+          if (!ok) {
+            for (ColumnVector cv : cvs) {
+              if (cv != null) {
+                cv.close();
+              }
+            }
+          }
+        }
+      } else {
+        try {
+          for (int i = 0; i < nc; i++) {
+            cvs[i] = new ColumnVector(packed[3 + i]);
+          }
+          ok = true;
+          return new BatchedTable(cvs, fIdx, rCnt);
+        } finally {
+          if (!ok) {
+            for (ColumnVector cv : cvs) {
+              if (cv != null) {
+                cv.close();
+              }
+            }
+          }
+        }
+      }
     }
 
     public int getLastFileIndex() {
