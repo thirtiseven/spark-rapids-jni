@@ -108,6 +108,8 @@ __device__ __forceinline__ uint8_t d_bits_needed(uint64_t range)
 
 template <typename T>
 __global__ void batched_for256_stats_kernel(T const* __restrict__ data,
+                                            cudf::bitmask_type const* __restrict__ null_mask,
+                                            cudf::size_type col_off,
                                             uint32_t const* __restrict__ blk_row_start,
                                             uint16_t const* __restrict__ blk_row_len,
                                             int64_t* __restrict__ min_vals,
@@ -121,23 +123,36 @@ __global__ void batched_for256_stats_kernel(T const* __restrict__ data,
   uint32_t const b     = blockIdx.x;
   uint32_t const start = blk_row_start[b];
   uint32_t const len   = blk_row_len[b];
-  uint32_t const idx   = (threadIdx.x < len) ? (start + threadIdx.x) : start;
+  bool const in_bounds = (threadIdx.x < len);
+  uint32_t const r     = start + threadIdx.x;
+  bool const valid =
+    in_bounds && (null_mask == nullptr || cudf::bit_is_set(null_mask, col_off + static_cast<cudf::size_type>(r)));
 
-  int64_t const v  = static_cast<int64_t>(data[idx]);
-  int64_t const lo = BlockReduce(ts_min).Reduce(v, cuda::minimum<>{});
-  int64_t const hi = BlockReduce(ts_max).Reduce(v, cuda::maximum<>{});
+  int64_t const v_lo = valid ? static_cast<int64_t>(data[r]) : INT64_MAX;
+  int64_t const v_hi = valid ? static_cast<int64_t>(data[r]) : INT64_MIN;
+  int64_t const lo   = BlockReduce(ts_min).Reduce(v_lo, cuda::minimum<>{});
+  int64_t const hi   = BlockReduce(ts_max).Reduce(v_hi, cuda::maximum<>{});
 
   if (threadIdx.x == 0) {
-    min_vals[b]          = lo;
-    uint64_t const range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
-    uint8_t const bw     = d_bits_needed(range);
-    bit_widths[b]        = bw;
-    blk_words[b]         = (bw == 0u) ? 0u : ((len * bw + 63u) / 64u + 1u);
+    if (lo > hi) {
+      // All-null 256-row block: 0 bits needed, zero payload!
+      min_vals[b]   = 0;
+      bit_widths[b] = 0u;
+      blk_words[b]  = 0u;
+    } else {
+      min_vals[b]          = lo;
+      uint64_t const range = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+      uint8_t const bw     = d_bits_needed(range);
+      bit_widths[b]        = bw;
+      blk_words[b]         = (bw == 0u) ? 0u : ((len * bw + 63u) / 64u + 1u);
+    }
   }
 }
 
 template <typename T>
 __global__ void batched_for256_pack_kernel(T const* __restrict__ data,
+                                           cudf::bitmask_type const* __restrict__ null_mask,
+                                           cudf::size_type col_off,
                                            uint32_t const* __restrict__ blk_row_start,
                                            uint16_t const* __restrict__ blk_row_len,
                                            int64_t const* __restrict__ min_vals,
@@ -160,8 +175,11 @@ __global__ void batched_for256_pack_kernel(T const* __restrict__ data,
   __syncthreads();
 
   if (threadIdx.x < len) {
+    uint32_t const r = start + threadIdx.x;
+    bool const valid =
+      (null_mask == nullptr || cudf::bit_is_set(null_mask, col_off + static_cast<cudf::size_type>(r)));
     uint64_t const delta =
-      static_cast<uint64_t>(static_cast<int64_t>(data[start + threadIdx.x]) - base);
+      valid ? static_cast<uint64_t>(static_cast<int64_t>(data[r]) - base) : 0ULL;
     uint32_t const bit_pos = threadIdx.x * bw;
     uint32_t const widx    = bit_pos >> 6;
     uint32_t const bit_off = bit_pos & 63u;
@@ -1049,13 +1067,17 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
   std::vector<ColWork> works;
   works.reserve(ncols);
 
-  auto run_batched_for = [&]<typename T>(ColWork& w, T const* d_in) {
+  auto run_batched_for = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
+    cudf::bitmask_type const* nmask = w.has_nulls ? cv.null_mask() : nullptr;
+    cudf::size_type const coff      = cv.offset();
     w.d_mins.resize(total_blks, stream);
     w.d_bws.resize(total_blks, stream);
     w.d_word_offs.resize(total_blks + 1u, stream);
     if (total_blks > 0) {
       batched_for256_stats_kernel<T><<<total_blks, 256, 0, stream.get()>>>(
         d_in,
+        nmask,
+        coff,
         d_blk_row_start.data(),
         d_blk_row_len.data(),
         w.d_mins.data(),
@@ -1078,6 +1100,8 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     if (total_blks > 0 && tot_words > 0) {
       batched_for256_pack_kernel<T><<<total_blks, 256, 0, stream.get()>>>(
         d_in,
+        nmask,
+        coff,
         d_blk_row_start.data(),
         d_blk_row_len.data(),
         w.d_mins.data(),
@@ -1111,7 +1135,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       w.enc       = ShufEnc::FOR_BITPACK;
       w.elem_size = 8;
       run_batched_for.template operator()<int64_t>(
-        w, static_cast<int64_t const*>(cv.head()) + cv.offset());
+        w, static_cast<int64_t const*>(cv.head()) + cv.offset(), cv);
       for (size_t p = 0; p < n_parts; ++p) {
         uint32_t const nc = h_part_nblks[p];
         if (nc == 0) continue;
@@ -1127,7 +1151,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       w.enc       = ShufEnc::FOR_BITPACK;
       w.elem_size = 4;
       run_batched_for.template operator()<int32_t>(
-        w, static_cast<int32_t const*>(cv.head()) + cv.offset());
+        w, static_cast<int32_t const*>(cv.head()) + cv.offset(), cv);
       for (size_t p = 0; p < n_parts; ++p) {
         uint32_t const nc = h_part_nblks[p];
         if (nc == 0) continue;
@@ -1141,7 +1165,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     } else if (w.tid == cudf::type_id::INT16) {
       w.enc       = ShufEnc::FOR_BITPACK;
       w.elem_size = 2;
-      run_batched_for.template operator()<int16_t>(w, cv.data<int16_t>() + cv.offset());
+      run_batched_for.template operator()<int16_t>(w, cv.data<int16_t>() + cv.offset(), cv);
       for (size_t p = 0; p < n_parts; ++p) {
         uint32_t const nc = h_part_nblks[p];
         if (nc == 0) continue;
@@ -1156,7 +1180,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       w.enc       = ShufEnc::FOR_BITPACK;
       w.elem_size = 1;
       run_batched_for.template operator()<int8_t>(
-        w, static_cast<int8_t const*>(cv.head()) + cv.offset());
+        w, static_cast<int8_t const*>(cv.head()) + cv.offset(), cv);
       for (size_t p = 0; p < n_parts; ++p) {
         uint32_t const nc = h_part_nblks[p];
         if (nc == 0) continue;
@@ -1210,7 +1234,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
           stream.sync();
           if (h_mis != 0u) { return; }
 
-          run_batched_for.template operator()<int64_t>(w, d_alp_q.data());
+          run_batched_for.template operator()<int64_t>(w, d_alp_q.data(), cv);
           size_t tot_alp_b = 0;
           std::vector<uint64_t> cand_sz(n_parts, 0);
           for (size_t p = 0; p < n_parts; ++p) {
@@ -1276,7 +1300,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
             }
             w.dict_col = std::move(owned_dc);
             run_batched_for.template operator()<int32_t>(
-              w, dcv.indices().data<int32_t>() + dcv.offset());
+              w, dcv.indices().data<int32_t>() + dcv.offset(), cv);
             for (size_t p = 0; p < n_parts; ++p) {
               uint32_t const nc = h_part_nblks[p];
               if (nc == 0) continue;
