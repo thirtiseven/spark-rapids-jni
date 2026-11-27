@@ -572,7 +572,30 @@ std::unique_ptr<cudf::table> run_jit_reduce_table(
         for (uint32_t k = 0; k < ds; ++k) {
           col_dicts[s][k].assign(h_ch.data() + h_offs[k], static_cast<size_t>(h_offs[k + 1] - h_offs[k]));
         }
-        cd.raw_ptr   = dcv.indices().head();
+        cudf::column_view const idx_col = dcv.indices();
+        auto const idx_off              = static_cast<size_t>(dcv.offset());
+        switch (idx_col.type().id()) {
+          case cudf::type_id::UINT8:
+            cd.mode    = 4;
+            cd.raw_ptr = idx_col.data<uint8_t>() + idx_off;
+            break;
+          case cudf::type_id::UINT16:
+            cd.mode    = 5;
+            cd.raw_ptr = idx_col.data<uint16_t>() + idx_off;
+            break;
+          case cudf::type_id::INT8:
+            cd.mode    = 6;
+            cd.raw_ptr = idx_col.data<int8_t>() + idx_off;
+            break;
+          case cudf::type_id::INT16:
+            cd.mode    = 7;
+            cd.raw_ptr = idx_col.data<int16_t>() + idx_off;
+            break;
+          default:
+            cd.mode    = 0;
+            cd.raw_ptr = static_cast<uint8_t const*>(idx_col.head()) + idx_off * sizeof(int32_t);
+            break;
+        }
         cd.dict_size = ds;
       }
     } else {
