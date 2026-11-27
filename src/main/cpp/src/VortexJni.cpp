@@ -575,6 +575,7 @@ struct VortexMultiFileScanState {
 // True Zero-Copy ArrowDeviceArray Owner: keeps Vortex's GPU buffers & cuDF table_view holder
 // alive across all ColumnVectors in the batch until the last GpuColumnVector is closed!
 struct ZeroCopyArrowOwner {
+  std::thread::id creator_tid{std::this_thread::get_id()};
   RawArrowBatch raw;
   ArrowNullMaskPatcher null_patcher;
   std::optional<cudf::unique_table_view_t> holder;
@@ -624,6 +625,10 @@ struct ArrowOwnerReaper {
         if (p.ev != nullptr) {
           cudaEventSynchronize(p.ev);
           cudaEventDestroy(p.ev);
+        } else {
+          // Cross-thread close (GC cleaner / Spill / Shuffle thread != creator task thread):
+          // synchronize device off the hot Spark thread so creator PTDS kernels finish before free!
+          cudaDeviceSynchronize();
         }
         delete p.owner;
         delete p.mat_owner;
@@ -631,8 +636,23 @@ struct ArrowOwnerReaper {
     });
   }
 
-  void enqueue_any(ZeroCopyArrowOwner* owner, MaterializedInputsOwner* mat_owner, cudaStream_t stream)
+  void enqueue_any(ZeroCopyArrowOwner* owner,
+                   MaterializedInputsOwner* mat_owner,
+                   cudaStream_t stream,
+                   bool cross_thread = false)
   {
+    if (cross_thread) {
+      std::lock_guard<std::mutex> lk(mtx);
+      if (!stop) {
+        queue.push_back(Pending{nullptr, owner, mat_owner});
+        cv.notify_one();
+        return;
+      }
+      cudaDeviceSynchronize();
+      delete owner;
+      delete mat_owner;
+      return;
+    }
     cudaEvent_t ev = nullptr;
     if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess &&
         cudaEventRecord(ev, stream) == cudaSuccess) {
@@ -641,7 +661,7 @@ struct ArrowOwnerReaper {
         std::lock_guard<std::mutex> lk(mtx);
         if (!stop) {
           queue.push_back(Pending{ev, owner, mat_owner});
-          while (queue.size() > 8u) {
+          while (queue.size() > 32u) {
             overflow.push_back(queue.front());
             queue.pop_front();
           }
@@ -655,6 +675,8 @@ struct ArrowOwnerReaper {
         if (p.ev != nullptr) {
           cudaEventSynchronize(p.ev);
           cudaEventDestroy(p.ev);
+        } else {
+          cudaDeviceSynchronize();
         }
         delete p.owner;
         delete p.mat_owner;
@@ -670,9 +692,9 @@ struct ArrowOwnerReaper {
     delete mat_owner;
   }
 
-  void enqueue(ZeroCopyArrowOwner* owner, cudaStream_t stream)
+  void enqueue(ZeroCopyArrowOwner* owner, cudaStream_t stream, bool cross_thread = false)
   {
-    enqueue_any(owner, nullptr, stream);
+    enqueue_any(owner, nullptr, stream, cross_thread);
   }
 
   void enqueue_mat(MaterializedInputsOwner* mat_owner, cudaStream_t stream)
@@ -1340,7 +1362,8 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_releaseArro
   {
     auto* owner = std::bit_cast<ZeroCopyArrowOwner*>(j_owner);
     if (owner != nullptr) {
-      ArrowOwnerReaper::get().enqueue(owner, cudf::get_default_stream().get());
+      bool const cross_thread = (std::this_thread::get_id() != owner->creator_tid);
+      ArrowOwnerReaper::get().enqueue(owner, cudf::get_default_stream().get(), cross_thread);
     }
   }
   JNI_CATCH(env, );
