@@ -219,6 +219,24 @@ public final class VortexNative {
     return maskToRowIndicesNative(maskCol.getNativeView());
   }
 
+  /**
+   * Streams multi-file Vortex compressed segments (FSST / FastLanes BitPacked+FoR / ALP / Dict)
+   * directly into a libcudf WholeStageNative.HashAggTask WITHOUT materializing uncompressed HBM columns!
+   */
+  public static long streamCompressedPathsToWholeStageAgg(
+      String[] paths,
+      String[] colNames,
+      WholeStageNative.HashAggTask aggTask,
+      long[] probeHandles,
+      ColumnView[] dimCols) {
+    long[] dViews = new long[dimCols.length];
+    for (int i = 0; i < dimCols.length; i++) {
+      dViews[i] = dimCols[i].getNativeView();
+    }
+    return streamCompressedPathsToWholeStageAggNative(
+        paths, colNames, aggTask.getNativeHandle(), probeHandles, dViews);
+  }
+
   private static native void writeTableNative(long tableView, String[] colNames, String path);
 
   private static native long openMultiScanNative(
@@ -242,4 +260,8 @@ public final class VortexNative {
       String path, String[] colNames, long[] rowIndices, byte[] dict32Mask);
 
   private static native long[] maskToRowIndicesNative(long maskColView);
+
+  private static native long streamCompressedPathsToWholeStageAggNative(
+      String[] paths, String[] colNames, long aggTaskHandle,
+      long[] probeHandles, long[] dimColViews);
 }

@@ -143,14 +143,25 @@ __global__ void jr_bool_to_bitmask_kernel(
   mask[widx] = w;
 }
 
+constexpr char const* kNullGroupKeySentinel = "\x01__LENC_SQL_NULL_KEY__\x02";
+
 static std::unique_ptr<cudf::column> make_string_col_from_host(
   std::vector<std::string> const& strs, cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   size_t const m = strs.size();
   std::vector<int32_t> offs(m + 1, 0);
   std::vector<char> chars;
+  size_t const mask_words =
+    cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(m)) / sizeof(cudf::bitmask_type);
+  std::vector<cudf::bitmask_type> h_mask(mask_words, ~cudf::bitmask_type{0});
+  cudf::size_type null_cnt = 0;
   for (size_t i = 0; i < m; ++i) {
-    chars.insert(chars.end(), strs[i].begin(), strs[i].end());
+    if (strs[i] == kNullGroupKeySentinel) {
+      h_mask[i >> 5] &= ~(cudf::bitmask_type{1} << (i & 31));
+      ++null_cnt;
+    } else {
+      chars.insert(chars.end(), strs[i].begin(), strs[i].end());
+    }
     offs[i + 1] = static_cast<int32_t>(chars.size());
   }
   auto d_offs = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
@@ -168,11 +179,20 @@ static std::unique_ptr<cudf::column> make_string_col_from_host(
     CUDF_CUDA_TRY(
       cudaMemcpyAsync(d_ch.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get()));
   }
+  auto nbuf = cudf::create_null_mask(
+    null_cnt > 0 ? static_cast<cudf::size_type>(m) : 0,
+    null_cnt > 0 ? cudf::mask_state::UNINITIALIZED : cudf::mask_state::UNALLOCATED,
+    stream,
+    mr);
+  if (null_cnt > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      nbuf.data(), h_mask.data(), mask_words * sizeof(cudf::bitmask_type), cudaMemcpyHostToDevice, stream.get()));
+  }
   return cudf::make_strings_column(static_cast<cudf::size_type>(m),
                                    std::move(d_offs),
                                    std::move(d_ch),
-                                   0,
-                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
+                                   null_cnt,
+                                   std::move(nbuf));
 }
 
 // Helper to materialize final output columns from Mode 0 (Global) / Mode 1 (Low-Card GroupBy)
@@ -971,7 +991,7 @@ void add_batch_jit_reduce_task(JitReduceTaskAccumulator& acc,
         }
       }
 
-      std::vector<int32_t> h_remap(gi.ds, -1);
+      std::vector<int32_t> h_remap(gi.ds + 1u, -1);
       auto& tdict = acc.task_gk_dicts[gi.gk_idx];
       auto& tmap  = acc.task_gk_maps[gi.gk_idx];
       for (uint32_t k = 0; k < gi.ds; ++k) {
@@ -989,18 +1009,35 @@ void add_batch_jit_reduce_task(JitReduceTaskAccumulator& acc,
           h_remap[k] = it->second;
         }
       }
-      if (cap_exceeded) { break; }
-      if (gi.ds > 0) {
-        if (acc.d_remaps[gi.gk_idx].size() < gi.ds) {
-          acc.d_remaps[gi.gk_idx].resize(gi.ds, stream);
+      // Reserve an explicit NULL group-key code in slot `gi.ds` whenever this batch has NULLs!
+      int32_t null_code = -1;
+      if (!cap_exceeded && args.cols[gi.slot].has_nulls != 0u) {
+        std::string const null_k(kNullGroupKeySentinel);
+        auto it = tmap.find(null_k);
+        if (it == tmap.end()) {
+          if (static_cast<int32_t>(tdict.size()) >= acc.key_caps[gi.gk_idx]) {
+            cap_exceeded = true;
+          } else {
+            null_code = static_cast<int32_t>(tdict.size());
+            tmap.emplace(null_k, null_code);
+            tdict.push_back(null_k);
+          }
+        } else {
+          null_code = it->second;
         }
-        CUDF_CUDA_TRY(cudaMemcpyAsync(acc.d_remaps[gi.gk_idx].data(),
-                                      h_remap.data(),
-                                      gi.ds * sizeof(int32_t),
-                                      cudaMemcpyHostToDevice,
-                                      stream.get()));
-        args.cols[gi.slot].dict_remap = acc.d_remaps[gi.gk_idx].data();
       }
+      if (cap_exceeded) { break; }
+      h_remap[gi.ds] = null_code;
+      args.cols[gi.slot].rle_num_runs = gi.ds;  // pass local dict_size so NULL rows read dict_remap[rle_num_runs]
+      if (acc.d_remaps[gi.gk_idx].size() < gi.ds + 1u) {
+        acc.d_remaps[gi.gk_idx].resize(gi.ds + 1u, stream);
+      }
+      CUDF_CUDA_TRY(cudaMemcpyAsync(acc.d_remaps[gi.gk_idx].data(),
+                                    h_remap.data(),
+                                    (gi.ds + 1u) * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      args.cols[gi.slot].dict_remap = acc.d_remaps[gi.gk_idx].data();
     }
   }
 

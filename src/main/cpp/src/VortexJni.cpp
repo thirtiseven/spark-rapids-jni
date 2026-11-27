@@ -29,6 +29,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/whole_stage_jit.hpp>
 
 #include <cuda_runtime_api.h>
 #include <dlfcn.h>
@@ -220,6 +221,13 @@ struct VortexCudaApi {
                                     vx_error**)                                             = nullptr;
   size_t (*device_batches_last_file_idx)(vx_cuda_device_batches const*)                     = nullptr;
   void (*device_batches_free)(vx_cuda_device_batches*)                                      = nullptr;
+  int (*device_batches_next_compressed)(vx_cuda_device_batches*,
+                                        void**,
+                                        cudf::whole_stage::col_source_desc const**,
+                                        size_t*,
+                                        uint32_t*,
+                                        vx_error**)                                         = nullptr;
+  void (*compressed_batch_free)(void*)                                                      = nullptr;
   vx_session* shared_session{nullptr};
 
   template <typename Fn>
@@ -271,6 +279,11 @@ struct VortexCudaApi {
       a.load(a.device_batches_next_merged, "vx_cuda_device_batches_next_merged");
       a.load(a.device_batches_last_file_idx, "vx_cuda_device_batches_last_file_idx");
       a.load(a.device_batches_free, "vx_cuda_device_batches_free");
+      a.device_batches_next_compressed =
+        reinterpret_cast<decltype(a.device_batches_next_compressed)>(
+          dlsym(a.dl, "vx_cuda_device_batches_next_compressed"));
+      a.compressed_batch_free = reinterpret_cast<decltype(a.compressed_batch_free)>(
+        dlsym(a.dl, "vx_cuda_compressed_batch_free"));
 
       // Inject Spark RAPIDS RMM pool into vortex-cuda BEFORE creating the shared session!
       a.set_external_allocator(&vortex_rmm_alloc_cb, &vortex_rmm_free_cb);
@@ -1367,6 +1380,123 @@ JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_releaseArro
     }
   }
   JNI_CATCH(env, );
+}
+
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_VortexNative_streamCompressedPathsToWholeStageAggNative(
+  JNIEnv* env,
+  jclass,
+  jobjectArray j_paths,
+  jobjectArray j_col_names,
+  jlong j_agg_state,
+  jlongArray j_probe_tables,
+  jlongArray j_dim_col_views)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto& api = VortexCudaApi::get();
+    CUDF_EXPECTS(api.device_batches_next_compressed != nullptr && api.compressed_batch_free != nullptr,
+                 "VortexJni: libvortex_cuda_ffi.so missing vx_cuda_device_batches_next_compressed");
+
+    auto* st = std::bit_cast<cudf::whole_stage::hash_agg_task_state*>(j_agg_state);
+
+    jsize const np = env->GetArrayLength(j_paths);
+    std::vector<std::string> path_strs;
+    std::vector<vx_view> path_views;
+    path_strs.reserve(static_cast<size_t>(np));
+    path_views.reserve(static_cast<size_t>(np));
+    for (jsize i = 0; i < np; ++i) {
+      auto js = static_cast<jstring>(env->GetObjectArrayElement(j_paths, i));
+      cudf::jni::native_jstring ns(env, js);
+      path_strs.emplace_back(ns.get());
+      env->DeleteLocalRef(js);
+    }
+    for (auto const& s : path_strs) { path_views.push_back(vx_view{s.data(), s.size()}); }
+
+    jsize const nc = env->GetArrayLength(j_col_names);
+    std::vector<std::string> col_strs;
+    std::vector<vx_view> col_views;
+    col_strs.reserve(static_cast<size_t>(nc));
+    col_views.reserve(static_cast<size_t>(nc));
+    for (jsize i = 0; i < nc; ++i) {
+      auto js = static_cast<jstring>(env->GetObjectArrayElement(j_col_names, i));
+      cudf::jni::native_jstring ns(env, js);
+      col_strs.emplace_back(ns.get());
+      env->DeleteLocalRef(js);
+    }
+    for (auto const& s : col_strs) { col_views.push_back(vx_view{s.data(), s.size()}); }
+
+    std::vector<cudf::whole_stage::broadcast_probe_table const*> probes;
+    if (j_probe_tables != nullptr) {
+      cudf::jni::native_jlongArray pt(env, j_probe_tables);
+      probes.reserve(static_cast<size_t>(pt.size()));
+      for (int i = 0; i < pt.size(); ++i) {
+        probes.push_back(std::bit_cast<cudf::whole_stage::broadcast_probe_table const*>(pt[i]));
+      }
+    }
+
+    std::vector<cudf::whole_stage::col_source_desc> dim_srcs;
+    if (j_dim_col_views != nullptr) {
+      cudf::jni::native_jlongArray dc(env, j_dim_col_views);
+      dim_srcs.reserve(static_cast<size_t>(dc.size()));
+      for (int i = 0; i < dc.size(); ++i) {
+        auto const* cv = reinterpret_cast<cudf::column_view const*>(dc[i]);
+        dim_srcs.push_back(cudf::whole_stage::make_raw_source(*cv));
+      }
+    }
+
+    vx_cuda_scan_options opts{};
+    opts.batch_rows = 0;
+    opts.flags      = 0;
+    vx_error* err   = nullptr;
+    auto* batches   = api.scan_paths_prefetch_batches(
+      api.shared_session,
+      path_views.data(),
+      path_views.size(),
+      &opts,
+      col_views.data(),
+      col_views.size(),
+      3u,
+      &err);
+    if (batches == nullptr) {
+      CUDF_FAIL("VortexJni compressed scan open failed: " + api.consume_error(err));
+    }
+
+    int64_t total_rows = 0;
+    try {
+      while (true) {
+        void* cb_handle                                    = nullptr;
+        cudf::whole_stage::col_source_desc const* cols_ptr = nullptr;
+        size_t ncols                                       = 0;
+        uint32_t nrows                                     = 0;
+        vx_error* nerr                                     = nullptr;
+        int rc = api.device_batches_next_compressed(
+          batches, &cb_handle, &cols_ptr, &ncols, &nrows, &nerr);
+        if (rc != 0) {
+          CUDF_FAIL("VortexJni next_compressed failed: " + api.consume_error(nerr));
+        }
+        if (cb_handle == nullptr) { break; }
+        try {
+          if (nrows > 0u) {
+            std::vector<cudf::whole_stage::col_source_desc> fact_srcs(cols_ptr, cols_ptr + ncols);
+            cudf::whole_stage::add_batch_whole_stage_agg(*st, fact_srcs, nrows, probes, dim_srcs);
+            cudf::get_default_stream().sync();
+            total_rows += static_cast<int64_t>(nrows);
+          }
+        } catch (...) {
+          api.compressed_batch_free(cb_handle);
+          throw;
+        }
+        api.compressed_batch_free(cb_handle);
+      }
+    } catch (...) {
+      api.device_batches_free(batches);
+      throw;
+    }
+    api.device_batches_free(batches);
+    return total_rows;
+  }
+  JNI_CATCH(env, 0L);
 }
 
 }  // extern "C"

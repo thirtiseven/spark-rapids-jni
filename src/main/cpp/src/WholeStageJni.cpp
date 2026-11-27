@@ -230,4 +230,122 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_e
   JNI_CATCH(env, nullptr);
 }
 
+JNIEXPORT jboolean JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_tryAddLshfFrameToAggNative(
+  JNIEnv* env,
+  jclass,
+  jlong j_state,
+  jlong j_host_addr,
+  jlong j_host_len,
+  jlong j_dev_addr,
+  jlong j_dev_len,
+  jintArray j_sel_cols,
+  jlongArray j_probe_tables,
+  jlongArray j_dim_col_views)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* st = std::bit_cast<cudf::whole_stage::hash_agg_task_state*>(j_state);
+    cudf::jni::native_jintArray sc(env, j_sel_cols);
+    std::vector<int32_t> sel_cols(sc.begin(), sc.end());
+
+    std::vector<cudf::whole_stage::broadcast_probe_table const*> probes;
+    if (j_probe_tables != nullptr) {
+      cudf::jni::native_jlongArray pt(env, j_probe_tables);
+      probes.reserve(static_cast<size_t>(pt.size()));
+      for (int i = 0; i < pt.size(); ++i) {
+        probes.push_back(std::bit_cast<cudf::whole_stage::broadcast_probe_table const*>(pt[i]));
+      }
+    }
+    std::vector<cudf::whole_stage::col_source_desc> dim_srcs;
+    if (j_dim_col_views != nullptr) {
+      cudf::jni::native_jlongArray dc(env, j_dim_col_views);
+      dim_srcs.reserve(static_cast<size_t>(dc.size()));
+      for (int i = 0; i < dc.size(); ++i) {
+        auto const* cv = reinterpret_cast<cudf::column_view const*>(dc[i]);
+        dim_srcs.push_back(cudf::whole_stage::make_raw_source(*cv));
+      }
+    }
+    bool const ok = cudf::whole_stage::try_add_lshf_frame_whole_stage_agg(
+      *st,
+      reinterpret_cast<uint8_t const*>(j_host_addr),
+      static_cast<size_t>(j_host_len),
+      reinterpret_cast<uint8_t const*>(j_dev_addr),
+      static_cast<size_t>(j_dev_len),
+      sel_cols,
+      probes,
+      dim_srcs);
+    return ok ? JNI_TRUE : JNI_FALSE;
+  }
+  JNI_CATCH(env, JNI_FALSE);
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_runStagePartitionScatterNative(
+  JNIEnv* env,
+  jclass,
+  jlong j_count_prog,
+  jlong j_scatter_prog,
+  jlongArray j_fact_col_views,
+  jint j_num_rows,
+  jlongArray j_probe_tables,
+  jlongArray j_dim_col_views,
+  jintArray j_out_tids,
+  jintArray j_out_scales,
+  jint j_num_parts,
+  jintArray j_out_splits)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto* cprog = std::bit_cast<cudf::whole_stage::whole_stage_program*>(j_count_prog);
+    auto* sprog = std::bit_cast<cudf::whole_stage::whole_stage_program*>(j_scatter_prog);
+
+    std::vector<cudf::whole_stage::col_source_desc> fact_srcs;
+    if (j_fact_col_views != nullptr) {
+      cudf::jni::native_jlongArray fc(env, j_fact_col_views);
+      fact_srcs.reserve(static_cast<size_t>(fc.size()));
+      for (int i = 0; i < fc.size(); ++i) {
+        auto const* cv = reinterpret_cast<cudf::column_view const*>(fc[i]);
+        fact_srcs.push_back(cudf::whole_stage::make_raw_source(*cv));
+      }
+    }
+    std::vector<cudf::whole_stage::broadcast_probe_table const*> probes;
+    if (j_probe_tables != nullptr) {
+      cudf::jni::native_jlongArray pt(env, j_probe_tables);
+      probes.reserve(static_cast<size_t>(pt.size()));
+      for (int i = 0; i < pt.size(); ++i) {
+        probes.push_back(std::bit_cast<cudf::whole_stage::broadcast_probe_table const*>(pt[i]));
+      }
+    }
+    std::vector<cudf::whole_stage::col_source_desc> dim_srcs;
+    if (j_dim_col_views != nullptr) {
+      cudf::jni::native_jlongArray dc(env, j_dim_col_views);
+      dim_srcs.reserve(static_cast<size_t>(dc.size()));
+      for (int i = 0; i < dc.size(); ++i) {
+        auto const* cv = reinterpret_cast<cudf::column_view const*>(dc[i]);
+        dim_srcs.push_back(cudf::whole_stage::make_raw_source(*cv));
+      }
+    }
+    cudf::jni::native_jintArray tids(env, j_out_tids);
+    cudf::jni::native_jintArray scs(env, j_out_scales);
+    std::vector<cudf::data_type> out_dts;
+    out_dts.reserve(static_cast<size_t>(tids.size()));
+    for (int i = 0; i < tids.size(); ++i) {
+      auto tid = static_cast<cudf::type_id>(tids[i]);
+      if (tid == cudf::type_id::DECIMAL32 || tid == cudf::type_id::DECIMAL64 ||
+          tid == cudf::type_id::DECIMAL128) {
+        out_dts.emplace_back(tid, scs[i]);
+      } else {
+        out_dts.emplace_back(tid);
+      }
+    }
+
+    auto res = cudf::whole_stage::run_whole_stage_partition_scatter(
+      *cprog, *sprog, fact_srcs, static_cast<uint32_t>(j_num_rows), probes, dim_srcs, out_dts, j_num_parts);
+    env->SetIntArrayRegion(j_out_splits, 0, j_num_parts, reinterpret_cast<jint const*>(res.splits.data()));
+    return cudf::jni::convert_table_for_return(env, std::move(res.partitioned_table));
+  }
+  JNI_CATCH(env, nullptr);
+}
+
 }  // extern "C"

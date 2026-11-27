@@ -88,6 +88,10 @@ public final class WholeStageNative {
       this.handle = handle;
     }
 
+    public long getNativeHandle() {
+      return handle;
+    }
+
     public void addBatch(
         ColumnView[] factCols,
         int numRows,
@@ -136,6 +140,48 @@ public final class WholeStageNative {
     };
   }
 
+  public static boolean tryAddLshfFrameToAgg(
+      HashAggTask aggTask,
+      long hostAddr,
+      long hostLen,
+      long devAddr,
+      long devLen,
+      int[] selectedCols,
+      long[] probeHandles,
+      ColumnView[] dimCols) {
+    long[] dViews = new long[dimCols.length];
+    for (int i = 0; i < dimCols.length; i++) {
+      dViews[i] = dimCols[i].getNativeView();
+    }
+    return tryAddLshfFrameToAggNative(
+        aggTask.getNativeHandle(), hostAddr, hostLen, devAddr, devLen, selectedCols, probeHandles, dViews);
+  }
+
+  public static Table runStagePartitionScatter(
+      Program countProg,
+      Program scatterProg,
+      ColumnView[] factCols,
+      int numRows,
+      long[] probeHandles,
+      ColumnView[] dimCols,
+      DType[] outTypes,
+      int numParts,
+      int[] outSplits) {
+    long[] fViews = new long[factCols.length];
+    for (int i = 0; i < factCols.length; i++) { fViews[i] = factCols[i].getNativeView(); }
+    long[] dViews = new long[dimCols.length];
+    for (int i = 0; i < dimCols.length; i++) { dViews[i] = dimCols[i].getNativeView(); }
+    int[] tids = new int[outTypes.length];
+    int[] scales = new int[outTypes.length];
+    for (int i = 0; i < outTypes.length; i++) {
+      tids[i] = outTypes[i].getTypeId().getNativeId();
+      scales[i] = outTypes[i].getScale();
+    }
+    return new Table(runStagePartitionScatterNative(
+        countProg.handle, scatterProg.handle, fViews, numRows, probeHandles, dViews,
+        tids, scales, numParts, outSplits));
+  }
+
   private static native long compileProgramNative(String bodyCudaSrc, String kernelName);
   private static native void destroyProgramNative(long progHandle);
   private static native long buildProbeTableNative(long keyColView);
@@ -148,4 +194,11 @@ public final class WholeStageNative {
   private static native void destroyHashAggTaskNative(long stateHandle);
   private static native long[] encodeDimStringDictNative(
       long colView, int substrStart0, int substrLen);
+  private static native boolean tryAddLshfFrameToAggNative(
+      long stateHandle, long hostAddr, long hostLen, long devAddr, long devLen,
+      int[] selCols, long[] probeHandles, long[] dimColViews);
+  private static native long[] runStagePartitionScatterNative(
+      long countProg, long scatterProg, long[] factCols, int numRows,
+      long[] probeHandles, long[] dimCols, int[] outTids, int[] outScales,
+      int numParts, int[] outSplits);
 }
