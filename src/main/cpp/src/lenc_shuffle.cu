@@ -1296,33 +1296,12 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
   std::vector<ColWork> works;
   works.reserve(ncols);
 
-  // Milestone 2: Thread-local Pinned Host Staging Pool so batched FOR256 D2H copies are
-  // 100% truly async (eliminating CUDA's implicit sync on pageable std::vector D2H!).
-  struct PinnedU32Pool {
-    uint32_t* ptr{nullptr};
-    size_t cap{0};
-    ~PinnedU32Pool() {
-      if (ptr != nullptr) { cudaFreeHost(ptr); }
-    }
-    uint32_t* ensure(size_t n) {
-      if (n > cap) {
-        if (ptr != nullptr) { cudaFreeHost(ptr); ptr = nullptr; cap = 0; }
-        size_t alloc_n = std::max<size_t>(n, 65536u);
-        if (cudaHostAlloc(reinterpret_cast<void**>(&ptr), alloc_n * sizeof(uint32_t), cudaHostAllocDefault) == cudaSuccess) {
-          cap = alloc_n;
-        } else {
-          ptr = nullptr;
-          cap = 0;
-        }
-      }
-      return ptr;
-    }
-  };
-  thread_local PinnedU32Pool tl_pinned_word_offs;
+  // Note: Do NOT call cudaHostAlloc/cudaFreeHost per thread inside shuffle write!
+  // cudaHostAlloc takes the global CUDA context lock and stalls all 6 concurrent GPU tasks
+  // (caused +8.7s regression on TPC-H Q05 and +4.7s on Q18!). Plain batched single-sync D2H wins cleanly.
   uint32_t const stride_wo = total_blks + 1u;
-  uint32_t* pinned_base    = tl_pinned_word_offs.ensure(static_cast<size_t>(ncols) * stride_wo);
 
-  auto launch_for_stats = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv, uint32_t col_slot) {
+  auto launch_for_stats = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv, uint32_t /*col_slot*/) {
     cudf::bitmask_type const* nmask = w.has_nulls ? cv.null_mask() : nullptr;
     cudf::size_type const coff      = cv.offset();
     w.d_mins.resize(total_blks, stream);
@@ -1343,26 +1322,15 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       cudaMemsetAsync(w.d_word_offs.data() + total_blks, 0, sizeof(uint32_t), stream.get()));
     thrust::exclusive_scan(
       rmm::exec_policy_nosync(stream), w.d_word_offs.begin(), w.d_word_offs.end(), w.d_word_offs.begin());
-    uint32_t* h_dst = nullptr;
-    if (pinned_base != nullptr) {
-      h_dst = pinned_base + static_cast<size_t>(col_slot) * stride_wo;
-    } else {
-      w.h_word_offs.resize(stride_wo);
-      h_dst = w.h_word_offs.data();
-    }
-    CUDF_CUDA_TRY(cudaMemcpyAsync(h_dst,
+    w.h_word_offs.resize(stride_wo);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(w.h_word_offs.data(),
                                   w.d_word_offs.data(),
                                   stride_wo * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost,
                                   stream.get()));
   };
 
-  auto sync_copy_pinned_wo = [&](ColWork& w, uint32_t col_slot) {
-    if (pinned_base != nullptr) {
-      uint32_t const* src = pinned_base + static_cast<size_t>(col_slot) * stride_wo;
-      w.h_word_offs.assign(src, src + stride_wo);
-    }
-  };
+  auto sync_copy_pinned_wo = [&](ColWork& /*w*/, uint32_t /*col_slot*/) {};
 
   auto launch_for_pack = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
     cudf::bitmask_type const* nmask = w.has_nulls ? cv.null_mask() : nullptr;
