@@ -1670,7 +1670,11 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
           stream.sync();
 
           bool used_fsst = false;
-          if (tot_raw_ch >= 524288u) {
+          static bool const fsst_opt_in = []() {
+            char const* e = std::getenv("LENC_SHUF_FSST");
+            return e != nullptr && e[0] == '1';
+          }();
+          if (fsst_opt_in && tot_raw_ch >= 524288u) {
             // Fast 64 KiB CPU FSST symbol trainer (<0.25 ms): score 4B, 3B, 2B n-grams by freq*(len-1)!
             std::unordered_map<uint64_t, uint32_t> ng_cnt;
             ng_cnt.reserve(8192);
