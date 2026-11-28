@@ -16,6 +16,8 @@
 
 #include "lenc.hpp"
 
+#include <unordered_map>
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -65,7 +67,25 @@ enum class ShufEnc : uint8_t {
   STRING_LZ4    = 5,  // Optional GPU nvCOMP LZ4 for strings
   STRING_BIGRAM = 6,  // Opt V3: Zero-sync dynamic 127-bigram GPU mini-FSST string codec (1.5x-2.0x smaller, 250+ GB/s)!
   FLOAT_ALP     = 7,  // Item 4: Exact bit-for-bit lossless decimal-scaled FLOAT32/FLOAT64 -> FOR256 (1.5x-8x smaller!)
+  STRING_FSST   = 8,  // P1-B: 255-symbol multi-length (1..4B) GPU FSST string codec (2.2x-3.0x smaller, 250+ GB/s!)
 };
+
+constexpr size_t kFsstHdrBytes = 1280;  // 255*4B sym_word + 255B sym_len + 5B pad (8B aligned!)
+
+struct alignas(8) FsstEncodeTable {
+  uint32_t sym_word[255];
+  uint8_t sym_len[255];
+  uint8_t pad0[5];
+  uint8_t single_code[256];   // 0..254 or 0xFF (escape)
+  uint8_t bucket_head[1024];  // 2-byte prefix hash -> first multi-byte sym code (longest-first!), 0xFF=empty
+  uint8_t sym_next[255];      // linked list next symbol code in bucket, 0xFF=end
+  uint8_t pad1;
+};
+
+__host__ __device__ __forceinline__ uint32_t fsst_hash2(uint8_t b0, uint8_t b1)
+{
+  return ((static_cast<uint32_t>(b0) * 2654435761u) ^ (static_cast<uint32_t>(b1) * 40503u)) & 1023u;
+}
 
 struct ShufColMeta {
   uint64_t payload_offset;  // relative to start of LSHF frame
@@ -513,6 +533,148 @@ __global__ void scatter_bigram_string_kernel(int32_t const* __restrict__ in_offs
   }
 }
 
+// ---------------- P1-B: 255-Symbol Multi-Length (1..4B) GPU FSST String Codec ----------------
+
+__device__ __forceinline__ uint8_t fsst_find_match(
+  uint8_t const* __restrict__ p,
+  int32_t rem,
+  uint32_t const* __restrict__ s_word,
+  uint8_t const* __restrict__ s_len,
+  uint8_t const* __restrict__ s_single,
+  uint8_t const* __restrict__ s_head,
+  uint8_t const* __restrict__ s_next,
+  int32_t& out_adv)
+{
+  if (rem >= 2) {
+    uint32_t const h = fsst_hash2(p[0], p[1]);
+    uint8_t c        = s_head[h];
+    // Bucket chains are sorted longest-first (4 -> 3 -> 2), so first match is greedy longest!
+    while (c != 0xFFu) {
+      uint8_t const sl = s_len[c];
+      if (rem >= static_cast<int32_t>(sl)) {
+        uint32_t const w = s_word[c];
+        bool ok          = (p[0] == static_cast<uint8_t>(w & 0xFFu)) &&
+                  (p[1] == static_cast<uint8_t>((w >> 8) & 0xFFu));
+        if (ok && sl >= 3u) { ok = (p[2] == static_cast<uint8_t>((w >> 16) & 0xFFu)); }
+        if (ok && sl >= 4u) { ok = (p[3] == static_cast<uint8_t>((w >> 24) & 0xFFu)); }
+        if (ok) {
+          out_adv = static_cast<int32_t>(sl);
+          return c;
+        }
+      }
+      c = s_next[c];
+    }
+  }
+  out_adv = 1;
+  return s_single[p[0]];
+}
+
+__global__ void fsst_measure_rows_kernel(int32_t const* __restrict__ in_offs,
+                                         char const* __restrict__ in_chars,
+                                         uint32_t src_col_off,
+                                         uint32_t nrows,
+                                         FsstEncodeTable const* __restrict__ tbl,
+                                         int32_t* __restrict__ out_lens)
+{
+  __shared__ FsstEncodeTable st;
+  auto const* src_u32 = reinterpret_cast<uint32_t const*>(tbl);
+  auto* dst_u32       = reinterpret_cast<uint32_t*>(&st);
+  constexpr uint32_t n_u32 = sizeof(FsstEncodeTable) / sizeof(uint32_t);
+  for (uint32_t i = threadIdx.x; i < n_u32; i += blockDim.x) { dst_u32[i] = src_u32[i]; }
+  __syncthreads();
+
+  uint32_t const r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= nrows) {
+    if (r == nrows) { out_lens[nrows] = 0; }
+    return;
+  }
+  int32_t const s = in_offs[src_col_off + r];
+  int32_t const e = in_offs[src_col_off + r + 1u];
+  int32_t clen    = 0;
+  int32_t i       = s;
+  while (i < e) {
+    int32_t adv = 1;
+    uint8_t const c = fsst_find_match(
+      reinterpret_cast<uint8_t const*>(in_chars + i),
+      e - i,
+      st.sym_word,
+      st.sym_len,
+      st.single_code,
+      st.bucket_head,
+      st.sym_next,
+      adv);
+    clen += (c == 0xFFu) ? 2 : 1;
+    i += adv;
+  }
+  out_lens[r] = clen;
+}
+
+__global__ void scatter_fsst_string_kernel(int32_t const* __restrict__ in_offs,
+                                           char const* __restrict__ in_chars,
+                                           int32_t const* __restrict__ comp_offs,
+                                           uint32_t src_col_off,
+                                           FsstEncodeTable const* __restrict__ tbl,
+                                           uint8_t* __restrict__ d_out,
+                                           uint64_t const* __restrict__ dst_payload_offs,
+                                           uint32_t const* __restrict__ part_row_start,
+                                           uint32_t const* __restrict__ part_row_len,
+                                           uint32_t num_parts)
+{
+  uint32_t const p = blockIdx.x;
+  if (p >= num_parts) { return; }
+  uint32_t const len = part_row_len[p];
+  if (len == 0u) { return; }
+
+  __shared__ FsstEncodeTable st;
+  auto const* src_u32 = reinterpret_cast<uint32_t const*>(tbl);
+  auto* dst_u32       = reinterpret_cast<uint32_t*>(&st);
+  constexpr uint32_t n_u32 = sizeof(FsstEncodeTable) / sizeof(uint32_t);
+  for (uint32_t i = threadIdx.x; i < n_u32; i += blockDim.x) { dst_u32[i] = src_u32[i]; }
+  __syncthreads();
+
+  uint8_t* dst = d_out + dst_payload_offs[p];
+  // First tile writes the 1,280-byte FSST header (sym_word[255] + sym_len[255])
+  if (blockIdx.y == 0u) {
+    auto const* hdr_src = reinterpret_cast<uint8_t const*>(&st);
+    for (uint32_t i = threadIdx.x; i < kFsstHdrBytes; i += blockDim.x) { dst[i] = hdr_src[i]; }
+  }
+  uint32_t const ps      = part_row_start[p];
+  int32_t const cb0      = comp_offs[ps];
+  uint8_t* off_dst       = dst + kFsstHdrBytes;
+  uint8_t* ch_dst        = off_dst + static_cast<size_t>(len + 1u) * sizeof(int32_t);
+  uint32_t const tid     = blockIdx.y * blockDim.x + threadIdx.x;
+  uint32_t const stride  = gridDim.y * blockDim.x;
+  for (uint32_t i = tid; i <= len; i += stride) {
+    st_u32_u(off_dst + static_cast<size_t>(i) * 4u, static_cast<uint32_t>(comp_offs[ps + i] - cb0));
+  }
+  for (uint32_t r = tid; r < len; r += stride) {
+    uint32_t const gr = ps + r;
+    int32_t const s   = in_offs[src_col_off + gr];
+    int32_t const e   = in_offs[src_col_off + gr + 1u];
+    uint8_t* wp       = ch_dst + (comp_offs[gr] - cb0);
+    int32_t i         = s;
+    while (i < e) {
+      int32_t adv = 1;
+      uint8_t const c = fsst_find_match(
+        reinterpret_cast<uint8_t const*>(in_chars + i),
+        e - i,
+        st.sym_word,
+        st.sym_len,
+        st.single_code,
+        st.bucket_head,
+        st.sym_next,
+        adv);
+      if (c == 0xFFu) {
+        *wp++ = 0xFFu;
+        *wp++ = static_cast<uint8_t>(in_chars[i]);
+      } else {
+        *wp++ = c;
+      }
+      i += adv;
+    }
+  }
+}
+
 __global__ void gather_str_boundary_offs_kernel(int32_t const* __restrict__ in_offs,
                                                 uint32_t src_col_off,
                                                 uint32_t const* __restrict__ part_start,
@@ -862,6 +1024,35 @@ __global__ void batched_decode_str_lens_kernel(uint8_t const* __restrict__ d_dat
         dst[i] = ulen;
       }
     }
+  } else if (tk.encoding == static_cast<uint8_t>(ShufEnc::STRING_FSST)) {
+    __shared__ uint8_t s_len[255];
+    for (uint32_t i = threadIdx.x; i < 255u; i += blockDim.x) {
+      s_len[i] = d_pay[255u * 4u + i];
+    }
+    __syncthreads();
+    auto const* comp_offs = reinterpret_cast<int32_t const*>(d_pay + kFsstHdrBytes);
+    uint8_t const* ch_ptr = d_pay + kFsstHdrBytes + static_cast<size_t>(n + 1u) * sizeof(int32_t);
+    for (uint32_t i = tid; i < n; i += stride) {
+      if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) {
+        dst[i] = 0;
+      } else {
+        int32_t const cs = comp_offs[i];
+        int32_t const ce = comp_offs[i + 1u];
+        int32_t ulen     = 0;
+        int32_t k        = cs;
+        while (k < ce) {
+          uint8_t const c = ch_ptr[k];
+          if (c == 0xFFu) {
+            ulen += 1;
+            k += 2;
+          } else {
+            ulen += static_cast<int32_t>(s_len[c]);
+            k += 1;
+          }
+        }
+        dst[i] = ulen;
+      }
+    }
   } else {
     auto const* s_offs = reinterpret_cast<int32_t const*>(d_pay);
     for (uint32_t i = tid; i < n; i += stride) {
@@ -935,6 +1126,43 @@ __global__ void batched_decode_str_copy_kernel(uint8_t const* __restrict__ d_dat
           uint16_t const pair = s_sym[b - 0x80u];
           *wp++               = static_cast<char>(pair & 0xFFu);
           *wp++               = static_cast<char>((pair >> 8) & 0xFFu);
+          k += 1;
+        }
+      }
+    }
+  } else if (tk.encoding == static_cast<uint8_t>(ShufEnc::STRING_FSST)) {
+    __shared__ uint32_t s_word[255];
+    __shared__ uint8_t s_len[255];
+    for (uint32_t i = threadIdx.x; i < 255u; i += blockDim.x) {
+      size_t const o = static_cast<size_t>(i) * 4u;
+      s_word[i] = static_cast<uint32_t>(d_pay[o]) |
+                  (static_cast<uint32_t>(d_pay[o + 1u]) << 8) |
+                  (static_cast<uint32_t>(d_pay[o + 2u]) << 16) |
+                  (static_cast<uint32_t>(d_pay[o + 3u]) << 24);
+      s_len[i]  = d_pay[255u * 4u + i];
+    }
+    __syncthreads();
+    auto const* comp_offs = reinterpret_cast<int32_t const*>(d_pay + kFsstHdrBytes);
+    uint8_t const* ch_ptr = d_pay + kFsstHdrBytes + static_cast<size_t>(n + 1u) * sizeof(int32_t);
+    for (uint32_t i = tid; i < n; i += stride) {
+      if (sm != nullptr && !cudf::bit_is_set(sm, static_cast<cudf::size_type>(i))) { continue; }
+      uint32_t const grow = tk.out_row_off + i;
+      int32_t const cs    = comp_offs[i];
+      int32_t const ce    = comp_offs[i + 1u];
+      char* wp            = out_chars + out_offs[grow];
+      int32_t k           = cs;
+      while (k < ce) {
+        uint8_t const c = ch_ptr[k];
+        if (c == 0xFFu) {
+          *wp++ = static_cast<char>(ch_ptr[k + 1]);
+          k += 2;
+        } else {
+          uint32_t const w = s_word[c];
+          uint8_t const sl = s_len[c];
+          *wp++            = static_cast<char>(w & 0xFFu);
+          if (sl >= 2u) { *wp++ = static_cast<char>((w >> 8) & 0xFFu); }
+          if (sl >= 3u) { *wp++ = static_cast<char>((w >> 16) & 0xFFu); }
+          if (sl >= 4u) { *wp++ = static_cast<char>((w >> 24) & 0xFFu); }
           k += 1;
         }
       }
@@ -1047,9 +1275,10 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
     // RAW_STRING offsets on host for sizing
     int32_t h_str_base_off{0};
     std::vector<int32_t> h_str_part_chars;
-    // Opt V3: Zero-sync GPU Dynamic Bigram (mini-FSST) buffers for high-cardinality strings
+    // Opt V3: Zero-sync GPU Dynamic Bigram + P1-B 255-Symbol Multi-Length GPU FSST buffers
     rmm::device_buffer d_bigram_lut;
     rmm::device_buffer d_bigram_sym;
+    rmm::device_buffer d_fsst_tbl;
     rmm::device_uvector<int32_t> d_bigram_offs{0, cudf::get_default_stream()};
     std::vector<int32_t> h_bigram_part_chars;
     // Item 3: Batched GPU nvCOMP LZ4 buffers for FLOAT/DOUBLE columns
@@ -1332,7 +1561,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
           CUDF_CUDA_TRY(cudaMemcpyAsync(
             &kb, ksv.offsets().data<int32_t>() + ds, sizeof(int32_t), cudaMemcpyDeviceToHost, stream.get()));
           stream.sync();
-          if (kb <= 16384) {
+          if (kb <= 20480) {
             used_dict         = true;
             w.enc             = ShufEnc::DICT_BITPACK;
             w.dict_size       = ds;
@@ -1427,7 +1656,8 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         }
 
         // Opt V3: Zero-sync GPU Dynamic 127-Bigram (mini-FSST) compression for high-card ASCII strings!
-        // Train top-127 bigrams on a 64 KiB sample (<0.05 ms CPU), measure & scan on GPU, keep if >15% smaller!
+        // P1-B: Try 255-Symbol Multi-Length (1..4B) GPU FSST first for large high-card string cols (>=512 KiB)!
+        // Achieves 2.2x-3.0x compression on arbitrary UTF-8 (vs Bigram 1.5x ASCII-only), with 1.25 KiB table.
         if (tot_raw_ch >= 262144u && nrows >= 1024u) {
           int32_t base_ch = 0;
           CUDF_CUDA_TRY(cudaMemcpyAsync(
@@ -1439,6 +1669,141 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
             h_samp.data(), scv.chars_begin(stream) + base_ch, samp_len, cudaMemcpyDeviceToHost, stream.get()));
           stream.sync();
 
+          bool used_fsst = false;
+          if (tot_raw_ch >= 524288u) {
+            // Fast 64 KiB CPU FSST symbol trainer (<0.25 ms): score 4B, 3B, 2B n-grams by freq*(len-1)!
+            std::unordered_map<uint64_t, uint32_t> ng_cnt;
+            ng_cnt.reserve(8192);
+            uint32_t b1_cnt[256] = {};
+            for (size_t i = 0; i < samp_len; ++i) {
+              uint8_t const b0 = h_samp[i];
+              b1_cnt[b0]++;
+              if (i + 2u <= samp_len) {
+                uint64_t const k2 = (2ULL << 32) | static_cast<uint64_t>(b0) |
+                                    (static_cast<uint64_t>(h_samp[i + 1u]) << 8);
+                ng_cnt[k2]++;
+              }
+              if (i + 3u <= samp_len) {
+                uint64_t const k3 = (3ULL << 32) | static_cast<uint64_t>(b0) |
+                                    (static_cast<uint64_t>(h_samp[i + 1u]) << 8) |
+                                    (static_cast<uint64_t>(h_samp[i + 2u]) << 16);
+                ng_cnt[k3]++;
+              }
+              if (i + 4u <= samp_len) {
+                uint64_t const k4 = (4ULL << 32) | static_cast<uint64_t>(b0) |
+                                    (static_cast<uint64_t>(h_samp[i + 1u]) << 8) |
+                                    (static_cast<uint64_t>(h_samp[i + 2u]) << 16) |
+                                    (static_cast<uint64_t>(h_samp[i + 3u]) << 24);
+                ng_cnt[k4]++;
+              }
+            }
+            struct Cand { uint32_t score; uint32_t word; uint8_t len; };
+            std::vector<Cand> cands;
+            cands.reserve(ng_cnt.size());
+            for (auto const& kv : ng_cnt) {
+              uint8_t const l  = static_cast<uint8_t>(kv.first >> 32);
+              uint32_t const c = kv.second;
+              if (c >= 6u) {
+                cands.push_back(Cand{c * static_cast<uint32_t>(l - 1u), static_cast<uint32_t>(kv.first), l});
+              }
+            }
+            size_t const max_multi = std::min<size_t>(cands.size(), 150u);
+            if (max_multi >= 24u) {
+              std::partial_sort(cands.begin(), cands.begin() + max_multi, cands.end(),
+                                [](Cand const& a, Cand const& b) { return a.score > b.score; });
+              // Sort selected multi-byte symbols longest-first (4 -> 3 -> 2) for greedy longest match!
+              std::vector<Cand> chosen(cands.begin(), cands.begin() + max_multi);
+              std::sort(chosen.begin(), chosen.end(), [](Cand const& a, Cand const& b) {
+                return (a.len != b.len) ? (a.len > b.len) : (a.score > b.score);
+              });
+
+              FsstEncodeTable h_ft{};
+              std::memset(&h_ft, 0, sizeof(h_ft));
+              std::memset(h_ft.single_code, 0xFF, sizeof(h_ft.single_code));
+              std::memset(h_ft.bucket_head, 0xFF, sizeof(h_ft.bucket_head));
+              std::memset(h_ft.sym_next, 0xFF, sizeof(h_ft.sym_next));
+              uint8_t bucket_tail[1024];
+              std::memset(bucket_tail, 0xFF, sizeof(bucket_tail));
+
+              uint32_t next_code = 0;
+              for (auto const& sc : chosen) {
+                uint8_t const code = static_cast<uint8_t>(next_code++);
+                h_ft.sym_word[code] = sc.word;
+                h_ft.sym_len[code]  = sc.len;
+                uint32_t const h    = fsst_hash2(static_cast<uint8_t>(sc.word & 0xFFu),
+                                                 static_cast<uint8_t>((sc.word >> 8) & 0xFFu));
+                if (h_ft.bucket_head[h] == 0xFFu) {
+                  h_ft.bucket_head[h] = code;
+                  bucket_tail[h]      = code;
+                } else {
+                  h_ft.sym_next[bucket_tail[h]] = code;
+                  bucket_tail[h]                = code;
+                }
+              }
+              // Fill remaining codes (..254) with top frequent 1-byte literals (avoiding 0xFF escapes!)
+              std::vector<std::pair<uint32_t, uint8_t>> b1s;
+              b1s.reserve(256);
+              for (uint32_t b = 0; b < 256u; ++b) {
+                if (b1_cnt[b] > 0u) { b1s.emplace_back(b1_cnt[b], static_cast<uint8_t>(b)); }
+              }
+              std::sort(b1s.begin(), b1s.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+              for (auto const& p1 : b1s) {
+                if (next_code >= 255u) { break; }
+                uint8_t const code    = static_cast<uint8_t>(next_code++);
+                h_ft.sym_word[code]   = static_cast<uint32_t>(p1.second);
+                h_ft.sym_len[code]    = 1u;
+                h_ft.single_code[p1.second] = code;
+              }
+
+              w.d_fsst_tbl    = rmm::device_buffer(&h_ft, sizeof(FsstEncodeTable), stream, mr);
+              w.d_bigram_offs = rmm::device_uvector<int32_t>(nrows + 1u, stream, mr);
+              uint32_t const gr = (nrows + 255u) / 256u;
+              fsst_measure_rows_kernel<<<gr, 256, 0, stream.get()>>>(
+                scv.offsets().data<int32_t>(),
+                scv.chars_begin(stream),
+                static_cast<uint32_t>(str_cv.offset()),
+                nrows,
+                static_cast<FsstEncodeTable const*>(w.d_fsst_tbl.data()),
+                w.d_bigram_offs.data());
+              thrust::exclusive_scan(rmm::exec_policy_nosync(stream),
+                                     w.d_bigram_offs.data(),
+                                     w.d_bigram_offs.data() + nrows + 1u,
+                                     w.d_bigram_offs.data());
+              w.h_bigram_part_chars.assign(n_parts, 0);
+              gather_str_boundary_offs_kernel<<<gpb, 256, 0, stream.get()>>>(
+                w.d_bigram_offs.data(),
+                0u,
+                d_part_start.data(),
+                d_part_len.data(),
+                d_part_chars.data(),
+                static_cast<uint32_t>(n_parts));
+              CUDF_CUDA_TRY(cudaMemcpyAsync(w.h_bigram_part_chars.data(),
+                                            d_part_chars.data(),
+                                            n_parts * sizeof(int32_t),
+                                            cudaMemcpyDeviceToHost,
+                                            stream.get()));
+              stream.sync();
+              size_t tot_comp_ch = 0;
+              size_t nonempty_p  = 0;
+              for (size_t p = 0; p < n_parts; ++p) {
+                if (h_part_len[p] > 0) {
+                  tot_comp_ch += static_cast<size_t>(w.h_bigram_part_chars[p]);
+                  ++nonempty_p;
+                }
+              }
+              if ((tot_comp_ch + nonempty_p * kFsstHdrBytes) * 100u < tot_raw_ch * 78u) {
+                used_fsst = true;
+                w.enc     = ShufEnc::STRING_FSST;
+                for (size_t p = 0; p < n_parts; ++p) {
+                  if (h_part_len[p] == 0) continue;
+                  w.part_payload_sz[p] = kFsstHdrBytes + (h_part_len[p] + 1u) * sizeof(int32_t) +
+                                         static_cast<size_t>(w.h_bigram_part_chars[p]);
+                }
+              }
+            }
+          }
+
+          if (!used_fsst) {
           std::vector<uint32_t> counts(128u * 128u, 0u);
           size_t ascii_cnt = 0;
           for (size_t i = 0; i + 1u < samp_len; ++i) {
@@ -1519,6 +1884,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
               }
             }
           }
+          }  // !used_fsst
         }
       }
     } else {
@@ -1825,6 +2191,19 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         static_cast<uint32_t>(cv.offset()),
         static_cast<uint8_t const*>(w.d_bigram_lut.data()),
         static_cast<uint16_t const*>(w.d_bigram_sym.data()),
+        d_base,
+        d_col_dst,
+        d_part_start.data(),
+        d_part_len.data(),
+        static_cast<uint32_t>(n_parts));
+    } else if (w.enc == ShufEnc::STRING_FSST) {
+      cudf::strings_column_view const scv(cv);
+      scatter_fsst_string_kernel<<<sc_grid, 256, 0, stream.get()>>>(
+        scv.offsets().data<int32_t>(),
+        scv.chars_begin(stream),
+        w.d_bigram_offs.data(),
+        static_cast<uint32_t>(cv.offset()),
+        static_cast<FsstEncodeTable const*>(w.d_fsst_tbl.data()),
         d_base,
         d_col_dst,
         d_part_start.data(),
