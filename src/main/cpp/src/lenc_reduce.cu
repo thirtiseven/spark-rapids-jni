@@ -466,21 +466,24 @@ struct JitReduceProgram {
   CUfunction func_blk{nullptr};
 };
 
-JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
-                                             std::string const& kernel_name)
+std::string compile_jit_reduce_to_ptx_cpu_only(std::string const& cuda_src,
+                                               std::string const& kernel_name,
+                                               std::string const& compute_arch)
 {
+  static std::mutex ptx_mtx;
+  static std::unordered_map<std::string, std::string> ptx_cache;
+  std::string const key = compute_arch + ":" + kernel_name + "\n" + cuda_src;
+  {
+    std::lock_guard<std::mutex> lk(ptx_mtx);
+    auto it = ptx_cache.find(key);
+    if (it != ptx_cache.end()) { return it->second; }
+  }
   nvrtcProgram prog{};
   auto rc = nvrtcCreateProgram(&prog, cuda_src.c_str(), "lenc_jit_reduce.cu", 0, nullptr, nullptr);
   CUDF_EXPECTS(rc == NVRTC_SUCCESS, "nvrtcCreateProgram failed");
-
-  int dev = 0, major = 8, minor = 0;
-  CUDF_CUDA_TRY(cudaGetDevice(&dev));
-  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
-  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
-  std::string arch_opt = "--gpu-architecture=compute_" + std::to_string(major * 10 + minor);
-  char const* opts[]   = {arch_opt.c_str(), "--std=c++17", "--fmad=false", "--device-int128"};
-
-  rc = nvrtcCompileProgram(prog, 4, opts);
+  std::string const arch_opt = "--gpu-architecture=" + compute_arch;
+  char const* opts[]         = {arch_opt.c_str(), "--std=c++17", "--fmad=false", "--device-int128"};
+  rc                         = nvrtcCompileProgram(prog, 4, opts);
   if (rc != NVRTC_SUCCESS) {
     size_t log_sz = 0;
     nvrtcGetProgramLogSize(prog, &log_sz);
@@ -494,7 +497,14 @@ JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
   std::string ptx(ptx_sz, '\0');
   nvrtcGetPTX(prog, ptx.data());
   nvrtcDestroyProgram(&prog);
+  std::lock_guard<std::mutex> lk(ptx_mtx);
+  auto [it, _] = ptx_cache.emplace(key, std::move(ptx));
+  return it->second;
+}
 
+JitReduceProgram* load_jit_reduce_program_from_ptx(std::string const& ptx,
+                                                   std::string const& kernel_name)
+{
   auto const& drv = CudaDriverApi::get();
   auto* out       = new JitReduceProgram();
   CUresult cr     = drv.mod_load(&out->mod, ptx.data());
@@ -513,6 +523,18 @@ JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
     out->func_blk = nullptr;
   }
   return out;
+}
+
+JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
+                                             std::string const& kernel_name)
+{
+  int dev = 0, major = 8, minor = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&dev));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
+  std::string const arch = "compute_" + std::to_string(major * 10 + minor);
+  std::string const ptx  = compile_jit_reduce_to_ptx_cpu_only(cuda_src, kernel_name, arch);
+  return load_jit_reduce_program_from_ptx(ptx, kernel_name);
 }
 
 void destroy_jit_reduce_program(JitReduceProgram* prog)

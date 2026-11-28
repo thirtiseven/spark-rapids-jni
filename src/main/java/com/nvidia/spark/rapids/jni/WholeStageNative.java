@@ -32,6 +32,13 @@ public final class WholeStageNative {
 
   private WholeStageNative() {}
 
+  public static final int PREAMBLE_FOR256    = 1 << 0;
+  public static final int PREAMBLE_VORTEX_BP = 1 << 1;
+  public static final int PREAMBLE_FSST      = 1 << 2;
+  public static final int PREAMBLE_SMEM      = 1 << 3;
+  public static final int PREAMBLE_MURMUR3   = 1 << 4;
+  public static final int PREAMBLE_ALL       = 0x1F;
+
   public static final class Program implements AutoCloseable {
     private long handle;
 
@@ -40,13 +47,18 @@ public final class WholeStageNative {
     }
 
     public HashAggTask openHashAggTask(DType[] keyTypes, byte[] aggKinds, int initialCapacity) {
+      return openHashAggTask(keyTypes, aggKinds, initialCapacity, null);
+    }
+
+    public HashAggTask openHashAggTask(
+        DType[] keyTypes, byte[] aggKinds, int initialCapacity, long[] constBits) {
       int[] tids = new int[keyTypes.length];
       int[] scales = new int[keyTypes.length];
       for (int i = 0; i < keyTypes.length; i++) {
         tids[i] = keyTypes[i].getTypeId().getNativeId();
         scales[i] = keyTypes[i].getScale();
       }
-      long h = openHashAggTaskNative(handle, tids, scales, aggKinds, initialCapacity);
+      long h = openHashAggTaskNative(handle, tids, scales, aggKinds, initialCapacity, constBits);
       return new HashAggTask(h);
     }
 
@@ -123,7 +135,28 @@ public final class WholeStageNative {
   }
 
   public static Program compileProgram(String bodyCudaSrc, String kernelName) {
-    return new Program(compileProgramNative(bodyCudaSrc, kernelName));
+    return compileProgram(bodyCudaSrc, kernelName, PREAMBLE_ALL);
+  }
+
+  public static Program compileProgram(String bodyCudaSrc, String kernelName, int preambleFlags) {
+    return new Program(compileProgramNative(bodyCudaSrc, kernelName, preambleFlags));
+  }
+
+  /**
+   * Pure-CPU NVRTC compilation to arch-independent PTX (default compute_75). Safe on CPU-only
+   * Spark Drivers (no GPU / CUDA driver required). Returns null if native compile is unavailable.
+   */
+  public static byte[] tryCompileToPtxCpuOnly(
+      String bodyCudaSrc, String kernelName, int preambleFlags) {
+    try {
+      return compileToPtxCpuOnlyNative(bodyCudaSrc, kernelName, preambleFlags, "compute_75");
+    } catch (Throwable t) {
+      return null;
+    }
+  }
+
+  public static Program loadProgramFromPtx(byte[] ptxBytes, String kernelName) {
+    return new Program(loadProgramFromPtxNative(ptxBytes, kernelName));
   }
 
   public static ProbeTable buildProbeTable(ColumnView keyCol) {
@@ -167,6 +200,21 @@ public final class WholeStageNative {
       DType[] outTypes,
       int numParts,
       int[] outSplits) {
+    return runStagePartitionScatter(
+        countProg, scatterProg, factCols, numRows, probeHandles, dimCols, outTypes, numParts, outSplits, null);
+  }
+
+  public static Table runStagePartitionScatter(
+      Program countProg,
+      Program scatterProg,
+      ColumnView[] factCols,
+      int numRows,
+      long[] probeHandles,
+      ColumnView[] dimCols,
+      DType[] outTypes,
+      int numParts,
+      int[] outSplits,
+      long[] constBits) {
     long[] fViews = new long[factCols.length];
     for (int i = 0; i < factCols.length; i++) { fViews[i] = factCols[i].getNativeView(); }
     long[] dViews = new long[dimCols.length];
@@ -179,7 +227,7 @@ public final class WholeStageNative {
     }
     return new Table(runStagePartitionScatterNative(
         countProg.handle, scatterProg.handle, fViews, numRows, probeHandles, dViews,
-        tids, scales, numParts, outSplits));
+        tids, scales, numParts, outSplits, constBits));
   }
 
   public static Table runStageMaterialize(
@@ -190,6 +238,19 @@ public final class WholeStageNative {
       long[] probeHandles,
       ColumnView[] dimCols,
       DType[] outTypes) {
+    return runStageMaterialize(
+        countProg, scatterProg, factCols, numRows, probeHandles, dimCols, outTypes, null);
+  }
+
+  public static Table runStageMaterialize(
+      Program countProg,
+      Program scatterProg,
+      ColumnView[] factCols,
+      int numRows,
+      long[] probeHandles,
+      ColumnView[] dimCols,
+      DType[] outTypes,
+      long[] constBits) {
     long[] fViews = new long[factCols.length];
     for (int i = 0; i < factCols.length; i++) { fViews[i] = factCols[i].getNativeView(); }
     long[] dViews = new long[dimCols.length];
@@ -201,15 +262,19 @@ public final class WholeStageNative {
       scales[i] = outTypes[i].getScale();
     }
     return new Table(runStageMaterializeNative(
-        countProg.handle, scatterProg.handle, fViews, numRows, probeHandles, dViews, tids, scales));
+        countProg.handle, scatterProg.handle, fViews, numRows, probeHandles, dViews, tids, scales, constBits));
   }
 
-  private static native long compileProgramNative(String bodyCudaSrc, String kernelName);
+  private static native long compileProgramNative(
+      String bodyCudaSrc, String kernelName, int preambleFlags);
+  private static native byte[] compileToPtxCpuOnlyNative(
+      String bodyCudaSrc, String kernelName, int preambleFlags, String computeArch);
+  private static native long loadProgramFromPtxNative(byte[] ptxBytes, String kernelName);
   private static native void destroyProgramNative(long progHandle);
   private static native long buildProbeTableNative(long keyColView);
   private static native void destroyProbeTableNative(long probeHandle);
   private static native long openHashAggTaskNative(
-      long progHandle, int[] keyTypeIds, int[] keyScales, byte[] aggKinds, int initCap);
+      long progHandle, int[] keyTypeIds, int[] keyScales, byte[] aggKinds, int initCap, long[] constBits);
   private static native void addBatchHashAggNative(
       long stateHandle, long[] factColViews, int numRows, long[] probeHandles, long[] dimColViews);
   private static native long[] finishHashAggTaskNative(long stateHandle);
@@ -222,8 +287,8 @@ public final class WholeStageNative {
   private static native long[] runStagePartitionScatterNative(
       long countProg, long scatterProg, long[] factCols, int numRows,
       long[] probeHandles, long[] dimCols, int[] outTids, int[] outScales,
-      int numParts, int[] outSplits);
+      int numParts, int[] outSplits, long[] constBits);
   private static native long[] runStageMaterializeNative(
       long countProg, long scatterProg, long[] factCols, int numRows,
-      long[] probeHandles, long[] dimCols, int[] outTids, int[] outScales);
+      long[] probeHandles, long[] dimCols, int[] outTids, int[] outScales, long[] constBits);
 }

@@ -32,14 +32,50 @@
 extern "C" {
 
 JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_compileProgramNative(
-  JNIEnv* env, jclass, jstring j_body_src, jstring j_kernel_name)
+  JNIEnv* env, jclass, jstring j_body_src, jstring j_kernel_name, jint j_preamble_flags)
 {
   JNI_TRY
   {
     cudf::jni::auto_set_device(env);
     cudf::jni::native_jstring src(env, j_body_src);
     cudf::jni::native_jstring kn(env, j_kernel_name);
-    auto* prog = cudf::whole_stage::compile_whole_stage_program(src.get(), kn.get());
+    auto* prog = cudf::whole_stage::compile_whole_stage_program(
+      src.get(), kn.get(), static_cast<uint32_t>(j_preamble_flags));
+    return std::bit_cast<jlong>(prog);
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT jbyteArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_compileToPtxCpuOnlyNative(
+  JNIEnv* env, jclass, jstring j_body_src, jstring j_kernel_name, jint j_preamble_flags, jstring j_arch)
+{
+  JNI_TRY
+  {
+    // Pure CPU NVRTC compile: intentionally NO auto_set_device / NO CUDA driver call!
+    cudf::jni::native_jstring src(env, j_body_src);
+    cudf::jni::native_jstring kn(env, j_kernel_name);
+    cudf::jni::native_jstring arch(env, j_arch);
+    std::string ptx = cudf::whole_stage::compile_whole_stage_to_ptx_cpu_only(
+      src.get(), kn.get(), static_cast<uint32_t>(j_preamble_flags), arch.get());
+    jbyteArray arr = env->NewByteArray(static_cast<jsize>(ptx.size()));
+    if (arr != nullptr && !ptx.empty()) {
+      env->SetByteArrayRegion(arr, 0, static_cast<jsize>(ptx.size()), reinterpret_cast<jbyte const*>(ptx.data()));
+    }
+    return arr;
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_loadProgramFromPtxNative(
+  JNIEnv* env, jclass, jbyteArray j_ptx, jstring j_kernel_name)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    cudf::jni::native_jbyteArray ptx_arr(env, j_ptx);
+    cudf::jni::native_jstring kn(env, j_kernel_name);
+    std::string ptx(reinterpret_cast<char const*>(ptx_arr.data()), static_cast<size_t>(ptx_arr.size()));
+    auto* prog = cudf::whole_stage::load_whole_stage_program_from_ptx(ptx, kn.get());
     return std::bit_cast<jlong>(prog);
   }
   JNI_CATCH(env, 0);
@@ -87,7 +123,8 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_openHa
   jintArray j_key_type_ids,
   jintArray j_key_scales,
   jbyteArray j_agg_kinds,
-  jint j_init_cap)
+  jint j_init_cap,
+  jlongArray j_const_bits)
 {
   JNI_TRY
   {
@@ -114,8 +151,14 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_openHa
     for (int i = 0; i < aks.size(); ++i) {
       agg_ks.push_back(static_cast<cudf::whole_stage::agg_kind>(aks[i]));
     }
+    std::vector<uint64_t> cbits;
+    if (j_const_bits != nullptr) {
+      cudf::jni::native_jlongArray cb(env, j_const_bits);
+      cbits.reserve(static_cast<size_t>(cb.size()));
+      for (int i = 0; i < cb.size(); ++i) { cbits.push_back(static_cast<uint64_t>(cb[i])); }
+    }
     auto* st = cudf::whole_stage::open_hash_agg_task(
-      *prog, key_dts, agg_ks, static_cast<uint32_t>(std::max<jint>(j_init_cap, 64)));
+      *prog, key_dts, agg_ks, static_cast<uint32_t>(std::max<jint>(j_init_cap, 64)), cbits);
     return std::bit_cast<jlong>(st);
   }
   JNI_CATCH(env, 0);
@@ -292,7 +335,8 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_r
   jintArray j_out_tids,
   jintArray j_out_scales,
   jint j_num_parts,
-  jintArray j_out_splits)
+  jintArray j_out_splits,
+  jlongArray j_const_bits)
 {
   JNI_TRY
   {
@@ -339,9 +383,15 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_r
         out_dts.emplace_back(tid);
       }
     }
+    std::vector<uint64_t> cbits;
+    if (j_const_bits != nullptr) {
+      cudf::jni::native_jlongArray cb(env, j_const_bits);
+      cbits.reserve(static_cast<size_t>(cb.size()));
+      for (int i = 0; i < cb.size(); ++i) { cbits.push_back(static_cast<uint64_t>(cb[i])); }
+    }
 
     auto res = cudf::whole_stage::run_whole_stage_partition_scatter(
-      *cprog, *sprog, fact_srcs, static_cast<uint32_t>(j_num_rows), probes, dim_srcs, out_dts, j_num_parts);
+      *cprog, *sprog, fact_srcs, static_cast<uint32_t>(j_num_rows), probes, dim_srcs, out_dts, j_num_parts, cbits);
     env->SetIntArrayRegion(j_out_splits, 0, j_num_parts, reinterpret_cast<jint const*>(res.splits.data()));
     return cudf::jni::convert_table_for_return(env, std::move(res.partitioned_table));
   }
@@ -358,7 +408,8 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_r
   jlongArray j_probe_tables,
   jlongArray j_dim_col_views,
   jintArray j_out_tids,
-  jintArray j_out_scales)
+  jintArray j_out_scales,
+  jlongArray j_const_bits)
 {
   JNI_TRY
   {
@@ -405,8 +456,14 @@ JNIEXPORT jlongArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_r
         out_dts.emplace_back(tid);
       }
     }
+    std::vector<uint64_t> cbits;
+    if (j_const_bits != nullptr) {
+      cudf::jni::native_jlongArray cb(env, j_const_bits);
+      cbits.reserve(static_cast<size_t>(cb.size()));
+      for (int i = 0; i < cb.size(); ++i) { cbits.push_back(static_cast<uint64_t>(cb[i])); }
+    }
     auto tbl = cudf::whole_stage::run_whole_stage_materialize(
-      *cprog, *sprog, fact_srcs, static_cast<uint32_t>(j_num_rows), probes, dim_srcs, out_dts);
+      *cprog, *sprog, fact_srcs, static_cast<uint32_t>(j_num_rows), probes, dim_srcs, out_dts, cbits);
     return cudf::jni::convert_table_for_return(env, std::move(tbl));
   }
   JNI_CATCH(env, nullptr);

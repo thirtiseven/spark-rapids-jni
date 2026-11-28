@@ -118,6 +118,19 @@ public final class LencNative {
     return new JitReduceProgram(compileJitReduceNative(cudaSource, kernelName));
   }
 
+  /** Pure-CPU Driver-side PTX compilation (no GPU needed). Returns null if unavailable. */
+  public static byte[] tryCompileJitReduceToPtxCpuOnly(String cudaSource, String kernelName) {
+    try {
+      return compileJitReduceToPtxCpuOnlyNative(cudaSource, kernelName, "compute_75");
+    } catch (Throwable t) {
+      return null;
+    }
+  }
+
+  public static JitReduceProgram loadJitReduceFromPtx(byte[] ptxBytes, String kernelName) {
+    return new JitReduceProgram(loadJitReduceFromPtxNative(ptxBytes, kernelName));
+  }
+
   public static DeviceMemoryBuffer[] splitAndEncodeShuffleToDevice(Table table, int... splits) {
     DeviceMemoryBuffer[] ret = new DeviceMemoryBuffer[2];
     boolean ok = false;
@@ -233,6 +246,9 @@ public final class LencNative {
       byte[] lshfBytes, int[] selectedCols, int[] typeIds, int[] scales);
 
   private static native long compileJitReduceNative(String cudaSrc, String kernelName);
+  private static native byte[] compileJitReduceToPtxCpuOnlyNative(
+      String cudaSrc, String kernelName, String computeArch);
+  private static native long loadJitReduceFromPtxNative(byte[] ptxBytes, String kernelName);
 
   private static native void destroyJitReduceNative(long progHandle);
 

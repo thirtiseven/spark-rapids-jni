@@ -83,6 +83,13 @@ struct JitReduceProgram;
 JitReduceProgram* compile_jit_reduce_program(std::string const& cuda_src,
                                              std::string const& kernel_name);
 
+std::string compile_jit_reduce_to_ptx_cpu_only(std::string const& cuda_src,
+                                               std::string const& kernel_name,
+                                               std::string const& compute_arch = "compute_75");
+
+JitReduceProgram* load_jit_reduce_program_from_ptx(std::string const& ptx,
+                                                   std::string const& kernel_name);
+
 void destroy_jit_reduce_program(JitReduceProgram* prog);
 
 std::unique_ptr<cudf::table> run_jit_reduce_table(

@@ -212,6 +212,39 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_compileJitRe
   JNI_CATCH(env, 0);
 }
 
+JNIEXPORT jbyteArray JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_compileJitReduceToPtxCpuOnlyNative(
+  JNIEnv* env, jclass, jstring j_cuda_src, jstring j_kernel_name, jstring j_arch)
+{
+  JNI_TRY
+  {
+    cudf::jni::native_jstring src(env, j_cuda_src);
+    cudf::jni::native_jstring kn(env, j_kernel_name);
+    cudf::jni::native_jstring arch(env, j_arch);
+    std::string ptx = rapids::jni::lenc::compile_jit_reduce_to_ptx_cpu_only(src.get(), kn.get(), arch.get());
+    jbyteArray arr = env->NewByteArray(static_cast<jsize>(ptx.size()));
+    if (arr != nullptr && !ptx.empty()) {
+      env->SetByteArrayRegion(arr, 0, static_cast<jsize>(ptx.size()), reinterpret_cast<jbyte const*>(ptx.data()));
+    }
+    return arr;
+  }
+  JNI_CATCH(env, nullptr);
+}
+
+JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_loadJitReduceFromPtxNative(
+  JNIEnv* env, jclass, jbyteArray j_ptx, jstring j_kernel_name)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    cudf::jni::native_jbyteArray ptx_arr(env, j_ptx);
+    cudf::jni::native_jstring kn(env, j_kernel_name);
+    std::string ptx(reinterpret_cast<char const*>(ptx_arr.data()), static_cast<size_t>(ptx_arr.size()));
+    auto* prog = rapids::jni::lenc::load_jit_reduce_program_from_ptx(ptx, kn.get());
+    return std::bit_cast<jlong>(prog);
+  }
+  JNI_CATCH(env, 0);
+}
+
 JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_LencNative_destroyJitReduceNative(
   JNIEnv* env, jclass, jlong j_prog)
 {
