@@ -1067,7 +1067,9 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
   std::vector<ColWork> works;
   works.reserve(ncols);
 
-  auto run_batched_for = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
+  // Phase II: Split FOR256 into async stats+scan (no sync!) + single batched sync + async pack
+  // so multi-column tables stall CPU-GPU ONCE per batch instead of 8-12x!
+  auto launch_for_stats = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
     cudf::bitmask_type const* nmask = w.has_nulls ? cv.null_mask() : nullptr;
     cudf::size_type const coff      = cv.offset();
     w.d_mins.resize(total_blks, stream);
@@ -1094,8 +1096,12 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
                                   (total_blks + 1u) * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost,
                                   stream.get()));
-    stream.sync();
-    uint32_t const tot_words = w.h_word_offs[total_blks];
+  };
+
+  auto launch_for_pack = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
+    cudf::bitmask_type const* nmask = w.has_nulls ? cv.null_mask() : nullptr;
+    cudf::size_type const coff      = cv.offset();
+    uint32_t const tot_words        = w.h_word_offs[total_blks];
     w.d_words.resize(std::max<uint32_t>(tot_words, 1), stream);
     if (total_blks > 0 && tot_words > 0) {
       batched_for256_pack_kernel<T><<<total_blks, 256, 0, stream.get()>>>(
@@ -1109,6 +1115,12 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         w.d_word_offs.data(),
         w.d_words.data());
     }
+  };
+
+  auto run_batched_for = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
+    launch_for_stats.template operator()<T>(w, d_in, cv);
+    stream.sync();
+    launch_for_pack.template operator()<T>(w, d_in, cv);
   };
 
   for (uint32_t c = 0; c < ncols; ++c) {
@@ -1127,71 +1139,77 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         }
       }
     }
+  }
 
-    if (nrows == 0) { continue; }
+  std::vector<uint32_t> batched_for_cols;
+  if (nrows > 0) {
+    for (uint32_t c = 0; c < ncols; ++c) {
+      ColWork& w    = works[c];
+      auto const cv = table.column(static_cast<cudf::size_type>(c));
+      if (w.tid == cudf::type_id::INT64 || w.tid == cudf::type_id::TIMESTAMP_MICROSECONDS ||
+          w.tid == cudf::type_id::DECIMAL64) {
+        w.enc       = ShufEnc::FOR_BITPACK;
+        w.elem_size = 8;
+        launch_for_stats.template operator()<int64_t>(
+          w, static_cast<int64_t const*>(cv.head()) + cv.offset(), cv);
+        batched_for_cols.push_back(c);
+      } else if (w.tid == cudf::type_id::INT32 || w.tid == cudf::type_id::TIMESTAMP_DAYS ||
+                 w.tid == cudf::type_id::DECIMAL32) {
+        w.enc       = ShufEnc::FOR_BITPACK;
+        w.elem_size = 4;
+        launch_for_stats.template operator()<int32_t>(
+          w, static_cast<int32_t const*>(cv.head()) + cv.offset(), cv);
+        batched_for_cols.push_back(c);
+      } else if (w.tid == cudf::type_id::INT16) {
+        w.enc       = ShufEnc::FOR_BITPACK;
+        w.elem_size = 2;
+        launch_for_stats.template operator()<int16_t>(w, cv.data<int16_t>() + cv.offset(), cv);
+        batched_for_cols.push_back(c);
+      } else if (w.tid == cudf::type_id::INT8 || w.tid == cudf::type_id::BOOL8) {
+        w.enc       = ShufEnc::FOR_BITPACK;
+        w.elem_size = 1;
+        launch_for_stats.template operator()<int8_t>(
+          w, static_cast<int8_t const*>(cv.head()) + cv.offset(), cv);
+        batched_for_cols.push_back(c);
+      }
+    }
+    if (!batched_for_cols.empty()) {
+      stream.sync();
+      for (uint32_t c : batched_for_cols) {
+        ColWork& w    = works[c];
+        auto const cv = table.column(static_cast<cudf::size_type>(c));
+        if (w.elem_size == 8) {
+          launch_for_pack.template operator()<int64_t>(
+            w, static_cast<int64_t const*>(cv.head()) + cv.offset(), cv);
+        } else if (w.elem_size == 4) {
+          launch_for_pack.template operator()<int32_t>(
+            w, static_cast<int32_t const*>(cv.head()) + cv.offset(), cv);
+        } else if (w.elem_size == 2) {
+          launch_for_pack.template operator()<int16_t>(w, cv.data<int16_t>() + cv.offset(), cv);
+        } else {
+          launch_for_pack.template operator()<int8_t>(
+            w, static_cast<int8_t const*>(cv.head()) + cv.offset(), cv);
+        }
+        for (size_t p = 0; p < n_parts; ++p) {
+          uint32_t const nc = h_part_nblks[p];
+          if (nc == 0) continue;
+          uint32_t const b0 = h_part_blk_start[p];
+          uint32_t const nw = w.h_word_offs[b0 + nc] - w.h_word_offs[b0];
+          size_t const o_bw = nc * sizeof(int64_t);
+          size_t const o_cw = align8(o_bw + nc * sizeof(uint8_t));
+          size_t const o_pk = align8(o_cw + nc * sizeof(uint32_t));
+          w.part_payload_sz[p] = o_pk + static_cast<size_t>(nw) * sizeof(uint64_t);
+        }
+      }
+    }
+  }
 
-    if (w.tid == cudf::type_id::INT64 || w.tid == cudf::type_id::TIMESTAMP_MICROSECONDS ||
-        w.tid == cudf::type_id::DECIMAL64) {
-      w.enc       = ShufEnc::FOR_BITPACK;
-      w.elem_size = 8;
-      run_batched_for.template operator()<int64_t>(
-        w, static_cast<int64_t const*>(cv.head()) + cv.offset(), cv);
-      for (size_t p = 0; p < n_parts; ++p) {
-        uint32_t const nc = h_part_nblks[p];
-        if (nc == 0) continue;
-        uint32_t const b0 = h_part_blk_start[p];
-        uint32_t const nw = w.h_word_offs[b0 + nc] - w.h_word_offs[b0];
-        size_t const o_bw = nc * sizeof(int64_t);
-        size_t const o_cw = align8(o_bw + nc * sizeof(uint8_t));
-        size_t const o_pk = align8(o_cw + nc * sizeof(uint32_t));
-        w.part_payload_sz[p] = o_pk + static_cast<size_t>(nw) * sizeof(uint64_t);
-      }
-    } else if (w.tid == cudf::type_id::INT32 || w.tid == cudf::type_id::TIMESTAMP_DAYS ||
-               w.tid == cudf::type_id::DECIMAL32) {
-      w.enc       = ShufEnc::FOR_BITPACK;
-      w.elem_size = 4;
-      run_batched_for.template operator()<int32_t>(
-        w, static_cast<int32_t const*>(cv.head()) + cv.offset(), cv);
-      for (size_t p = 0; p < n_parts; ++p) {
-        uint32_t const nc = h_part_nblks[p];
-        if (nc == 0) continue;
-        uint32_t const b0 = h_part_blk_start[p];
-        uint32_t const nw = w.h_word_offs[b0 + nc] - w.h_word_offs[b0];
-        size_t const o_bw = nc * sizeof(int64_t);
-        size_t const o_cw = align8(o_bw + nc * sizeof(uint8_t));
-        size_t const o_pk = align8(o_cw + nc * sizeof(uint32_t));
-        w.part_payload_sz[p] = o_pk + static_cast<size_t>(nw) * sizeof(uint64_t);
-      }
-    } else if (w.tid == cudf::type_id::INT16) {
-      w.enc       = ShufEnc::FOR_BITPACK;
-      w.elem_size = 2;
-      run_batched_for.template operator()<int16_t>(w, cv.data<int16_t>() + cv.offset(), cv);
-      for (size_t p = 0; p < n_parts; ++p) {
-        uint32_t const nc = h_part_nblks[p];
-        if (nc == 0) continue;
-        uint32_t const b0 = h_part_blk_start[p];
-        uint32_t const nw = w.h_word_offs[b0 + nc] - w.h_word_offs[b0];
-        size_t const o_bw = nc * sizeof(int64_t);
-        size_t const o_cw = align8(o_bw + nc * sizeof(uint8_t));
-        size_t const o_pk = align8(o_cw + nc * sizeof(uint32_t));
-        w.part_payload_sz[p] = o_pk + static_cast<size_t>(nw) * sizeof(uint64_t);
-      }
-    } else if (w.tid == cudf::type_id::INT8 || w.tid == cudf::type_id::BOOL8) {
-      w.enc       = ShufEnc::FOR_BITPACK;
-      w.elem_size = 1;
-      run_batched_for.template operator()<int8_t>(
-        w, static_cast<int8_t const*>(cv.head()) + cv.offset(), cv);
-      for (size_t p = 0; p < n_parts; ++p) {
-        uint32_t const nc = h_part_nblks[p];
-        if (nc == 0) continue;
-        uint32_t const b0 = h_part_blk_start[p];
-        uint32_t const nw = w.h_word_offs[b0 + nc] - w.h_word_offs[b0];
-        size_t const o_bw = nc * sizeof(int64_t);
-        size_t const o_cw = align8(o_bw + nc * sizeof(uint8_t));
-        size_t const o_pk = align8(o_cw + nc * sizeof(uint32_t));
-        w.part_payload_sz[p] = o_pk + static_cast<size_t>(nw) * sizeof(uint64_t);
-      }
-    } else if (w.tid == cudf::type_id::FLOAT32 || w.tid == cudf::type_id::FLOAT64) {
+  for (uint32_t c = 0; c < ncols; ++c) {
+    ColWork& w    = works[c];
+    auto const cv = table.column(static_cast<cudf::size_type>(c));
+    if (nrows == 0 || w.enc == ShufEnc::FOR_BITPACK) { continue; }
+
+    if (w.tid == cudf::type_id::FLOAT32 || w.tid == cudf::type_id::FLOAT64) {
       w.elem_size = static_cast<uint32_t>(cudf::size_of(cv.type()));
       w.enc       = ShufEnc::RAW_FIXED;
       size_t const tot_raw_b = static_cast<size_t>(nrows) * w.elem_size;
