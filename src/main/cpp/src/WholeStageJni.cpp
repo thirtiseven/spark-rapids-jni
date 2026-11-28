@@ -46,6 +46,22 @@ JNIEXPORT jlong JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_compil
   JNI_CATCH(env, 0);
 }
 
+JNIEXPORT void JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_warmupLtoHelpersNative(
+  JNIEnv* env, jclass, jstring j_arch)
+{
+  JNI_TRY
+  {
+    std::string arch = "compute_75";
+    if (j_arch != nullptr) {
+      char const* a_c = env->GetStringUTFChars(j_arch, nullptr);
+      arch = a_c;
+      env->ReleaseStringUTFChars(j_arch, a_c);
+    }
+    cudf::whole_stage::warmup_whole_stage_lto_helpers(arch);
+  }
+  JNI_CATCH(env, );
+}
+
 JNIEXPORT jbyteArray JNICALL Java_com_nvidia_spark_rapids_jni_WholeStageNative_compileToPtxCpuOnlyNative(
   JNIEnv* env, jclass, jstring j_body_src, jstring j_kernel_name, jint j_preamble_flags, jstring j_arch)
 {

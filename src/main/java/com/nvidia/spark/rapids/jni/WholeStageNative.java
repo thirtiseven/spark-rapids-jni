@@ -265,6 +265,15 @@ public final class WholeStageNative {
         countProg.handle, scatterProg.handle, fViews, numRows, probeHandles, dViews, tids, scales, constBits));
   }
 
+  /** P4: Pre-compile StageIR device helper library into in-memory LTOIR bitcode (zero disk cache). */
+  public static void warmupLtoHelpers() {
+    try {
+      warmupLtoHelpersNative("compute_75");
+    } catch (Throwable ignored) {
+    }
+  }
+
+  private static native void warmupLtoHelpersNative(String computeArch);
   private static native long compileProgramNative(
       String bodyCudaSrc, String kernelName, int preambleFlags);
   private static native byte[] compileToPtxCpuOnlyNative(
