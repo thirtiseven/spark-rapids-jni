@@ -1067,14 +1067,38 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
   std::vector<ColWork> works;
   works.reserve(ncols);
 
-  // Phase II: Split FOR256 into async stats+scan (no sync!) + single batched sync + async pack
-  // so multi-column tables stall CPU-GPU ONCE per batch instead of 8-12x!
-  auto launch_for_stats = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
+  // Milestone 2: Thread-local Pinned Host Staging Pool so batched FOR256 D2H copies are
+  // 100% truly async (eliminating CUDA's implicit sync on pageable std::vector D2H!).
+  struct PinnedU32Pool {
+    uint32_t* ptr{nullptr};
+    size_t cap{0};
+    ~PinnedU32Pool() {
+      if (ptr != nullptr) { cudaFreeHost(ptr); }
+    }
+    uint32_t* ensure(size_t n) {
+      if (n > cap) {
+        if (ptr != nullptr) { cudaFreeHost(ptr); ptr = nullptr; cap = 0; }
+        size_t alloc_n = std::max<size_t>(n, 65536u);
+        if (cudaHostAlloc(reinterpret_cast<void**>(&ptr), alloc_n * sizeof(uint32_t), cudaHostAllocDefault) == cudaSuccess) {
+          cap = alloc_n;
+        } else {
+          ptr = nullptr;
+          cap = 0;
+        }
+      }
+      return ptr;
+    }
+  };
+  thread_local PinnedU32Pool tl_pinned_word_offs;
+  uint32_t const stride_wo = total_blks + 1u;
+  uint32_t* pinned_base    = tl_pinned_word_offs.ensure(static_cast<size_t>(ncols) * stride_wo);
+
+  auto launch_for_stats = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv, uint32_t col_slot) {
     cudf::bitmask_type const* nmask = w.has_nulls ? cv.null_mask() : nullptr;
     cudf::size_type const coff      = cv.offset();
     w.d_mins.resize(total_blks, stream);
     w.d_bws.resize(total_blks, stream);
-    w.d_word_offs.resize(total_blks + 1u, stream);
+    w.d_word_offs.resize(stride_wo, stream);
     if (total_blks > 0) {
       batched_for256_stats_kernel<T><<<total_blks, 256, 0, stream.get()>>>(
         d_in,
@@ -1090,12 +1114,25 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       cudaMemsetAsync(w.d_word_offs.data() + total_blks, 0, sizeof(uint32_t), stream.get()));
     thrust::exclusive_scan(
       rmm::exec_policy_nosync(stream), w.d_word_offs.begin(), w.d_word_offs.end(), w.d_word_offs.begin());
-    w.h_word_offs.resize(total_blks + 1u);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(w.h_word_offs.data(),
+    uint32_t* h_dst = nullptr;
+    if (pinned_base != nullptr) {
+      h_dst = pinned_base + static_cast<size_t>(col_slot) * stride_wo;
+    } else {
+      w.h_word_offs.resize(stride_wo);
+      h_dst = w.h_word_offs.data();
+    }
+    CUDF_CUDA_TRY(cudaMemcpyAsync(h_dst,
                                   w.d_word_offs.data(),
-                                  (total_blks + 1u) * sizeof(uint32_t),
+                                  stride_wo * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost,
                                   stream.get()));
+  };
+
+  auto sync_copy_pinned_wo = [&](ColWork& w, uint32_t col_slot) {
+    if (pinned_base != nullptr) {
+      uint32_t const* src = pinned_base + static_cast<size_t>(col_slot) * stride_wo;
+      w.h_word_offs.assign(src, src + stride_wo);
+    }
   };
 
   auto launch_for_pack = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
@@ -1118,8 +1155,9 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
   };
 
   auto run_batched_for = [&]<typename T>(ColWork& w, T const* d_in, cudf::column_view const& cv) {
-    launch_for_stats.template operator()<T>(w, d_in, cv);
+    launch_for_stats.template operator()<T>(w, d_in, cv, 0u);
     stream.sync();
+    sync_copy_pinned_wo(w, 0u);
     launch_for_pack.template operator()<T>(w, d_in, cv);
   };
 
@@ -1151,25 +1189,25 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
         w.enc       = ShufEnc::FOR_BITPACK;
         w.elem_size = 8;
         launch_for_stats.template operator()<int64_t>(
-          w, static_cast<int64_t const*>(cv.head()) + cv.offset(), cv);
+          w, static_cast<int64_t const*>(cv.head()) + cv.offset(), cv, c);
         batched_for_cols.push_back(c);
       } else if (w.tid == cudf::type_id::INT32 || w.tid == cudf::type_id::TIMESTAMP_DAYS ||
                  w.tid == cudf::type_id::DECIMAL32) {
         w.enc       = ShufEnc::FOR_BITPACK;
         w.elem_size = 4;
         launch_for_stats.template operator()<int32_t>(
-          w, static_cast<int32_t const*>(cv.head()) + cv.offset(), cv);
+          w, static_cast<int32_t const*>(cv.head()) + cv.offset(), cv, c);
         batched_for_cols.push_back(c);
       } else if (w.tid == cudf::type_id::INT16) {
         w.enc       = ShufEnc::FOR_BITPACK;
         w.elem_size = 2;
-        launch_for_stats.template operator()<int16_t>(w, cv.data<int16_t>() + cv.offset(), cv);
+        launch_for_stats.template operator()<int16_t>(w, cv.data<int16_t>() + cv.offset(), cv, c);
         batched_for_cols.push_back(c);
       } else if (w.tid == cudf::type_id::INT8 || w.tid == cudf::type_id::BOOL8) {
         w.enc       = ShufEnc::FOR_BITPACK;
         w.elem_size = 1;
         launch_for_stats.template operator()<int8_t>(
-          w, static_cast<int8_t const*>(cv.head()) + cv.offset(), cv);
+          w, static_cast<int8_t const*>(cv.head()) + cv.offset(), cv, c);
         batched_for_cols.push_back(c);
       }
     }
@@ -1177,6 +1215,7 @@ std::pair<rmm::device_buffer, rmm::device_buffer> split_and_encode_shuffle_to_de
       stream.sync();
       for (uint32_t c : batched_for_cols) {
         ColWork& w    = works[c];
+        sync_copy_pinned_wo(w, c);
         auto const cv = table.column(static_cast<cudf::size_type>(c));
         if (w.elem_size == 8) {
           launch_for_pack.template operator()<int64_t>(
